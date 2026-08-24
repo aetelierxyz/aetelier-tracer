@@ -1,0 +1,59 @@
+{
+  "schema": "tracer.params.v1",
+  "params_version": 1,
+  "tau_secs": 60.0,
+  "hold_ms": 900000,
+  "notional_usd": 1000.0,
+  "exit_staleness_ms": 225000,
+  "t_split_ms": 1784901430873,
+  "decile_thresholds": [
+    -0.784242271256198,
+    -0.5632996192660081,
+    -0.35804437828231683,
+    -0.1807990529029601,
+    -0.023968796292745224,
+    0.13370855882829324,
+    0.315785227347895,
+    0.53209005124327,
+    0.7760005631894468
+  ],
+  "symbols": [
+    {
+      "stem": "para_IREN",
+      "bar_threshold_usd": 310.7190171631322,
+      "maker_fee_leg_bps": 0.121,
+      "taker_fee_leg_bps": 1.349
+    },
+    {
+      "stem": "xyz_AAPL",
+      "bar_threshold_usd": 10666.397501123809,
+      "maker_fee_leg_bps": -0.045,
+      "taker_fee_leg_bps": 1.044
+    },
+    {
+      "stem": "xyz_AMD",
+      "bar_threshold_usd": 16506.546924883467,
+      "maker_fee_leg_bps": -0.045,
+      "taker_fee_leg_bps": 1.044
+    },
+    {
+      "stem": "xyz_NVDA",
+      "bar_threshold_usd": 40446.24349980131,
+      "maker_fee_leg_bps": -0.015,
+      "taker_fee_leg_bps": 0.928
+    },
+    {
+      "stem": "xyz_TSLA",
+      "bar_threshold_usd": 17464.467006583698,
+      "maker_fee_leg_bps": -0.015,
+      "taker_fee_leg_bps": 1.044
+    }
+  ],
+  "input_sha256": {
+    "fills/para_IREN.csv": "f0a2c0526fb3dd329b93b2a2d55b348a8e0b7c181786cb01a5b87512090d3059",
+    "fills/xyz_AAPL.csv": "0daa05dec7ab99a0ae27fddf2fc900f7ddd955993c2c45c16b29b5729df46beb",
+    "fills/xyz_AMD.csv": "fcd0bb6aa0fc01b4a44a6d7793ec81c6b991fbe05b15211718aec874838df3c9",
+    "fills/xyz_NVDA.csv": "28f8d69820afc517d94b4d0710797b09c30a7d481dbc6b3f975f79bc224035ee",
+    "fills/xyz_TSLA.csv": "38de9398fa8eb163c8a593272fb70f67e03cd125a53c87eec568634ed7b57208"
+  }
+}

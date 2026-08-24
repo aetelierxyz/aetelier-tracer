@@ -1,0 +1,11 @@
+[package]
+name = "tracerd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tracer-engine.workspace = true

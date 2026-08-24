@@ -1,8 +1,6 @@
 name: ci
 
 on:
-  push:
-    branches: [main, staging]
   pull_request:
     branches: [main, staging]
   workflow_dispatch:
@@ -23,48 +21,92 @@ env:
 jobs:
 
   gates:
-    name: fmt + clippy + tests (x86_64-unknown-linux-gnu)
+    name: fmt + check + clippy + tests (x86_64-unknown-linux-gnu)
     runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: aetelier-tracer
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
+        with:
+          path: aetelier-tracer
+
+      - uses: actions/checkout@v5
+        with:
+          repository: IteraLabs/aetelier-sdk
+          path: aetelier-sdk
+          token: ${{ secrets.INTER_AETELIER_READ_PAT }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aetelier-tracer
 
-      - name: cargo fmt (blocking)
-        run: cargo fmt --all -- --check
+      - name: cargo fmt (blocking, workspace members only)
+        run: |
+          set -e
+          for p in $(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(" ".join(p["name"] for p in json.load(sys.stdin)["packages"]))'); do
+            cargo fmt -p "$p" -- --check
+          done
+
+      - name: cargo check (blocking)
+        run: cargo check --locked --workspace --all-targets
 
       - name: cargo clippy (blocking)
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      - name: cargo test (doc tests)
-        run: cargo test --locked --workspace --doc
+      - name: cargo test (unit + integration + doc)
+        run: cargo test --locked --workspace
 
   msrv:
     name: MSRV (1.88.0)
     runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: aetelier-tracer
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
+        with:
+          path: aetelier-tracer
+
+      - uses: actions/checkout@v5
+        with:
+          repository: IteraLabs/aetelier-sdk
+          path: aetelier-sdk
+          token: ${{ secrets.INTER_AETELIER_READ_PAT }}
+
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aetelier-tracer
+          key: msrv
+
       - name: cargo check on the declared rust-version
         run: cargo check --locked --workspace
 
   deny:
-    name: cargo deny (advisories + licenses + bans + sources)
+    name: cargo deny (advisories + bans + licenses + sources)
     runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: aetelier-tracer
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
+        with:
+          path: aetelier-tracer
+
+      - uses: actions/checkout@v5
+        with:
+          repository: IteraLabs/aetelier-sdk
+          path: aetelier-sdk
+          token: ${{ secrets.INTER_AETELIER_READ_PAT }}
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-      - uses: Swatinem/rust-cache@v2
       - name: cargo deny check
         run: cargo deny check advisories bans licenses sources
 
