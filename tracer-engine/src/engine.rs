@@ -131,6 +131,7 @@ pub struct EngineCounters {
     pub queue_vs_through_disagreements: u64,
     pub book_degraded: u64,
     pub duplicates_dropped: u64,
+    pub paper_exit_unpriced: u64,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -138,6 +139,8 @@ pub struct StreamStatus {
     pub watermark_ms: u64,
     pub last_file: Option<String>,
     pub files_read: u64,
+    pub advance_age_ms: u64,
+    pub stalled: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -152,11 +155,18 @@ pub struct EngineStatus {
     pub books: Option<StreamStatus>,
     pub merged_watermark_ms: u64,
     pub idle: bool,
+    pub session: String,
+    pub verdict_trail_ms: u64,
     pub calendar_expired: bool,
     pub open_trades: usize,
     pub counters: EngineCounters,
     pub corrected_n_kept: usize,
     pub corrected_total_usd: f64,
+    pub corrected_fees_usd: f64,
+    pub paper_n: usize,
+    pub paper_total_usd: f64,
+    pub paper_fees_usd: f64,
+    pub first_post_ts_ms: Option<u64>,
     pub events_written: u64,
     pub ready: bool,
 }
@@ -180,7 +190,14 @@ pub struct LiveEngine {
     pub counters: EngineCounters,
     pub corrected_points: Vec<(u64, f64)>,
     corrected_total: f64,
+    corrected_fees: f64,
+    pub paper_points: Vec<(u64, f64)>,
+    paper_total: f64,
+    paper_fees: f64,
+    first_post_ts_ms: Option<u64>,
     last_advance_wall_ms: u64,
+    trades_last_advance_wall_ms: u64,
+    books_last_advance_wall_ms: u64,
     ready: bool,
 }
 
@@ -220,11 +237,18 @@ impl LiveEngine {
             counters: EngineCounters::default(),
             corrected_points: Vec::new(),
             corrected_total: 0.0,
+            corrected_fees: 0.0,
+            paper_points: Vec::new(),
+            paper_total: 0.0,
+            paper_fees: 0.0,
+            first_post_ts_ms: None,
             maker_fee_leg_bps: sym.maker_fee_leg_bps,
             taker_fee_leg_bps: sym.taker_fee_leg_bps,
             trades_root: trades_binding.to_path_buf(),
             books_root: books_binding.map(|p| p.to_path_buf()),
             last_advance_wall_ms: 0,
+            trades_last_advance_wall_ms: 0,
+            books_last_advance_wall_ms: 0,
             ready: false,
             params,
             cfg,
@@ -238,7 +262,29 @@ impl LiveEngine {
         }
     }
 
+    fn stream_status(
+        &self,
+        tail: &crate::market_engine::StreamTail,
+        advance_wall_ms: u64,
+        wall_ms: u64,
+    ) -> StreamStatus {
+        let advance_age_ms = wall_ms.saturating_sub(advance_wall_ms);
+        StreamStatus {
+            watermark_ms: tail.watermark_ms,
+            last_file: tail.last_file.clone(),
+            files_read: tail.files_read,
+            advance_age_ms,
+            stalled: self.ready && advance_age_ms > self.cfg.idle_after_ms,
+        }
+    }
+
     pub fn status(&self, wall_ms: u64) -> EngineStatus {
+        let trades =
+            self.stream_status(&self.trades.tail, self.trades_last_advance_wall_ms, wall_ms);
+        let books = self
+            .books
+            .as_ref()
+            .map(|b| self.stream_status(&b.tail, self.books_last_advance_wall_ms, wall_ms));
         EngineStatus {
             schema: "tracer.status.v1",
             mode: "live",
@@ -246,19 +292,13 @@ impl LiveEngine {
             params_version: self.params.params_version,
             symbol: self.cfg.symbol_stem.clone(),
             queue_verdicts: self.cfg.queue_verdicts,
-            trades: StreamStatus {
-                watermark_ms: self.trades.tail.watermark_ms,
-                last_file: self.trades.tail.last_file.clone(),
-                files_read: self.trades.tail.files_read,
-            },
-            books: self.books.as_ref().map(|b| StreamStatus {
-                watermark_ms: b.tail.watermark_ms,
-                last_file: b.tail.last_file.clone(),
-                files_read: b.tail.files_read,
-            }),
             merged_watermark_ms: self.merged_watermark_ms(),
             idle: self.ready
                 && wall_ms.saturating_sub(self.last_advance_wall_ms) > self.cfg.idle_after_ms,
+            session: regime(wall_ms).label().into(),
+            verdict_trail_ms: trades
+                .watermark_ms
+                .saturating_sub(self.merged_watermark_ms()),
             calendar_expired: self.trades.tail.watermark_ms > 0
                 && calendar_expired(self.trades.tail.watermark_ms),
             open_trades: self.open.len(),
@@ -268,8 +308,15 @@ impl LiveEngine {
             },
             corrected_n_kept: self.corrected_points.len(),
             corrected_total_usd: self.corrected_total,
+            corrected_fees_usd: self.corrected_fees,
+            paper_n: self.paper_points.len(),
+            paper_total_usd: self.paper_total,
+            paper_fees_usd: self.paper_fees,
+            first_post_ts_ms: self.first_post_ts_ms,
             events_written: self.ledger.events_written,
             ready: self.ready,
+            trades,
+            books,
         }
     }
 
@@ -372,6 +419,7 @@ impl LiveEngine {
         self.ledger.append(&e)?;
         t.seq = 1;
         self.counters.posted += 1;
+        self.first_post_ts_ms.get_or_insert(bar.close_ms);
         self.open.push(t);
         Ok(())
     }
@@ -398,6 +446,18 @@ impl LiveEngine {
             if wm < window_end_ms + WATERMARK_SLACK_MS {
                 still_open.push(t);
                 continue;
+            }
+            let t_exit_post = t.t_post_ms + self.params.hold_ms;
+            let nominal_exit = self.exit_posted_px(t_exit_post);
+            match nominal_exit {
+                Some((px, _)) => {
+                    let fee_leg = self.params.notional_usd * self.maker_fee_leg_bps / 1e4;
+                    let gross = t.side as f64 * (px / t.posted_px - 1.0) * self.params.notional_usd;
+                    self.paper_total += gross - 2.0 * fee_leg;
+                    self.paper_fees += 2.0 * fee_leg;
+                    self.paper_points.push((t_exit_post, self.paper_total));
+                }
+                None => self.counters.paper_exit_unpriced += 1,
             }
             let maker_side = MakerSide::entry_for_signal_side(t.side);
             if gap_overlaps(&self.gaps, t.t_post_ms, window_end_ms) {
@@ -473,6 +533,7 @@ impl LiveEngine {
                 } else {
                     "queue_cleared".into()
                 });
+                e.evidence_px = scan.through.map(|f| f.px).or(queue_cleared.map(|f| f.px));
             }
             self.ledger.append(&e)?;
             self.ledger.flush()?;
@@ -486,8 +547,7 @@ impl LiveEngine {
                 self.counters.entry_expired_unfilled += 1;
                 continue;
             }
-            let t_exit_post = t.t_post_ms + self.params.hold_ms;
-            let (posted_px, px_ts) = match self.exit_posted_px(t_exit_post) {
+            let (posted_px, px_ts) = match nominal_exit {
                 Some(v) => v,
                 None => {
                     self.counters.exit_unpriced += 1;
@@ -576,6 +636,9 @@ impl LiveEngine {
             e.verdict = Some(verdict);
             e.filled_touch_ts_ms = scan.touch.map(|f| f.ts_ms);
             e.filled_through_ts_ms = scan.through.map(|f| f.ts_ms);
+            if matches!(kind, EventKind::Filled) {
+                e.evidence_px = scan.through.map(|f| f.px);
+            }
             self.ledger.append(&e)?;
             t.seq += 1;
             if let Some(f) = cross {
@@ -591,6 +654,7 @@ impl LiveEngine {
                 let gross = t.side as f64 * (px / t.posted_px - 1.0) * self.params.notional_usd;
                 let pnl = gross - entry_fee - exit_fee;
                 self.corrected_total += pnl;
+                self.corrected_fees += entry_fee + exit_fee;
                 self.corrected_points.push((exit_ts, self.corrected_total));
             }
         }
@@ -600,9 +664,19 @@ impl LiveEngine {
 
     pub fn tick(&mut self, wall_ms: u64) -> anyhow::Result<()> {
         let wm_before = self.merged_watermark_ms();
+        let trades_wm_before = self.trades.tail.watermark_ms;
+        let books_wm_before = self.books.as_ref().map(|b| b.tail.watermark_ms);
         let new_prints = self.trades.poll()?;
         if let Some(b) = self.books.as_mut() {
             b.poll()?;
+        }
+        if self.trades.tail.watermark_ms > trades_wm_before || !self.ready {
+            self.trades_last_advance_wall_ms = wall_ms;
+        }
+        if let Some(b) = self.books.as_ref()
+            && (Some(b.tail.watermark_ms) > books_wm_before || !self.ready)
+        {
+            self.books_last_advance_wall_ms = wall_ms;
         }
         let mut gaps = read_gap_spans(&self.trades_root)?;
         if let Some(root) = &self.books_root {
@@ -771,6 +845,71 @@ mod tests {
         assert!((eng.corrected_total - 0.003).abs() < 1e-9);
         assert!(eng.open.is_empty());
         assert!(eng.ledger.events_written >= 6);
+
+        assert_eq!(eng.paper_points.len(), 1);
+        assert_eq!(eng.paper_points[0].0, 70_000);
+        let st = eng.status(122_000);
+        assert!((st.paper_total_usd - 0.003).abs() < 1e-9);
+        assert!((st.paper_fees_usd - -0.003).abs() < 1e-9);
+        assert!((st.corrected_fees_usd - -0.003).abs() < 1e-9);
+        assert_eq!(st.first_post_ts_ms, Some(10_000));
+        assert!(!st.session.is_empty());
+
+        let events = read_ledger_events(&ledger);
+        let entry_fill = events
+            .iter()
+            .find(|e| e.kind == EventKind::Filled && e.leg == Leg::Entry)
+            .unwrap();
+        assert_eq!(entry_fill.evidence_px, Some(99.0));
+        let exit_fill = events
+            .iter()
+            .find(|e| e.kind == EventKind::Filled && e.leg == Leg::Exit)
+            .unwrap();
+        assert_eq!(exit_fill.evidence_px, Some(101.0));
+        std::fs::remove_dir_all(binding.parent().unwrap()).unwrap();
+    }
+
+    fn read_ledger_events(dir: &Path) -> Vec<Event> {
+        let mut names: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        names.sort();
+        names
+            .iter()
+            .flat_map(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap()
+                    .lines()
+                    .map(|l| serde_json::from_str::<Event>(l).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn paper_series_accumulates_every_admitted_post_including_unfilled() {
+        let (binding, ledger) = fixture("paper_unfilled");
+        let dir = binding.join("hyperliquid/perpetual/trades");
+        write_trades_parquet(&preamble_and_burst(), &dir.join("a.parquet")).unwrap();
+        write_trades_parquet(
+            &[
+                trade(20_000, 102.0, 10.0, true, "b1"),
+                trade(73_000, 102.0, 0.1, true, "wm73"),
+            ],
+            &dir.join("b.parquet"),
+        )
+        .unwrap();
+        let mut eng = LiveEngine::new(test_params(), cfg(), &binding, None, &ledger).unwrap();
+        eng.tick(1_000).unwrap();
+        assert_eq!(eng.counters.posted, 1);
+        assert_eq!(eng.counters.entry_expired_unfilled, 1);
+        assert!(eng.corrected_points.is_empty());
+        assert_eq!(eng.paper_points.len(), 1);
+        let st = eng.status(2_000);
+        assert_eq!(st.paper_n, 1);
+        assert!((st.paper_total_usd - 20.003).abs() < 1e-9);
+        assert_eq!(st.corrected_n_kept, 0);
         std::fs::remove_dir_all(binding.parent().unwrap()).unwrap();
     }
 
@@ -800,6 +939,8 @@ mod tests {
         assert_eq!(eng.counters.entry_filled_through, 0);
         assert_eq!(eng.counters.entry_expired_unfilled, 0);
         assert!(eng.open.is_empty());
+        assert_eq!(eng.paper_points.len(), 1);
+        assert!(eng.corrected_points.is_empty());
         std::fs::remove_dir_all(binding.parent().unwrap()).unwrap();
     }
 
@@ -832,6 +973,11 @@ mod tests {
         assert_eq!(eng.counters.book_degraded, 1);
         assert_eq!(eng.counters.entry_filled_through, 0);
         assert_eq!(eng.open.len(), 1);
+        let st = eng.status(40_000);
+        assert_eq!(st.verdict_trail_ms, st.trades.watermark_ms);
+        let books = st.books.unwrap();
+        assert_eq!(books.watermark_ms, 0);
+        assert!(books.stalled);
         std::fs::remove_dir_all(binding.parent().unwrap()).unwrap();
     }
 
@@ -842,10 +988,18 @@ mod tests {
         write_trades_parquet(&preamble_and_burst(), &dir.join("a.parquet")).unwrap();
         let mut eng = LiveEngine::new(test_params(), cfg(), &binding, None, &ledger).unwrap();
         eng.tick(1_000).unwrap();
-        assert!(!eng.status(2_000).idle);
+        let fresh = eng.status(2_000);
+        assert!(!fresh.idle);
+        assert!(!fresh.trades.stalled);
+        assert_eq!(fresh.trades.advance_age_ms, 1_000);
         eng.tick(3_000).unwrap();
-        assert!(eng.status(10_000).idle);
-        assert_eq!(eng.status(10_000).counters.entry_expired_unfilled, 0);
+        let stalled = eng.status(10_000);
+        assert!(stalled.idle);
+        assert!(stalled.trades.stalled);
+        assert_eq!(stalled.verdict_trail_ms, 0);
+        assert!(stalled.books.is_none());
+        assert!(!stalled.session.is_empty());
+        assert_eq!(stalled.counters.entry_expired_unfilled, 0);
         std::fs::remove_dir_all(binding.parent().unwrap()).unwrap();
     }
 }

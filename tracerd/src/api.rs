@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -12,16 +12,22 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use tracer_engine::ledger::Event;
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
-pub struct CorrectedLive {
+pub struct LedgerLive {
+    pub since_ts_ms: Option<u64>,
     pub n_kept: usize,
     pub total_usd: f64,
+    pub fees_usd: f64,
     pub equity: Vec<(u64, f64)>,
+    pub paper_n: usize,
+    pub paper_total_usd: f64,
+    pub paper_fees_usd: f64,
+    pub paper_equity: Vec<(u64, f64)>,
 }
 
 #[derive(Clone)]
 pub struct AppState {
     pub status: Arc<RwLock<serde_json::Value>>,
-    pub corrected: Arc<RwLock<CorrectedLive>>,
+    pub ledger_live: Arc<RwLock<LedgerLive>>,
     pub ready: Arc<RwLock<bool>>,
     pub ledger_dir: PathBuf,
     pub artifacts_dir: Option<PathBuf>,
@@ -44,6 +50,8 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> axum::Router {
         .route("/api/tracer/events", get(events))
         .route("/api/tracer/fillrates", get(fillrates))
         .route("/api/tracer/ledger", get(ledger))
+        .route("/api/tracer/replay/ledger", get(replay_ledger))
+        .route("/api/tracer/replay/fillrates", get(replay_fillrates))
         .layer(cors)
         .with_state(state)
 }
@@ -139,45 +147,38 @@ fn encode_cursor(file: &str, line: usize) -> String {
     B64.encode(format!("{file}|{line}"))
 }
 
+fn deduped_events(ledger_dir: &PathBuf) -> Vec<(String, usize, Event)> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut all: Vec<(String, usize, Event)> = Vec::new();
+    for path in ledger_files_sorted(ledger_dir) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        for (idx, e) in read_event_lines(&path).into_iter().enumerate() {
+            if seen.insert(e.event_id.clone()) {
+                all.push((name.clone(), idx, e));
+            }
+        }
+    }
+    all
+}
+
 async fn events(
     State(s): State<AppState>,
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<EventsPage>, StatusCode> {
     let limit = q.limit.unwrap_or(200).min(1000);
-    let files = ledger_files_sorted(&s.ledger_dir);
     let start = match &q.cursor {
         None => None,
         Some(c) => Some(decode_cursor(c).ok_or(StatusCode::BAD_REQUEST)?),
     };
-    let mut out: Vec<Event> = Vec::new();
-    let mut older: Option<String> = None;
-    for (idx, path) in files.iter().enumerate().rev() {
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let mut lines = read_event_lines(path);
-        if let Some((cf, cl)) = &start {
-            if name > *cf {
-                continue;
-            }
-            if name == *cf {
-                lines.truncate(*cl);
-            }
-        }
-        while out.len() < limit {
-            match lines.pop() {
-                Some(e) => out.push(e),
-                None => break,
-            }
-        }
-        if out.len() >= limit {
-            if !lines.is_empty() || idx > 0 {
-                older = Some(encode_cursor(&name, lines.len()));
-            }
-            break;
-        }
+    let mut all = deduped_events(&s.ledger_dir);
+    if let Some((cf, cl)) = &start {
+        all.retain(|(name, idx, _)| name < cf || (name == cf && idx < cl));
     }
-    out.reverse();
+    let cut = all.len().saturating_sub(limit);
+    let older = (cut > 0).then(|| encode_cursor(&all[cut].0, all[cut].1));
+    let events = all.split_off(cut).into_iter().map(|(_, _, e)| e).collect();
     Ok(Json(EventsPage {
-        events: out,
+        events,
         older_cursor: older,
     }))
 }
@@ -187,7 +188,49 @@ struct FillratesQuery {
     window: Option<String>,
 }
 
-#[derive(Clone, Copy, Default, serde::Serialize)]
+#[derive(serde::Serialize)]
+struct Pct {
+    p50: u64,
+    p90: u64,
+    n: usize,
+}
+
+fn pct_json(mut v: Vec<u64>) -> Option<Pct> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_unstable();
+    let at = |q: f64| v[((v.len() as f64 - 1.0) * q).round() as usize];
+    Some(Pct {
+        p50: at(0.50),
+        p90: at(0.90),
+        n: v.len(),
+    })
+}
+
+#[derive(Default)]
+struct LiveEntryAgg {
+    posted: u64,
+    already_through: u64,
+    filled_touch: u64,
+    filled_through: u64,
+    filled_queue: u64,
+    expired_unfilled: u64,
+    gapped: u64,
+    book_degraded_stale: u64,
+    ttf_touch: Vec<u64>,
+    ttf_through: Vec<u64>,
+}
+
+#[derive(Default)]
+struct LiveExitAgg {
+    posted: u64,
+    filled_through: u64,
+    taker_cross: u64,
+    ttf_through: Vec<u64>,
+}
+
+#[derive(serde::Serialize)]
 struct LiveEntryCell {
     posted: u64,
     already_through: u64,
@@ -197,14 +240,16 @@ struct LiveEntryCell {
     expired_unfilled: u64,
     gapped: u64,
     book_degraded_stale: u64,
+    time_to_fill_ms: BTreeMap<&'static str, Option<Pct>>,
 }
 
-#[derive(Clone, Copy, Default, serde::Serialize)]
+#[derive(serde::Serialize)]
 struct LiveExitCell {
     posted: u64,
     filled_through: u64,
     taker_cross: u64,
     exit_unpriced: u64,
+    time_to_fill_ms: BTreeMap<&'static str, Option<Pct>>,
 }
 
 #[derive(serde::Serialize)]
@@ -228,64 +273,115 @@ async fn fillrates(
         "all" => 0,
         _ => return Err(StatusCode::BAD_REQUEST),
     };
-    let mut entry: BTreeMap<String, LiveEntryCell> = BTreeMap::new();
-    let mut exit: BTreeMap<String, LiveExitCell> = BTreeMap::new();
-    for path in ledger_files_sorted(&s.ledger_dir) {
-        for e in read_event_lines(&path) {
-            if e.ts_ms < cutoff {
-                continue;
+    let mut entry: BTreeMap<String, LiveEntryAgg> = BTreeMap::new();
+    let mut exit: BTreeMap<String, LiveExitAgg> = BTreeMap::new();
+    let mut posted_ts: HashMap<String, u64> = HashMap::new();
+    use tracer_engine::ledger::{EventKind, Leg, PostState, Verdict};
+    for (_, _, e) in deduped_events(&s.ledger_dir) {
+        if e.kind == EventKind::Posted {
+            let leg = match e.leg {
+                Leg::Entry => "entry",
+                Leg::Exit => "exit",
+            };
+            posted_ts.insert(format!("{}|{leg}", e.trade_id), e.ts_ms);
+        }
+        if e.ts_ms < cutoff {
+            continue;
+        }
+        let key = format!("{}|{}", e.symbol, e.regime);
+        match (e.leg, e.kind) {
+            (Leg::Entry, EventKind::Posted) => {
+                let c = entry.entry(key).or_default();
+                c.posted += 1;
+                if e.post_state == Some(PostState::AlreadyThrough) {
+                    c.already_through += 1;
+                }
+                if e.book_staleness_ms.is_some() && e.depth_ahead_usd.is_none() {
+                    c.book_degraded_stale += 1;
+                }
             }
-            let key = format!("{}|{}", e.symbol, e.regime);
-            use tracer_engine::ledger::{EventKind, Leg, PostState, Verdict};
-            match (e.leg, e.kind) {
-                (Leg::Entry, EventKind::Posted) => {
-                    let c = entry.entry(key).or_default();
-                    c.posted += 1;
-                    if e.post_state == Some(PostState::AlreadyThrough) {
-                        c.already_through += 1;
-                    }
-                    if e.book_staleness_ms.is_some() && e.depth_ahead_usd.is_none() {
-                        c.book_degraded_stale += 1;
-                    }
+            (Leg::Entry, EventKind::Filled | EventKind::Expired) => {
+                let c = entry.entry(key).or_default();
+                if e.filled_touch_ts_ms.is_some() {
+                    c.filled_touch += 1;
                 }
-                (Leg::Entry, EventKind::Filled | EventKind::Expired) => {
-                    let c = entry.entry(key).or_default();
-                    if e.filled_touch_ts_ms.is_some() {
-                        c.filled_touch += 1;
-                    }
-                    match e.verdict {
-                        Some(Verdict::FilledThrough) => c.filled_through += 1,
-                        Some(Verdict::FilledQueue) => c.filled_queue += 1,
-                        Some(Verdict::UnfilledGapped) => c.gapped += 1,
-                        Some(Verdict::Unfilled) => c.expired_unfilled += 1,
-                        _ => {}
-                    }
+                let posted = posted_ts.get(&format!("{}|entry", e.trade_id)).copied();
+                if let (Some(t0), Some(t)) = (posted, e.filled_touch_ts_ms) {
+                    c.ttf_touch.push(t.saturating_sub(t0));
                 }
-                (Leg::Exit, EventKind::Posted) => {
-                    exit.entry(key).or_default().posted += 1;
+                if let (Some(t0), Some(t)) = (posted, e.filled_through_ts_ms) {
+                    c.ttf_through.push(t.saturating_sub(t0));
                 }
-                (Leg::Exit, EventKind::Filled) => {
-                    exit.entry(key).or_default().filled_through += 1;
+                match e.verdict {
+                    Some(Verdict::FilledThrough) => c.filled_through += 1,
+                    Some(Verdict::FilledQueue) => c.filled_queue += 1,
+                    Some(Verdict::UnfilledGapped) => c.gapped += 1,
+                    Some(Verdict::Unfilled) => c.expired_unfilled += 1,
+                    _ => {}
                 }
-                (Leg::Exit, EventKind::TakerCross) => {
-                    exit.entry(key).or_default().taker_cross += 1;
-                }
-                (Leg::Exit, EventKind::Expired) => {}
-                _ => {}
             }
+            (Leg::Exit, EventKind::Posted) => {
+                exit.entry(key).or_default().posted += 1;
+            }
+            (Leg::Exit, EventKind::Filled) => {
+                let c = exit.entry(key).or_default();
+                c.filled_through += 1;
+                let posted = posted_ts.get(&format!("{}|exit", e.trade_id)).copied();
+                if let (Some(t0), Some(t)) = (posted, e.filled_through_ts_ms) {
+                    c.ttf_through.push(t.saturating_sub(t0));
+                }
+            }
+            (Leg::Exit, EventKind::TakerCross) => {
+                exit.entry(key).or_default().taker_cross += 1;
+            }
+            (Leg::Exit, EventKind::Expired) => {}
+            _ => {}
         }
     }
-    for (key, x) in exit.iter_mut() {
-        let _ = key;
-        x.exit_unpriced = x.posted.saturating_sub(x.filled_through + x.taker_cross);
-    }
+    let entry_cells: BTreeMap<String, LiveEntryCell> = entry
+        .into_iter()
+        .map(|(k, a)| {
+            (
+                k,
+                LiveEntryCell {
+                    posted: a.posted,
+                    already_through: a.already_through,
+                    filled_touch: a.filled_touch,
+                    filled_through: a.filled_through,
+                    filled_queue: a.filled_queue,
+                    expired_unfilled: a.expired_unfilled,
+                    gapped: a.gapped,
+                    book_degraded_stale: a.book_degraded_stale,
+                    time_to_fill_ms: BTreeMap::from([
+                        ("touch", pct_json(a.ttf_touch)),
+                        ("through", pct_json(a.ttf_through)),
+                    ]),
+                },
+            )
+        })
+        .collect();
+    let exit_cells: BTreeMap<String, LiveExitCell> = exit
+        .into_iter()
+        .map(|(k, a)| {
+            (
+                k,
+                LiveExitCell {
+                    posted: a.posted,
+                    filled_through: a.filled_through,
+                    taker_cross: a.taker_cross,
+                    exit_unpriced: a.posted.saturating_sub(a.filled_through + a.taker_cross),
+                    time_to_fill_ms: BTreeMap::from([("through", pct_json(a.ttf_through))]),
+                },
+            )
+        })
+        .collect();
     let body = LiveFillrates {
         schema: "tracer.fillrates.live.v1",
         mode: "live",
         window,
         denominator: "posted_signals",
-        entry_cells: entry,
-        exit_cells: exit,
+        entry_cells,
+        exit_cells,
     };
     Ok(Json(serde_json::to_value(body).unwrap()))
 }
@@ -299,20 +395,44 @@ async fn ledger(
     State(s): State<AppState>,
     Query(q): Query<LedgerQuery>,
 ) -> Json<serde_json::Value> {
-    if let Some(dir) = &s.artifacts_dir
-        && let Ok(text) = std::fs::read_to_string(dir.join("corrected_ledger.json"))
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
-    {
-        return Json(v);
-    }
-    let c = s.corrected.read().unwrap().clone();
+    let c = s.ledger_live.read().unwrap().clone();
     let points = q.points.unwrap_or(500);
-    let equity: Vec<(u64, f64)> = c.equity.iter().rev().take(points).rev().copied().collect();
+    let tail = |v: &[(u64, f64)]| -> Vec<(u64, f64)> {
+        v.iter().rev().take(points).rev().copied().collect()
+    };
     Json(serde_json::json!({
         "schema": "tracer.ledger.live.v1",
         "mode": "live",
+        "since_ts_ms": c.since_ts_ms,
         "n_kept": c.n_kept,
         "total_usd": c.total_usd,
-        "equity": equity,
+        "fees_usd": c.fees_usd,
+        "equity": tail(&c.equity),
+        "paper": {
+            "denominator": "every_posted_signal",
+            "n": c.paper_n,
+            "total_usd": c.paper_total_usd,
+            "fees_usd": c.paper_fees_usd,
+            "equity": tail(&c.paper_equity),
+        },
+        "delta_total_usd": c.total_usd - c.paper_total_usd,
     }))
+}
+
+fn artifact_json(s: &AppState, name: &str) -> Result<Json<serde_json::Value>, StatusCode> {
+    let dir = s.artifacts_dir.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let text = std::fs::read_to_string(dir.join(name)).map_err(|_| StatusCode::NOT_FOUND)?;
+    serde_json::from_str(&text)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn replay_ledger(State(s): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    artifact_json(&s, "corrected_ledger.json")
+}
+
+async fn replay_fillrates(
+    State(s): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    artifact_json(&s, "fillrates.json")
 }

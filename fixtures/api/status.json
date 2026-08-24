@@ -1,10 +1,13 @@
 {
   "books": {
+    "advance_age_ms": 150000,
     "files_read": 977,
     "last_file": "hyperliquid_xyz-TSLA_ob_sync_20260824_060000.000.parquet",
-    "watermark_ms": 1787599938000
+    "stalled": true,
+    "watermark_ms": 1787599755000
   },
   "calendar_expired": true,
+  "corrected_fees_usd": -0.096,
   "corrected_n_kept": 32,
   "corrected_total_usd": -14.7,
   "counters": {
@@ -17,24 +20,33 @@
     "exit_maker": 25,
     "exit_taker_cross": 7,
     "exit_unpriced": 2,
+    "paper_exit_unpriced": 0,
     "posted": 41,
     "queue_vs_through_disagreements": 4,
     "would_be_voided_by_paper_filter": 2
   },
   "engine_version": "0.1.0",
   "events_written": 208,
+  "first_post_ts_ms": 1787492000000,
   "idle": true,
-  "merged_watermark_ms": 1787599935000,
+  "merged_watermark_ms": 1787599755000,
   "mode": "live",
   "open_trades": 3,
+  "paper_fees_usd": -0.114,
+  "paper_n": 38,
+  "paper_total_usd": 22.4,
   "params_version": 1,
   "queue_verdicts": true,
   "ready": true,
   "schema": "tracer.status.v1",
+  "session": "RTH",
   "symbol": "xyz_TSLA",
   "trades": {
+    "advance_age_ms": 48000,
     "files_read": 412,
     "last_file": "hyperliquid_xyz-TSLA_trades_sync_20260824_060000.000.parquet",
+    "stalled": true,
     "watermark_ms": 1787599935000
-  }
+  },
+  "verdict_trail_ms": 180000
 }
