@@ -1,10 +1,15 @@
+mod api;
+
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use clap::{Parser, Subcommand};
 
+use api::{AppState, CorrectedLive, origins_from_env, router, wall_now_ms};
 use tracer_engine::corrected::{
     DEFAULT_CROSS_WINDOW_MS, DEFAULT_GRACE_MS, emit_events, evaluate, write_artifacts,
 };
+use tracer_engine::engine::{DEFAULT_IDLE_AFTER_MS, LiveConfig, LiveEngine};
 use tracer_engine::ledger::LedgerWriter;
 use tracer_engine::nyse::regime;
 use tracer_engine::params::TracerParams;
@@ -23,7 +28,34 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Run,
+    Run {
+        #[arg(long, env = "TRACER_SYMBOL")]
+        symbol: String,
+        #[arg(long, env = "TRACER_TRADES_BINDING")]
+        trades_binding: PathBuf,
+        #[arg(long, env = "TRACER_BOOKS_BINDING")]
+        books_binding: Option<PathBuf>,
+        #[arg(
+            long,
+            env = "TRACER_PARAMS",
+            default_value = "./params/tracer_params.v1.json"
+        )]
+        params: PathBuf,
+        #[arg(long, env = "TRACER_LEDGER_DIR", default_value = "./out/live/ledger")]
+        ledger_dir: PathBuf,
+        #[arg(long, env = "TRACER_QUEUE_VERDICTS", default_value_t = false)]
+        queue_verdicts: bool,
+        #[arg(long, env = "TRACER_POLL_MS", default_value_t = 2_000)]
+        poll_ms: u64,
+        #[arg(long, env = "TRACER_PORT", default_value_t = 8330)]
+        port: u16,
+        #[arg(long, env = "TRACER_EXIT_GRACE_MS", default_value_t = DEFAULT_GRACE_MS)]
+        grace_ms: u64,
+        #[arg(long, env = "TRACER_CROSS_WINDOW_MS", default_value_t = DEFAULT_CROSS_WINDOW_MS)]
+        cross_window_ms: u64,
+        #[arg(long, env = "TRACER_IDLE_AFTER_MS", default_value_t = DEFAULT_IDLE_AFTER_MS)]
+        idle_after_ms: u64,
+    },
     Replay {
         #[arg(long, env = "TRACER_FILLS_DIR")]
         fills: PathBuf,
@@ -36,7 +68,14 @@ enum Command {
         #[arg(long, env = "TRACER_CROSS_WINDOW_MS", default_value_t = DEFAULT_CROSS_WINDOW_MS)]
         cross_window_ms: u64,
     },
-    Serve,
+    Serve {
+        #[arg(long, env = "TRACER_LEDGER_DIR")]
+        ledger_dir: PathBuf,
+        #[arg(long)]
+        artifacts: Option<PathBuf>,
+        #[arg(long, env = "TRACER_PORT", default_value_t = 8330)]
+        port: u16,
+    },
     ExportGolden {
         #[arg(long, env = "TRACER_FILLS_DIR")]
         fills: PathBuf,
@@ -45,6 +84,79 @@ enum Command {
         #[arg(long, default_value = "./out/paper_trades_golden.csv")]
         out: PathBuf,
     },
+}
+
+async fn serve_api(state: AppState, port: u16) -> anyhow::Result<()> {
+    let origins = origins_from_env();
+    let app = router(state, &origins);
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    println!("tracerd api listening on :{port}");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_live(
+    symbol: String,
+    trades_binding: PathBuf,
+    books_binding: Option<PathBuf>,
+    params_path: PathBuf,
+    ledger_dir: PathBuf,
+    queue_verdicts: bool,
+    poll_ms: u64,
+    port: u16,
+    grace_ms: u64,
+    cross_window_ms: u64,
+    idle_after_ms: u64,
+) -> anyhow::Result<()> {
+    let params = TracerParams::load(&params_path)?;
+    let stem = symbol.replace(':', "_");
+    let cfg = LiveConfig {
+        symbol_stem: stem,
+        grace_ms,
+        cross_window_ms,
+        queue_verdicts,
+        idle_after_ms,
+    };
+    let mut engine = LiveEngine::new(
+        params,
+        cfg,
+        &trades_binding,
+        books_binding.as_deref(),
+        &ledger_dir,
+    )?;
+    let state = AppState {
+        status: Arc::new(RwLock::new(serde_json::json!({"mode": "starting"}))),
+        corrected: Arc::new(RwLock::new(CorrectedLive::default())),
+        ready: Arc::new(RwLock::new(false)),
+        ledger_dir,
+        artifacts_dir: None,
+        now_ms: wall_now_ms,
+    };
+    let publish = state.clone();
+    std::thread::spawn(move || {
+        loop {
+            let wall = wall_now_ms();
+            if let Err(e) = engine.tick(wall) {
+                eprintln!("tick error: {e:#}");
+            }
+            let status = engine.status(wall_now_ms());
+            *publish.status.write().unwrap() =
+                serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+            *publish.corrected.write().unwrap() = CorrectedLive {
+                n_kept: engine.corrected_points.len(),
+                total_usd: engine
+                    .corrected_points
+                    .last()
+                    .map(|(_, c)| *c)
+                    .unwrap_or(0.0),
+                equity: engine.corrected_points.clone(),
+            };
+            *publish.ready.write().unwrap() = true;
+            std::thread::sleep(std::time::Duration::from_millis(poll_ms));
+        }
+    });
+    serve_api(state, port).await
 }
 
 fn run_replay(
@@ -121,10 +233,56 @@ fn export_golden(
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
-        Command::Run => anyhow::bail!("run is not implemented"),
-        Command::Serve => anyhow::bail!("serve is not implemented"),
+        Command::Run {
+            symbol,
+            trades_binding,
+            books_binding,
+            params,
+            ledger_dir,
+            queue_verdicts,
+            poll_ms,
+            port,
+            grace_ms,
+            cross_window_ms,
+            idle_after_ms,
+        } => {
+            run_live(
+                symbol,
+                trades_binding,
+                books_binding,
+                params,
+                ledger_dir,
+                queue_verdicts,
+                poll_ms,
+                port,
+                grace_ms,
+                cross_window_ms,
+                idle_after_ms,
+            )
+            .await
+        }
+        Command::Serve {
+            ledger_dir,
+            artifacts,
+            port,
+        } => {
+            let state = AppState {
+                status: Arc::new(RwLock::new(serde_json::json!({
+                    "schema": "tracer.status.v1",
+                    "mode": "serve",
+                    "engine_version": tracer_engine::ENGINE_VERSION,
+                }))),
+                corrected: Arc::new(RwLock::new(CorrectedLive::default())),
+                ready: Arc::new(RwLock::new(true)),
+                ledger_dir,
+                artifacts_dir: artifacts,
+                now_ms: wall_now_ms,
+            };
+            serve_api(state, port).await
+        }
         Command::Replay {
             fills,
             params,

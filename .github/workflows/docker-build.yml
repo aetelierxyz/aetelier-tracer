@@ -1,0 +1,105 @@
+name: docker-build
+
+on:
+  pull_request:
+    branches: [main, staging]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-build-aetelier-tracer-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/iteralabs/aetelier-tracer
+
+jobs:
+  lint:
+    name: docker-naming lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: IteraLabs/aetelier-infra
+          path: infra
+          token: ${{ secrets.INTER_AETELIER_READ_PAT }}
+          persist-credentials: false
+      - run: bash infra/scripts/lint-docker-naming.sh repo
+
+  build:
+    name: build (amd64)
+    runs-on: [self-hosted, linux-amd64]
+    steps:
+      - name: isolate docker config
+        run: |
+          set -euo pipefail
+          echo "DOCKER_CONFIG=$RUNNER_TEMP/.docker" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/.docker"
+          printf '{}' > "$RUNNER_TEMP/.docker/config.json"
+      - uses: actions/checkout@v4
+        with:
+          path: aetelier-tracer
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: IteraLabs/aetelier-sdk
+          path: aetelier-sdk
+          token: ${{ secrets.INTER_AETELIER_READ_PAT }}
+          persist-credentials: false
+      - name: docker build (native amd64)
+        env:
+          CARGO_GIT_TOKEN: ${{ secrets.INTER_AETELIER_READ_PAT }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' '**/target/' '**/.git/' '**/datasets/' '**/results/' '**/out/' > .dockerignore
+          docker build \
+            --secret id=cargo_git_token,env=CARGO_GIT_TOKEN \
+            -t "$IMAGE:${GITHUB_SHA::12}-amd64" \
+            -f aetelier-tracer/Dockerfile .
+
+  publish:
+    name: publish (amd64 to ghcr)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build]
+    runs-on: [self-hosted, linux-amd64]
+    steps:
+      - name: isolate docker config
+        run: |
+          set -euo pipefail
+          echo "DOCKER_CONFIG=$RUNNER_TEMP/.docker" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/.docker"
+      - uses: actions/checkout@v4
+        with:
+          path: aetelier-tracer
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: IteraLabs/aetelier-sdk
+          path: aetelier-sdk
+          token: ${{ secrets.INTER_AETELIER_READ_PAT }}
+          persist-credentials: false
+      - name: write ghcr auth
+        run: |
+          set -euo pipefail
+          AUTH=$(printf '%s:%s' "${{ github.actor }}" "${{ secrets.GITHUB_TOKEN }}" | base64 | tr -d '\n')
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$AUTH" > "$DOCKER_CONFIG/config.json"
+      - name: build + push main sha as amd64
+        env:
+          CARGO_GIT_TOKEN: ${{ secrets.INTER_AETELIER_READ_PAT }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' '**/target/' '**/.git/' '**/datasets/' '**/results/' '**/out/' > .dockerignore
+          docker build \
+            --secret id=cargo_git_token,env=CARGO_GIT_TOKEN \
+            -t "$IMAGE:${GITHUB_SHA::12}-amd64" \
+            -f aetelier-tracer/Dockerfile .
+          docker push "$IMAGE:${GITHUB_SHA::12}-amd64"
