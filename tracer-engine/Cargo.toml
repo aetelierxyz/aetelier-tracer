@@ -9,6 +9,7 @@ publish.workspace = true
 aetelier-io.workspace = true
 aetelier-types.workspace = true
 anyhow.workspace = true
+rust_decimal.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 serde.workspace = true

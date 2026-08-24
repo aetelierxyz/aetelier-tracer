@@ -1,0 +1,36 @@
+{
+  "denominator": "posted_signals",
+  "entry_cells": {
+    "xyz_TSLA|EXT": {
+      "already_through": 0,
+      "book_degraded_stale": 0,
+      "expired_unfilled": 1,
+      "filled_queue": 0,
+      "filled_through": 0,
+      "filled_touch": 1,
+      "gapped": 0,
+      "posted": 1
+    },
+    "xyz_TSLA|RTH": {
+      "already_through": 1,
+      "book_degraded_stale": 1,
+      "expired_unfilled": 0,
+      "filled_queue": 1,
+      "filled_through": 1,
+      "filled_touch": 2,
+      "gapped": 1,
+      "posted": 3
+    }
+  },
+  "exit_cells": {
+    "xyz_TSLA|RTH": {
+      "exit_unpriced": 0,
+      "filled_through": 0,
+      "posted": 1,
+      "taker_cross": 1
+    }
+  },
+  "mode": "live",
+  "schema": "tracer.fillrates.live.v1",
+  "window": "all"
+}

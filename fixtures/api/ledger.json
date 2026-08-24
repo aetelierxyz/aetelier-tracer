@@ -1,0 +1,16 @@
+{
+  "equity": [
+    [
+      1787592800000,
+      0.15
+    ],
+    [
+      1787596400000,
+      -0.35
+    ]
+  ],
+  "mode": "live",
+  "n_kept": 2,
+  "schema": "tracer.ledger.live.v1",
+  "total_usd": -0.35
+}
