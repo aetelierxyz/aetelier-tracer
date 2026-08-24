@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use clap::{Parser, Subcommand};
 
-use api::{AppState, CorrectedLive, origins_from_env, router, wall_now_ms};
+use api::{AppState, LedgerLive, origins_from_env, router, wall_now_ms};
 use tracer_engine::corrected::{
     DEFAULT_CROSS_WINDOW_MS, DEFAULT_GRACE_MS, emit_events, evaluate, write_artifacts,
 };
@@ -43,6 +43,8 @@ enum Command {
         params: PathBuf,
         #[arg(long, env = "TRACER_LEDGER_DIR", default_value = "./out/live/ledger")]
         ledger_dir: PathBuf,
+        #[arg(long, env = "TRACER_ARTIFACTS_DIR")]
+        artifacts: Option<PathBuf>,
         #[arg(long, env = "TRACER_QUEUE_VERDICTS", default_value_t = false)]
         queue_verdicts: bool,
         #[arg(long, env = "TRACER_POLL_MS", default_value_t = 2_000)]
@@ -102,6 +104,7 @@ async fn run_live(
     books_binding: Option<PathBuf>,
     params_path: PathBuf,
     ledger_dir: PathBuf,
+    artifacts_dir: Option<PathBuf>,
     queue_verdicts: bool,
     poll_ms: u64,
     port: u16,
@@ -127,10 +130,10 @@ async fn run_live(
     )?;
     let state = AppState {
         status: Arc::new(RwLock::new(serde_json::json!({"mode": "starting"}))),
-        corrected: Arc::new(RwLock::new(CorrectedLive::default())),
+        ledger_live: Arc::new(RwLock::new(LedgerLive::default())),
         ready: Arc::new(RwLock::new(false)),
         ledger_dir,
-        artifacts_dir: None,
+        artifacts_dir,
         now_ms: wall_now_ms,
     };
     let publish = state.clone();
@@ -143,14 +146,20 @@ async fn run_live(
             let status = engine.status(wall_now_ms());
             *publish.status.write().unwrap() =
                 serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
-            *publish.corrected.write().unwrap() = CorrectedLive {
+            *publish.ledger_live.write().unwrap() = LedgerLive {
+                since_ts_ms: status.first_post_ts_ms,
                 n_kept: engine.corrected_points.len(),
                 total_usd: engine
                     .corrected_points
                     .last()
                     .map(|(_, c)| *c)
                     .unwrap_or(0.0),
+                fees_usd: status.corrected_fees_usd,
                 equity: engine.corrected_points.clone(),
+                paper_n: engine.paper_points.len(),
+                paper_total_usd: engine.paper_points.last().map(|(_, c)| *c).unwrap_or(0.0),
+                paper_fees_usd: status.paper_fees_usd,
+                paper_equity: engine.paper_points.clone(),
             };
             *publish.ready.write().unwrap() = true;
             std::thread::sleep(std::time::Duration::from_millis(poll_ms));
@@ -242,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
             books_binding,
             params,
             ledger_dir,
+            artifacts,
             queue_verdicts,
             poll_ms,
             port,
@@ -255,6 +265,7 @@ async fn main() -> anyhow::Result<()> {
                 books_binding,
                 params,
                 ledger_dir,
+                artifacts,
                 queue_verdicts,
                 poll_ms,
                 port,
@@ -275,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
                     "mode": "serve",
                     "engine_version": tracer_engine::ENGINE_VERSION,
                 }))),
-                corrected: Arc::new(RwLock::new(CorrectedLive::default())),
+                ledger_live: Arc::new(RwLock::new(LedgerLive::default())),
                 ready: Arc::new(RwLock::new(true)),
                 ledger_dir,
                 artifacts_dir: artifacts,
