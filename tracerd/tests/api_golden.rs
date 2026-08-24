@@ -11,7 +11,7 @@ use tracer_engine::ledger::{
 #[path = "../src/api.rs"]
 #[allow(dead_code)]
 mod api;
-use api::{AppState, CorrectedLive, router};
+use api::{AppState, LedgerLive, router};
 
 const FIXED_NOW_MS: u64 = 1_787_600_000_000;
 
@@ -187,12 +187,23 @@ fn build_fixture_ledger(dir: &Path) {
 fn state(dir: &Path) -> AppState {
     AppState {
         status: Arc::new(RwLock::new(status_fixture())),
-        corrected: Arc::new(RwLock::new(CorrectedLive {
+        ledger_live: Arc::new(RwLock::new(LedgerLive {
+            since_ts_ms: Some(FIXED_NOW_MS - 30 * 3_600_000),
             n_kept: 2,
             total_usd: -0.35,
+            fees_usd: -0.006,
             equity: vec![
                 (FIXED_NOW_MS - 7_200_000, 0.15),
                 (FIXED_NOW_MS - 3_600_000, -0.35),
+            ],
+            paper_n: 4,
+            paper_total_usd: 1.85,
+            paper_fees_usd: -0.012,
+            paper_equity: vec![
+                (FIXED_NOW_MS - 29 * 3_600_000, 0.4),
+                (FIXED_NOW_MS - 7_200_000, 1.1),
+                (FIXED_NOW_MS - 5_400_000, 0.7),
+                (FIXED_NOW_MS - 3_600_000, 1.85),
             ],
         })),
         ready: Arc::new(RwLock::new(true)),
@@ -210,10 +221,12 @@ fn status_fixture() -> serde_json::Value {
         "params_version": 1,
         "symbol": "xyz_TSLA",
         "queue_verdicts": true,
-        "trades": {"watermark_ms": FIXED_NOW_MS - 65_000, "last_file": "hyperliquid_xyz-TSLA_trades_sync_20260824_060000.000.parquet", "files_read": 412},
-        "books": {"watermark_ms": FIXED_NOW_MS - 62_000, "last_file": "hyperliquid_xyz-TSLA_ob_sync_20260824_060000.000.parquet", "files_read": 977},
-        "merged_watermark_ms": FIXED_NOW_MS - 65_000,
+        "trades": {"watermark_ms": FIXED_NOW_MS - 65_000, "last_file": "hyperliquid_xyz-TSLA_trades_sync_20260824_060000.000.parquet", "files_read": 412, "advance_age_ms": 48_000, "stalled": true},
+        "books": {"watermark_ms": FIXED_NOW_MS - 245_000, "last_file": "hyperliquid_xyz-TSLA_ob_sync_20260824_060000.000.parquet", "files_read": 977, "advance_age_ms": 150_000, "stalled": true},
+        "merged_watermark_ms": FIXED_NOW_MS - 245_000,
         "idle": true,
+        "session": "RTH",
+        "verdict_trail_ms": 180_000,
         "calendar_expired": true,
         "open_trades": 3,
         "counters": {
@@ -221,10 +234,16 @@ fn status_fixture() -> serde_json::Value {
             "entry_expired_unfilled": 3, "entry_gapped": 1,
             "exit_maker": 25, "exit_taker_cross": 7, "exit_unpriced": 2,
             "would_be_voided_by_paper_filter": 2,
-            "queue_vs_through_disagreements": 4, "book_degraded": 5, "duplicates_dropped": 12
+            "queue_vs_through_disagreements": 4, "book_degraded": 5, "duplicates_dropped": 12,
+            "paper_exit_unpriced": 0
         },
         "corrected_n_kept": 32,
         "corrected_total_usd": -14.7,
+        "corrected_fees_usd": -0.096,
+        "paper_n": 38,
+        "paper_total_usd": 22.4,
+        "paper_fees_usd": -0.114,
+        "first_post_ts_ms": FIXED_NOW_MS - 30 * 3_600_000,
         "events_written": 208,
         "ready": true
     })
@@ -316,8 +335,8 @@ async fn api_responses_match_committed_goldens() {
 }
 
 #[tokio::test]
-async fn serve_mode_returns_replay_artifacts_when_present() {
-    let dir = std::env::temp_dir().join("tracer_api_serve_artifacts");
+async fn replay_routes_serve_artifacts_beside_the_live_ledger() {
+    let dir = std::env::temp_dir().join("tracer_api_replay_routes");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -327,10 +346,86 @@ async fn serve_mode_returns_replay_artifacts_when_present() {
     .unwrap();
     let mut s = state(&dir);
     s.artifacts_dir = Some(dir.clone());
-    let app = router(s, &["http://localhost:3000".to_string()]);
-    let (code, body) = get_json(app, "/api/tracer/ledger").await;
+    let app = || router(s.clone(), &["http://localhost:3000".to_string()]);
+
+    let (code, live) = get_json(app(), "/api/tracer/ledger").await;
     assert_eq!(code, 200);
-    assert_eq!(body["schema"], "tracer.corrected.v1");
-    assert_eq!(body["paper"]["n"], 14433);
+    assert_eq!(live["schema"], "tracer.ledger.live.v1");
+    assert_eq!(live["paper"]["denominator"], "every_posted_signal");
+
+    let (code, replay) = get_json(app(), "/api/tracer/replay/ledger").await;
+    assert_eq!(code, 200);
+    assert_eq!(replay["schema"], "tracer.corrected.v1");
+    assert_eq!(replay["paper"]["n"], 14433);
+
+    let (code, _) = get_json(app(), "/api/tracer/replay/fillrates").await;
+    assert_eq!(code, 404);
+    std::fs::write(
+        dir.join("fillrates.json"),
+        r#"{"schema":"tracer.fillrates.v1","mode":"replay","entry_cells":[]}"#,
+    )
+    .unwrap();
+    let (code, fr) = get_json(app(), "/api/tracer/replay/fillrates").await;
+    assert_eq!(code, 200);
+    assert_eq!(fr["schema"], "tracer.fillrates.v1");
+
+    let no_artifacts = state(&dir);
+    let bare = router(no_artifacts, &["http://localhost:3000".to_string()]);
+    let (code, _) = get_json(bare, "/api/tracer/replay/ledger").await;
+    assert_eq!(code, 404);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn duplicate_reappended_events_do_not_move_displayed_rates() {
+    let dir = std::env::temp_dir().join("tracer_api_dedupe_ledger");
+    build_fixture_ledger(&dir);
+    let origins = vec!["http://localhost:3000".to_string()];
+    let app = || router(state(&dir), &origins);
+
+    let (_, events_before) = get_json(app(), "/api/tracer/events?limit=100").await;
+    let (_, fr_before) = get_json(app(), "/api/tracer/fillrates?window=all").await;
+
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    files.sort();
+    let replayed: String = files
+        .iter()
+        .map(|p| std::fs::read_to_string(p).unwrap())
+        .collect();
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(files.last().unwrap())
+        .unwrap();
+    f.write_all(replayed.as_bytes()).unwrap();
+    f.flush().unwrap();
+
+    let (_, events_after) = get_json(app(), "/api/tracer/events?limit=100").await;
+    let (_, fr_after) = get_json(app(), "/api/tracer/fillrates?window=all").await;
+    assert_eq!(events_before, events_after);
+    assert_eq!(fr_before, fr_after);
+
+    let (_, page1) = get_json(app(), "/api/tracer/events?limit=6").await;
+    let cursor = page1["older_cursor"].as_str().unwrap();
+    let (_, page2) = get_json(
+        app(),
+        &format!("/api/tracer/events?limit=6&cursor={cursor}"),
+    )
+    .await;
+    let mut ids: Vec<String> = page1["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(page2["events"].as_array().unwrap().iter())
+        .map(|e| e["event_id"].as_str().unwrap().to_string())
+        .collect();
+    let n = ids.len();
+    assert_eq!(n, 12);
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), n, "duplicate event_ids leaked across pages");
     std::fs::remove_dir_all(&dir).unwrap();
 }

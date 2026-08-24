@@ -9,7 +9,19 @@
       "filled_through": 1,
       "filled_touch": 2,
       "gapped": 1,
-      "posted": 3
+      "posted": 3,
+      "time_to_fill_ms": {
+        "through": {
+          "n": 1,
+          "p50": 9000,
+          "p90": 9000
+        },
+        "touch": {
+          "n": 2,
+          "p50": 11000,
+          "p90": 11000
+        }
+      }
     }
   },
   "exit_cells": {
@@ -17,7 +29,10 @@
       "exit_unpriced": 0,
       "filled_through": 0,
       "posted": 1,
-      "taker_cross": 1
+      "taker_cross": 1,
+      "time_to_fill_ms": {
+        "through": null
+      }
     }
   },
   "mode": "live",
