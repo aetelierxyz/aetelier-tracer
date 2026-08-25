@@ -306,60 +306,56 @@ pub fn load_trades_files(paths: &[&Path]) -> anyhow::Result<(PrintsByStem, Vec<T
     Ok((by_stem, summaries))
 }
 
-pub struct LoadedBooks {
-    pub ticks: Vec<BookTick>,
-    pub summary: TapeFileSummary,
-}
-
-pub fn load_tape_books(path: &Path) -> anyhow::Result<LoadedBooks> {
-    expect_schema(path, TapeRole::Orderbook)?;
-    let data = read_ob_parquet(path, OrderbookTarget::Snapshot)
-        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-    let OrderbookTargetData::Snapshot(books) = data else {
-        anyhow::bail!("{}: not an orderbook snapshot parquet", path.display());
-    };
-    anyhow::ensure!(!books.is_empty(), "{}: no snapshots", path.display());
+pub fn load_books_files(paths: &[&Path]) -> anyhow::Result<(Vec<BookTick>, Vec<TapeFileSummary>)> {
     let mut stems: BTreeSet<String> = BTreeSet::new();
-    let mut ticks: Vec<BookTick> = Vec::with_capacity(books.len());
-    for ob in &books {
-        stems.insert(stem_of_symbol(&ob.pair.to_canonical()));
-        ticks.push(BookTick {
-            ts_ms: ob.orderbook_ts_us / 1_000,
-            bid_px: ob.bids.last_key_value().and_then(|(px, _)| px.to_f64()),
-            ask_px: ob.asks.first_key_value().and_then(|(px, _)| px.to_f64()),
-        });
-    }
-    ticks.sort_by_key(|t| t.ts_ms);
-    ticks.dedup_by_key(|t| t.ts_ms);
-    anyhow::ensure!(
-        stems.len() == 1,
-        "{}: {} symbols in one tape file, want exactly one",
-        path.display(),
-        stems.len()
-    );
-    let min_ts = ticks.first().map(|t| t.ts_ms).unwrap_or(0);
-    let max_ts = ticks.last().map(|t| t.ts_ms).unwrap_or(0);
-    Ok(LoadedBooks {
-        summary: TapeFileSummary {
+    let mut merged: Vec<BookTick> = Vec::new();
+    let mut summaries: Vec<TapeFileSummary> = Vec::new();
+    for path in paths {
+        expect_schema(path, TapeRole::Orderbook)?;
+        let data = read_ob_parquet(path, OrderbookTarget::Snapshot)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let OrderbookTargetData::Snapshot(books) = data else {
+            anyhow::bail!("{}: not an orderbook snapshot parquet", path.display());
+        };
+        anyhow::ensure!(!books.is_empty(), "{}: no snapshots", path.display());
+        let mut min_ts = u64::MAX;
+        let mut max_ts = 0u64;
+        let mut kept = 0usize;
+        for ob in &books {
+            stems.insert(stem_of_symbol(&ob.pair.to_canonical()));
+            let ts_ms = ob.orderbook_ts_us / 1_000;
+            min_ts = min_ts.min(ts_ms);
+            max_ts = max_ts.max(ts_ms);
+            kept += 1;
+            merged.push(BookTick {
+                ts_ms,
+                bid_px: ob.bids.last_key_value().and_then(|(px, _)| px.to_f64()),
+                ask_px: ob.asks.first_key_value().and_then(|(px, _)| px.to_f64()),
+            });
+        }
+        summaries.push(TapeFileSummary {
             role: TapeRole::Orderbook,
             file: file_name(path),
-            symbol_stem: stems.into_iter().next().unwrap(),
-            events: ticks.len(),
+            symbol_stem: stems.iter().cloned().collect::<Vec<_>>().join(","),
+            events: kept,
             min_ts_ms: min_ts,
             max_ts_ms: max_ts,
             sha256: file_sha256(path)?,
-        },
-        ticks,
-    })
+        });
+    }
+    anyhow::ensure!(
+        stems.len() <= 1,
+        "orderbook tape carries {} symbols ({}), want exactly one",
+        stems.len(),
+        stems.iter().cloned().collect::<Vec<_>>().join(", ")
+    );
+    merged.sort_by_key(|t| t.ts_ms);
+    merged.dedup_by_key(|t| t.ts_ms);
+    Ok((merged, summaries))
 }
 
-fn span_intersection(files: &[TapeFileSummary]) -> Option<SharedSpan> {
-    let start = files.iter().map(|f| f.min_ts_ms).max()?;
-    let end = files.iter().map(|f| f.max_ts_ms).min()?;
-    (start < end).then_some(SharedSpan {
-        start_ms: start,
-        end_ms: end,
-    })
+fn range_of<T, F: Fn(&T) -> u64>(items: &[T], ts: F) -> Option<(u64, u64)> {
+    Some((ts(items.first()?), ts(items.last()?)))
 }
 
 fn last_px_at_or_before(prints: &[FillRow], ts_ms: u64) -> Option<f64> {
@@ -729,7 +725,6 @@ pub fn prepare(
             TapeRole::Orderbook => ob_paths.push(path),
         }
     }
-    anyhow::ensure!(ob_paths.len() <= 1, "more than one orderbook tape file");
     match load_trades_files(&trades_paths) {
         Ok((by_stem, summaries)) => {
             for s in &summaries {
@@ -740,17 +735,18 @@ pub fn prepare(
         }
         Err(e) => errors.push(file_error("trades", format!("{e:#}"))),
     }
-    if let Some(path) = ob_paths.first() {
-        match load_tape_books(path) {
-            Ok(loaded) => {
-                input_sha256.insert(
-                    format!("orderbook/{}", loaded.summary.file),
-                    loaded.summary.sha256.clone(),
-                );
-                books = loaded.ticks;
-                files.push(loaded.summary);
+    let mut ob_stem: Option<String> = None;
+    if !ob_paths.is_empty() {
+        match load_books_files(&ob_paths) {
+            Ok((ticks, summaries)) => {
+                for s in &summaries {
+                    input_sha256.insert(format!("orderbook/{}", s.file), s.sha256.clone());
+                }
+                ob_stem = summaries.first().map(|s| s.symbol_stem.clone());
+                books = ticks;
+                files.extend(summaries);
             }
-            Err(e) => errors.push(file_error(&file_name(path), format!("{e:#}"))),
+            Err(e) => errors.push(file_error("orderbook", format!("{e:#}"))),
         }
     }
 
@@ -761,25 +757,46 @@ pub fn prepare(
             reason: "no trades tape provided".into(),
         });
     }
-    let ob_file = files
-        .iter()
-        .find(|f| f.role == TapeRole::Orderbook)
-        .cloned();
-    if let Some(ob) = &ob_file {
+    if let Some(ob) = &ob_stem {
         for stem in prints_by_stem.keys() {
-            if &ob.symbol_stem != stem {
+            if ob != stem {
                 errors.push(RowError {
                     row: 0,
                     field: "tape".into(),
-                    reason: format!(
-                        "symbol mismatch: orderbook {} vs trades {stem}",
-                        ob.symbol_stem
-                    ),
+                    reason: format!("symbol mismatch: orderbook {ob} vs trades {stem}"),
                 });
             }
         }
     }
-    let span = span_intersection(&files);
+    let trades_range = {
+        let lo = prints_by_stem
+            .values()
+            .filter_map(|p| p.first())
+            .map(|r| r.time_ms)
+            .min();
+        let hi = prints_by_stem
+            .values()
+            .filter_map(|p| p.last())
+            .map(|r| r.time_ms)
+            .max();
+        lo.zip(hi)
+    };
+    let ob_range = range_of(&books, |t| t.ts_ms);
+    let span = match (trades_range, ob_range) {
+        (Some((tl, th)), Some((ol, oh))) => {
+            let start = tl.max(ol);
+            let end = th.min(oh);
+            (start < end).then_some(SharedSpan {
+                start_ms: start,
+                end_ms: end,
+            })
+        }
+        (Some((tl, th)), None) => (tl < th).then_some(SharedSpan {
+            start_ms: tl,
+            end_ms: th,
+        }),
+        _ => None,
+    };
     if span.is_none() && !files.is_empty() {
         errors.push(RowError {
             row: 0,
@@ -799,8 +816,7 @@ pub fn prepare(
         return Ok(Err(report));
     }
 
-    let ob_span = ob_file.as_ref().map(|f| (f.min_ts_ms, f.max_ts_ms));
-    let coverage = coverage_by_stem(&prints_by_stem, ob_span);
+    let coverage = coverage_by_stem(&prints_by_stem, ob_range);
 
     let into_data = |map: BTreeMap<String, Vec<FillRow>>| -> Vec<SymbolData> {
         map.into_iter()
