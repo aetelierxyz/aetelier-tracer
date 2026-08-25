@@ -11,6 +11,7 @@ pub mod params;
 pub mod replay;
 pub mod signal;
 pub mod stats;
+pub mod trace;
 pub mod verdict;
 
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");

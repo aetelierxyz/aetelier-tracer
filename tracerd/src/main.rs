@@ -1,4 +1,5 @@
 mod api;
+mod traces;
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -57,6 +58,8 @@ enum Command {
         cross_window_ms: u64,
         #[arg(long, env = "TRACER_IDLE_AFTER_MS", default_value_t = DEFAULT_IDLE_AFTER_MS)]
         idle_after_ms: u64,
+        #[arg(long, env = "TRACER_TRACES_DIR")]
+        traces_dir: Option<PathBuf>,
     },
     Replay {
         #[arg(long, env = "TRACER_FILLS_DIR")]
@@ -77,6 +80,14 @@ enum Command {
         artifacts: Option<PathBuf>,
         #[arg(long, env = "TRACER_PORT", default_value_t = 8330)]
         port: u16,
+        #[arg(long, env = "TRACER_TRACES_DIR")]
+        traces_dir: Option<PathBuf>,
+        #[arg(
+            long,
+            env = "TRACER_PARAMS",
+            default_value = "./params/tracer_params.v1.json"
+        )]
+        params: PathBuf,
     },
     ExportGolden {
         #[arg(long, env = "TRACER_FILLS_DIR")]
@@ -85,6 +96,36 @@ enum Command {
         params: PathBuf,
         #[arg(long, default_value = "./out/paper_trades_golden.csv")]
         out: PathBuf,
+    },
+    Evaluate {
+        #[arg(long, env = "TRACER_TAPE")]
+        tape: String,
+        #[arg(long, env = "TRACER_ORDERS")]
+        orders: String,
+        #[arg(
+            long,
+            env = "TRACER_PARAMS",
+            default_value = "./params/tracer_params.v1.json"
+        )]
+        params: PathBuf,
+        #[arg(long, default_value = "./out/trace")]
+        out: PathBuf,
+        #[arg(long, env = "TRACER_EXIT_GRACE_MS", default_value_t = DEFAULT_GRACE_MS)]
+        grace_ms: u64,
+        #[arg(long, env = "TRACER_CROSS_WINDOW_MS", default_value_t = DEFAULT_CROSS_WINDOW_MS)]
+        cross_window_ms: u64,
+        #[arg(long)]
+        notional_usd: Option<f64>,
+        #[arg(long)]
+        hold_ms: Option<u64>,
+        #[arg(long)]
+        maker_fee_bps: Option<f64>,
+        #[arg(long)]
+        taker_fee_bps: Option<f64>,
+        #[arg(long, env = "TRACER_TRADES_BINDING")]
+        trades_binding: Option<PathBuf>,
+        #[arg(long, env = "TRACER_BOOKS_BINDING")]
+        books_binding: Option<PathBuf>,
     },
 }
 
@@ -111,9 +152,23 @@ async fn run_live(
     grace_ms: u64,
     cross_window_ms: u64,
     idle_after_ms: u64,
+    traces_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let params = TracerParams::load(&params_path)?;
     let stem = symbol.replace(':', "_");
+    let traces_rt = traces_dir
+        .map(|dir| {
+            traces::TraceRuntime::start(
+                dir,
+                params_path.clone(),
+                grace_ms,
+                cross_window_ms,
+                Some(trades_binding.clone()),
+                books_binding.clone(),
+                Some(stem.clone()),
+            )
+        })
+        .transpose()?;
     let cfg = LiveConfig {
         symbol_stem: stem.clone(),
         grace_ms,
@@ -137,6 +192,7 @@ async fn run_live(
         trades_binding: Some(trades_binding.clone()),
         books_binding: books_binding.clone(),
         symbol_stem: Some(stem),
+        traces: traces_rt,
         now_ms: wall_now_ms,
     };
     let publish = state.clone();
@@ -204,6 +260,70 @@ fn run_replay(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_evaluate(
+    tape: &str,
+    orders: &str,
+    params_path: &std::path::Path,
+    out: &std::path::Path,
+    grace_ms: u64,
+    cross_window_ms: u64,
+    overrides: Option<tracer_engine::trace::TraceOverrides>,
+    trades_binding: Option<&std::path::Path>,
+    books_binding: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use tracer_engine::market_engine::read_gap_spans;
+    use tracer_engine::trace::{
+        OrderSourceSpec, TapeRole, TraceRequest, execute, load_live_tape_files, prepare, sniff_role,
+    };
+    let (tape_files, gap_spans) = if tape == "live" {
+        let trades_root =
+            trades_binding.ok_or_else(|| anyhow::anyhow!("--tape live needs --trades-binding"))?;
+        let files = load_live_tape_files(trades_root, books_binding)?;
+        (files, read_gap_spans(trades_root, None)?)
+    } else {
+        let mut files: Vec<(TapeRole, PathBuf)> = Vec::new();
+        for part in tape.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let path = PathBuf::from(part);
+            files.push((sniff_role(&path)?, path));
+        }
+        anyhow::ensure!(!files.is_empty(), "--tape lists no files");
+        (files, Vec::new())
+    };
+    let order_source = if orders == "strategy" {
+        OrderSourceSpec::Strategy
+    } else {
+        OrderSourceSpec::Signals(PathBuf::from(orders))
+    };
+    let base_params = TracerParams::load(params_path)?;
+    let req = TraceRequest {
+        tape_files,
+        orders: order_source,
+        overrides,
+        grace_ms,
+        cross_window_ms,
+        gap_spans,
+    };
+    match prepare(&req, &base_params)? {
+        Err(report) => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            anyhow::bail!(
+                "strict validation failed: {} errors",
+                report.row_errors.len()
+            );
+        }
+        Ok(prepared) => {
+            let summary = execute(&prepared, grace_ms, cross_window_ms, out)?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            println!(
+                "artifacts: {}/corrected_ledger.json, fillrates.json, ledger/",
+                out.display()
+            );
+            Ok(())
+        }
+    }
+}
+
 fn export_golden(
     fills: &std::path::Path,
     params_path: &std::path::Path,
@@ -261,6 +381,7 @@ async fn main() -> anyhow::Result<()> {
             grace_ms,
             cross_window_ms,
             idle_after_ms,
+            traces_dir,
         } => {
             run_live(
                 symbol,
@@ -275,6 +396,7 @@ async fn main() -> anyhow::Result<()> {
                 grace_ms,
                 cross_window_ms,
                 idle_after_ms,
+                traces_dir,
             )
             .await
         }
@@ -282,7 +404,22 @@ async fn main() -> anyhow::Result<()> {
             ledger_dir,
             artifacts,
             port,
+            traces_dir,
+            params,
         } => {
+            let traces_rt = traces_dir
+                .map(|dir| {
+                    traces::TraceRuntime::start(
+                        dir,
+                        params.clone(),
+                        DEFAULT_GRACE_MS,
+                        DEFAULT_CROSS_WINDOW_MS,
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .transpose()?;
             let state = AppState {
                 status: Arc::new(RwLock::new(serde_json::json!({
                     "schema": "tracer.status.v1",
@@ -296,6 +433,7 @@ async fn main() -> anyhow::Result<()> {
                 trades_binding: None,
                 books_binding: None,
                 symbol_stem: None,
+                traces: traces_rt,
                 now_ms: wall_now_ms,
             };
             serve_api(state, port).await
@@ -308,6 +446,42 @@ async fn main() -> anyhow::Result<()> {
             cross_window_ms,
         } => run_replay(&fills, &params, &out, grace_ms, cross_window_ms),
         Command::ExportGolden { fills, params, out } => export_golden(&fills, &params, &out),
+        Command::Evaluate {
+            tape,
+            orders,
+            params,
+            out,
+            grace_ms,
+            cross_window_ms,
+            notional_usd,
+            hold_ms,
+            maker_fee_bps,
+            taker_fee_bps,
+            trades_binding,
+            books_binding,
+        } => {
+            let overrides = (notional_usd.is_some()
+                || hold_ms.is_some()
+                || maker_fee_bps.is_some()
+                || taker_fee_bps.is_some())
+            .then_some(tracer_engine::trace::TraceOverrides {
+                notional_usd,
+                hold_ms,
+                maker_fee_leg_bps: maker_fee_bps,
+                taker_fee_leg_bps: taker_fee_bps,
+            });
+            run_evaluate(
+                &tape,
+                &orders,
+                &params,
+                &out,
+                grace_ms,
+                cross_window_ms,
+                overrides,
+                trades_binding.as_deref(),
+                books_binding.as_deref(),
+            )
+        }
     }
 }
 

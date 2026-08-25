@@ -11,6 +11,9 @@ use tracer_engine::ledger::{
 #[path = "../src/api.rs"]
 #[allow(dead_code)]
 mod api;
+#[path = "../src/traces.rs"]
+#[allow(dead_code)]
+mod traces;
 use api::{AppState, LedgerLive, router};
 
 const FIXED_NOW_MS: u64 = 1_787_600_000_000;
@@ -38,6 +41,7 @@ fn event(
         kind,
         leg,
         mode: Mode::Live,
+        trace_id: None,
         ts_ms,
         wall_ts_ms: ts_ms + 1_500,
         engine_version: "0.1.0".into(),
@@ -268,6 +272,7 @@ fn state(dir: &Path) -> AppState {
         trades_binding: Some(dir.join("binding")),
         books_binding: None,
         symbol_stem: Some("xyz_TSLA".into()),
+        traces: None,
         now_ms: fixed_now,
     }
 }

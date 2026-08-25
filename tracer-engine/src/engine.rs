@@ -356,6 +356,7 @@ impl LiveEngine {
             kind,
             leg,
             mode: Mode::Live,
+            trace_id: None,
             ts_ms,
             wall_ts_ms: now_wall_ms(),
             engine_version: crate::ENGINE_VERSION.into(),
