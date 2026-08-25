@@ -265,7 +265,9 @@ struct RegimeSplit {
 #[derive(serde::Serialize)]
 struct CorrectedLedgerJson<'a> {
     schema: &'static str,
-    mode: &'static str,
+    mode: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_id: Option<&'a str>,
     params_version: u32,
     engine_version: &'static str,
     input_sha256: &'a BTreeMap<String, String>,
@@ -326,7 +328,9 @@ struct ExitCell {
 #[derive(serde::Serialize)]
 struct FillratesJson<'a> {
     schema: &'static str,
-    mode: &'static str,
+    mode: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_id: Option<&'a str>,
     params_version: u32,
     engine_version: &'static str,
     input_sha256: &'a BTreeMap<String, String>,
@@ -389,6 +393,27 @@ pub fn write_artifacts(
     cross_window_ms: u64,
     out_dir: &Path,
 ) -> anyhow::Result<()> {
+    write_artifacts_stamped(
+        verdicts,
+        params,
+        grace_ms,
+        cross_window_ms,
+        out_dir,
+        "replay",
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_artifacts_stamped(
+    verdicts: &[TradeVerdicts],
+    params: &TracerParams,
+    grace_ms: u64,
+    cross_window_ms: u64,
+    out_dir: &Path,
+    mode: &str,
+    trace_id: Option<&str>,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(out_dir)?;
 
     let paper_refs: Vec<&ExecutedTrade> = verdicts.iter().map(|v| &v.trade).collect();
@@ -429,7 +454,8 @@ pub fn write_artifacts(
 
     let ledger = CorrectedLedgerJson {
         schema: "tracer.corrected.v1",
-        mode: "replay",
+        mode,
+        trace_id,
         params_version: params.params_version,
         engine_version: crate::ENGINE_VERSION,
         input_sha256: &params.input_sha256,
@@ -536,7 +562,8 @@ pub fn write_artifacts(
 
     let fillrates = FillratesJson {
         schema: "tracer.fillrates.v1",
-        mode: "replay",
+        mode,
+        trace_id,
         params_version: params.params_version,
         engine_version: crate::ENGINE_VERSION,
         input_sha256: &params.input_sha256,
@@ -558,6 +585,17 @@ pub fn emit_events(
     grace_ms: u64,
     writer: &mut LedgerWriter,
 ) -> anyhow::Result<()> {
+    emit_events_stamped(verdicts, params, grace_ms, writer, Mode::Replay, None)
+}
+
+pub fn emit_events_stamped(
+    verdicts: &[TradeVerdicts],
+    params: &TracerParams,
+    grace_ms: u64,
+    writer: &mut LedgerWriter,
+    mode: Mode,
+    trace_id: Option<&str>,
+) -> anyhow::Result<()> {
     for v in verdicts {
         let t = &v.trade;
         let tid = trade_id(&t.symbol, t.t_entry_ms, t.side);
@@ -569,7 +607,8 @@ pub fn emit_events(
             seq,
             kind,
             leg,
-            mode: Mode::Replay,
+            mode,
+            trace_id: trace_id.map(|s| s.to_string()),
             ts_ms,
             wall_ts_ms: ts_ms,
             engine_version: crate::ENGINE_VERSION.into(),

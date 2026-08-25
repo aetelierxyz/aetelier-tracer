@@ -17,6 +17,9 @@ tower-http.workspace = true
 tracer-engine.workspace = true
 
 [dev-dependencies]
+aetelier-io.workspace = true
+aetelier-types.workspace = true
 http-body-util = "0.1"
-sha2 = "0.10"
+rust_decimal.workspace = true
+sha2.workspace = true
 tower = { version = "0.5", features = ["util"] }
