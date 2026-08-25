@@ -36,10 +36,20 @@ fn temp_dir(name: &str) -> PathBuf {
 
 fn fills_to_trades_parquet(fills_csv: &Path, coin: &str, out: &Path) {
     let rows = read_fills_csv(fills_csv).unwrap();
+    rows_to_trades_parquet(&rows, coin, out, 0);
+}
+
+fn rows_to_trades_parquet(
+    rows: &[tracer_engine::bars::FillRow],
+    coin: &str,
+    out: &Path,
+    id_offset: usize,
+) {
     let pair = TradingPair::from_str(&format!("{coin}/USDC")).unwrap();
     let trades: Vec<Trade> = rows
         .iter()
         .enumerate()
+        .map(|(i, r)| (i + id_offset, r))
         .map(|(i, r)| Trade {
             source_trade_ts_us: r.time_ms * 1_000,
             local_trade_ts_us: r.time_ms * 1_000,
@@ -560,6 +570,57 @@ fn signals_row_cap_rejects() {
             .iter()
             .any(|e| e.reason.contains("row cap"))
     );
+}
+
+#[test]
+fn live_shaped_multifile_tape_prepares_with_the_union_span() {
+    let w = mini_world("multifile");
+    let rows = read_fills_csv(&w.dir.join("fills").join("xyz_TSLA.csv")).unwrap();
+    let mid_ms = rows[rows.len() / 2].time_ms;
+    let split = rows.partition_point(|r| r.time_ms <= mid_ms);
+    let t_min = rows.first().unwrap().time_ms;
+    let t_max = rows.last().unwrap().time_ms;
+
+    let trades_a = w.dir.join("trades_a.parquet");
+    let trades_b = w.dir.join("trades_b.parquet");
+    rows_to_trades_parquet(&rows[..split], "xyz:TSLA", &trades_a, 0);
+    rows_to_trades_parquet(&rows[split..], "xyz:TSLA", &trades_b, split);
+
+    let ob_dir_a = w.dir.join("ob_a");
+    let ob_dir_b = w.dir.join("ob_b");
+    std::fs::create_dir_all(&ob_dir_a).unwrap();
+    std::fs::create_dir_all(&ob_dir_b).unwrap();
+    let ob_a = write_ob_file(&ob_dir_a, "xyz:TSLA", &[t_min, mid_ms]);
+    let ob_b = write_ob_file(&ob_dir_b, "xyz:TSLA", &[mid_ms + 60_000, t_max]);
+
+    let req = TraceRequest {
+        tape_files: vec![
+            (TapeRole::Trades, trades_a),
+            (TapeRole::Trades, trades_b),
+            (TapeRole::Orderbook, ob_a),
+            (TapeRole::Orderbook, ob_b),
+        ],
+        orders: OrderSourceSpec::Strategy,
+        overrides: None,
+        grace_ms: DEFAULT_GRACE_MS,
+        cross_window_ms: DEFAULT_CROSS_WINDOW_MS,
+        gap_spans: Vec::new(),
+    };
+    let prepared = match prepare(&req, &w.params).unwrap() {
+        Ok(p) => p,
+        Err(r) => panic!("multi-file tape rejected: {:?}", r.row_errors),
+    };
+    let span = prepared.report.span.unwrap();
+    assert_eq!(span.start_ms, t_min);
+    assert_eq!(span.end_ms, t_max);
+    assert_eq!(prepared.report.files.len(), 4);
+    assert_eq!(prepared.trades, w.replay_trades);
+    assert_eq!(
+        prepared.books.first().unwrap().ts_ms,
+        t_min,
+        "merged book ticks must span both files"
+    );
+    assert_eq!(prepared.books.last().unwrap().ts_ms, t_max);
 }
 
 #[test]

@@ -10,7 +10,7 @@ use tracer_engine::params::TracerParams;
 use tracer_engine::trace::{
     BookTick, MAX_SIGNALS_BYTES, MAX_TAPE_BYTES, OrderSourceSpec, PreflightReport, RowError,
     SchemaFieldOut, TapeRole, TraceOverrides, TraceRequest, TraceSummary, book_series, execute,
-    load_live_tape_files, load_tape_books, load_trades_files, parquet_schema_fields, prepare,
+    load_books_files, load_live_tape_files, load_trades_files, parquet_schema_fields, prepare,
 };
 
 use crate::api::{AppState, EventsQuery, paged_events};
@@ -260,11 +260,11 @@ impl TraceRuntime {
         }
         let req = self.request_for(record)?;
         let mut trades_paths: Vec<&Path> = Vec::new();
-        let mut books_path: Option<&Path> = None;
+        let mut books_paths: Vec<&Path> = Vec::new();
         for (role, path) in &req.tape_files {
             match role {
                 TapeRole::Trades => trades_paths.push(path),
-                TapeRole::Orderbook => books_path = Some(path),
+                TapeRole::Orderbook => books_paths.push(path),
             }
         }
         let (by_stem, _) = load_trades_files(&trades_paths)?;
@@ -274,9 +274,10 @@ impl TraceRuntime {
             .map(|r| (r.time_ms, r.px, r.sz, r.is_buy))
             .collect();
         prints.sort_by_key(|p| p.0);
-        let books = match books_path {
-            Some(p) => load_tape_books(p)?.ticks,
-            None => Vec::new(),
+        let books = if books_paths.is_empty() {
+            Vec::new()
+        } else {
+            load_books_files(&books_paths)?.0
         };
         let tape = Arc::new(CachedTape { prints, books });
         *self.cache.lock().unwrap() = Some((record.trace_id.clone(), tape.clone()));
