@@ -305,7 +305,10 @@ fn status_fixture() -> serde_json::Value {
         "first_post_ts_ms": FIXED_NOW_MS - 30 * 3_600_000,
         "events_written": 208,
         "ready": true,
-        "binding_pending": false
+        "binding_pending": false,
+        "maker_fee_leg_bps": -0.015,
+        "taker_fee_leg_bps": 1.044,
+        "notional_usd": 1000.0
     })
 }
 
