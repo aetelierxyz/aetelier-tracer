@@ -9,7 +9,8 @@ use axum::routing::get;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 
-use tracer_engine::ledger::Event;
+use tracer_engine::ledger::{Event, EventKind, Leg};
+use tracer_engine::market_engine::{GapIncident, read_gap_incidents};
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct LedgerLive {
@@ -31,6 +32,9 @@ pub struct AppState {
     pub ready: Arc<RwLock<bool>>,
     pub ledger_dir: PathBuf,
     pub artifacts_dir: Option<PathBuf>,
+    pub trades_binding: Option<PathBuf>,
+    pub books_binding: Option<PathBuf>,
+    pub symbol_stem: Option<String>,
     pub now_ms: fn() -> u64,
 }
 
@@ -48,6 +52,7 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> axum::Router {
         .route("/readyz", get(readyz))
         .route("/api/tracer/status", get(status))
         .route("/api/tracer/events", get(events))
+        .route("/api/tracer/gaps", get(gaps))
         .route("/api/tracer/fillrates", get(fillrates))
         .route("/api/tracer/ledger", get(ledger))
         .route("/api/tracer/replay/ledger", get(replay_ledger))
@@ -128,6 +133,33 @@ fn read_event_lines(path: &PathBuf) -> Vec<Event> {
 struct EventsQuery {
     cursor: Option<String>,
     limit: Option<usize>,
+    trade_id: Option<String>,
+    kind: Option<String>,
+    leg: Option<String>,
+    regime: Option<String>,
+    symbol: Option<String>,
+    since_ms: Option<u64>,
+    until_ms: Option<u64>,
+}
+
+fn parse_kind(s: &str) -> Option<EventKind> {
+    Some(match s {
+        "POSTED" => EventKind::Posted,
+        "OBSERVED" => EventKind::Observed,
+        "FILLED" => EventKind::Filled,
+        "EXPIRED" => EventKind::Expired,
+        "TAKER_CROSS" => EventKind::TakerCross,
+        "EVIDENCE" => EventKind::Evidence,
+        _ => return None,
+    })
+}
+
+fn parse_leg(s: &str) -> Option<Leg> {
+    Some(match s {
+        "entry" => Leg::Entry,
+        "exit" => Leg::Exit,
+        _ => return None,
+    })
 }
 
 #[derive(serde::Serialize)]
@@ -170,10 +202,27 @@ async fn events(
         None => None,
         Some(c) => Some(decode_cursor(c).ok_or(StatusCode::BAD_REQUEST)?),
     };
+    let kind = match &q.kind {
+        None => None,
+        Some(k) => Some(parse_kind(k).ok_or(StatusCode::BAD_REQUEST)?),
+    };
+    let leg = match &q.leg {
+        None => None,
+        Some(l) => Some(parse_leg(l).ok_or(StatusCode::BAD_REQUEST)?),
+    };
     let mut all = deduped_events(&s.ledger_dir);
     if let Some((cf, cl)) = &start {
         all.retain(|(name, idx, _)| name < cf || (name == cf && idx < cl));
     }
+    all.retain(|(_, _, e)| {
+        q.trade_id.as_ref().is_none_or(|t| &e.trade_id == t)
+            && kind.is_none_or(|k| e.kind == k)
+            && leg.is_none_or(|l| e.leg == l)
+            && q.regime.as_ref().is_none_or(|r| &e.regime == r)
+            && q.symbol.as_ref().is_none_or(|sym| &e.symbol == sym)
+            && q.since_ms.is_none_or(|t| e.ts_ms >= t)
+            && q.until_ms.is_none_or(|t| e.ts_ms <= t)
+    });
     let cut = all.len().saturating_sub(limit);
     let older = (cut > 0).then(|| encode_cursor(&all[cut].0, all[cut].1));
     let events = all.split_off(cut).into_iter().map(|(_, _, e)| e).collect();
@@ -181,6 +230,132 @@ async fn events(
         events,
         older_cursor: older,
     }))
+}
+
+#[derive(serde::Deserialize)]
+struct GapsQuery {
+    window: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct GapIncidentOut {
+    start_ms: u64,
+    end_ms: u64,
+    window_us: u64,
+    cause: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    possible_dropped_trades: Option<u64>,
+    exchange: String,
+    symbol: String,
+}
+
+#[derive(serde::Serialize)]
+struct GapsResponse {
+    schema: &'static str,
+    mode: &'static str,
+    window: String,
+    coverage_pct: f64,
+    incident_count: usize,
+    total_gap_ms: u64,
+    est_dropped_trades_sum: u64,
+    incidents: Vec<GapIncidentOut>,
+}
+
+fn merged_overlap_ms(spans: &mut [(u64, u64)], since: u64, now: u64) -> u64 {
+    spans.sort_unstable();
+    let mut total = 0u64;
+    let mut cur: Option<(u64, u64)> = None;
+    for &(s0, e0) in spans.iter() {
+        let s = s0.max(since);
+        let e = e0.min(now);
+        if e <= s {
+            continue;
+        }
+        match cur {
+            Some((cs, ce)) if s <= ce => cur = Some((cs, ce.max(e))),
+            Some((cs, ce)) => {
+                total += ce - cs;
+                cur = Some((s, e));
+                let _ = cs;
+            }
+            None => cur = Some((s, e)),
+        }
+    }
+    if let Some((cs, ce)) = cur {
+        total += ce - cs;
+    }
+    total
+}
+
+async fn gaps(
+    State(s): State<AppState>,
+    Query(q): Query<GapsQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let trades_root = s.trades_binding.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let window = q.window.unwrap_or_else(|| "24h".into());
+    let now = (s.now_ms)();
+    let cutoff = match window.as_str() {
+        "24h" => now.saturating_sub(24 * 3_600_000),
+        "7d" => now.saturating_sub(7 * 24 * 3_600_000),
+        "all" => 0,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let stem = s.symbol_stem.as_deref();
+    let mut incidents: Vec<GapIncident> =
+        read_gap_incidents(trades_root, stem).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(root) = &s.books_binding {
+        incidents
+            .extend(read_gap_incidents(root, stem).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+    }
+    incidents.sort_by_key(|i| i.opened_epoch_us);
+    let in_window: Vec<&GapIncident> = incidents
+        .iter()
+        .filter(|i| i.closed_epoch_us / 1_000 > cutoff)
+        .collect();
+    let since = if window == "all" {
+        in_window
+            .first()
+            .map(|i| i.opened_epoch_us / 1_000)
+            .unwrap_or(now)
+    } else {
+        cutoff
+    };
+    let mut spans: Vec<(u64, u64)> = in_window
+        .iter()
+        .map(|i| (i.opened_epoch_us / 1_000, i.closed_epoch_us / 1_000))
+        .collect();
+    let total_gap_ms = merged_overlap_ms(&mut spans, since, now);
+    let elapsed = now.saturating_sub(since);
+    let coverage_pct = if elapsed == 0 {
+        100.0
+    } else {
+        100.0 * (1.0 - total_gap_ms as f64 / elapsed as f64)
+    };
+    let body = GapsResponse {
+        schema: "tracer.gaps.v1",
+        mode: "live",
+        window,
+        coverage_pct,
+        incident_count: in_window.len(),
+        total_gap_ms,
+        est_dropped_trades_sum: in_window
+            .iter()
+            .filter_map(|i| i.possible_dropped_trades)
+            .sum(),
+        incidents: in_window
+            .iter()
+            .map(|i| GapIncidentOut {
+                start_ms: i.opened_epoch_us / 1_000,
+                end_ms: i.closed_epoch_us / 1_000,
+                window_us: i.window_us,
+                cause: i.cause.clone(),
+                possible_dropped_trades: i.possible_dropped_trades,
+                exchange: i.exchange.clone(),
+                symbol: i.symbol.clone(),
+            })
+            .collect(),
+    };
+    Ok(Json(serde_json::to_value(body).unwrap()))
 }
 
 #[derive(serde::Deserialize)]

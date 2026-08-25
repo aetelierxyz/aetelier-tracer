@@ -75,6 +75,11 @@ impl BookTailer {
         !self.resolved
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_snapshot(&mut self, snap: BookSnapshot) {
+        self.snapshots.insert(snap.ts_ms, snap);
+    }
+
     pub fn poll(&mut self) -> anyhow::Result<()> {
         if !self.try_resolve()? {
             return Ok(());
@@ -198,6 +203,42 @@ pub fn scan_queue(
         }
     }
     scan
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OppositeEvidence {
+    pub notional_usd: f64,
+    pub vwap: Option<f64>,
+    pub n_prints: u64,
+}
+
+pub fn opposite_evidence(
+    prints: &[FillRow],
+    maker_side: MakerSide,
+    posted_px: f64,
+    start_ms: u64,
+    end_ms: u64,
+) -> OppositeEvidence {
+    let mut ev = OppositeEvidence::default();
+    let mut sz_sum = 0.0;
+    let mut px_x_sz = 0.0;
+    let start = prints.partition_point(|p| p.time_ms <= start_ms);
+    for p in &prints[start..] {
+        if p.time_ms > end_ms {
+            break;
+        }
+        if !opposite_at_or_through(maker_side, p.px, posted_px, p.is_buy) {
+            continue;
+        }
+        ev.notional_usd += p.px * p.sz;
+        ev.n_prints += 1;
+        sz_sum += p.sz;
+        px_x_sz += p.px * p.sz;
+    }
+    if sz_sum > 0.0 {
+        ev.vwap = Some(px_x_sz / sz_sum);
+    }
+    ev
 }
 
 pub fn prints_as_fillrows(prints: &[Print]) -> Vec<FillRow> {

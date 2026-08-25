@@ -115,7 +115,7 @@ async fn run_live(
     let params = TracerParams::load(&params_path)?;
     let stem = symbol.replace(':', "_");
     let cfg = LiveConfig {
-        symbol_stem: stem,
+        symbol_stem: stem.clone(),
         grace_ms,
         cross_window_ms,
         queue_verdicts,
@@ -134,6 +134,9 @@ async fn run_live(
         ready: Arc::new(RwLock::new(false)),
         ledger_dir,
         artifacts_dir,
+        trades_binding: Some(trades_binding.clone()),
+        books_binding: books_binding.clone(),
+        symbol_stem: Some(stem),
         now_ms: wall_now_ms,
     };
     let publish = state.clone();
@@ -290,6 +293,9 @@ async fn main() -> anyhow::Result<()> {
                 ready: Arc::new(RwLock::new(true)),
                 ledger_dir,
                 artifacts_dir: artifacts,
+                trades_binding: None,
+                books_binding: None,
+                symbol_stem: None,
                 now_ms: wall_now_ms,
             };
             serve_api(state, port).await

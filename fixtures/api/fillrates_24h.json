@@ -6,19 +6,19 @@
       "book_degraded_stale": 1,
       "expired_unfilled": 0,
       "filled_queue": 1,
-      "filled_through": 1,
-      "filled_touch": 2,
+      "filled_through": 2,
+      "filled_touch": 3,
       "gapped": 1,
-      "posted": 3,
+      "posted": 4,
       "time_to_fill_ms": {
         "through": {
-          "n": 1,
+          "n": 2,
           "p50": 9000,
           "p90": 9000
         },
         "touch": {
-          "n": 2,
-          "p50": 11000,
+          "n": 3,
+          "p50": 5000,
           "p90": 11000
         }
       }
