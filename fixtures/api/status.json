@@ -1,4 +1,5 @@
 {
+  "binding_pending": false,
   "books": {
     "advance_age_ms": 150000,
     "files_read": 977,

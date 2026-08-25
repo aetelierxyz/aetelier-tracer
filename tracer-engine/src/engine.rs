@@ -169,6 +169,7 @@ pub struct EngineStatus {
     pub first_post_ts_ms: Option<u64>,
     pub events_written: u64,
     pub ready: bool,
+    pub binding_pending: bool,
 }
 
 pub struct LiveEngine {
@@ -315,6 +316,8 @@ impl LiveEngine {
             first_post_ts_ms: self.first_post_ts_ms,
             events_written: self.ledger.events_written,
             ready: self.ready,
+            binding_pending: self.trades.pending()
+                || self.books.as_ref().is_some_and(|b| b.pending()),
             trades,
             books,
         }
@@ -796,6 +799,22 @@ mod tests {
             trade(4_000, 100.0, 5.0, false, "n4"),
             trade(10_000, 100.0, 10.0, true, "burst"),
         ]
+    }
+
+    #[test]
+    fn engine_idles_binding_pending_until_skeleton_appears() {
+        let (binding, ledger) = fixture("pending");
+        std::fs::remove_dir_all(&binding).unwrap();
+        let mut eng = LiveEngine::new(test_params(), cfg(), &binding, None, &ledger).unwrap();
+        assert!(eng.status(1_000).binding_pending);
+        eng.tick(1_000).unwrap();
+        assert_eq!(eng.counters.posted, 0);
+        let dir = binding.join("hyperliquid/perpetual/trades");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_trades_parquet(&preamble_and_burst(), &dir.join("a.parquet")).unwrap();
+        eng.tick(2_000).unwrap();
+        assert!(!eng.status(2_000).binding_pending);
+        assert_eq!(eng.counters.posted, 1);
     }
 
     #[test]
