@@ -39,20 +39,46 @@ pub fn depth_ahead_usd(snap: &BookSnapshot, maker_side: MakerSide, posted_px: f6
 }
 
 pub struct BookTailer {
+    binding_root: std::path::PathBuf,
+    resolved: bool,
     pub tail: StreamTail,
     snapshots: BTreeMap<u64, BookSnapshot>,
 }
 
 impl BookTailer {
     pub fn new(binding_root: &Path) -> anyhow::Result<Self> {
-        let dir = datatype_dir(binding_root, "orderbooks")?;
-        Ok(Self {
-            tail: StreamTail::new(dir),
+        let mut tailer = Self {
+            binding_root: binding_root.to_path_buf(),
+            resolved: false,
+            tail: StreamTail::new(std::path::PathBuf::new()),
             snapshots: BTreeMap::new(),
-        })
+        };
+        tailer.try_resolve()?;
+        Ok(tailer)
+    }
+
+    pub fn try_resolve(&mut self) -> anyhow::Result<bool> {
+        if self.resolved {
+            return Ok(true);
+        }
+        match datatype_dir(&self.binding_root, "orderbooks")? {
+            Some(dir) => {
+                self.tail = StreamTail::new(dir);
+                self.resolved = true;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    pub fn pending(&self) -> bool {
+        !self.resolved
     }
 
     pub fn poll(&mut self) -> anyhow::Result<()> {
+        if !self.try_resolve()? {
+            return Ok(());
+        }
         for path in self.tail.poll_new_files()? {
             let data = read_ob_parquet(&path, OrderbookTarget::Snapshot)
                 .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
@@ -270,5 +296,19 @@ mod tests {
         let s = snap(0);
         let ahead = depth_ahead_usd(&s, MakerSide::Sell, 101.0);
         assert!((ahead - 101.0 * 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn books_binding_pending_then_resolves() {
+        let root = std::env::temp_dir().join("tracer_book_pending");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut books = BookTailer::new(&root).unwrap();
+        assert!(books.pending());
+        books.poll().unwrap();
+        assert!(books.pending());
+        std::fs::create_dir_all(root.join("hyperliquid/perpetual/orderbooks")).unwrap();
+        books.poll().unwrap();
+        assert!(!books.pending());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

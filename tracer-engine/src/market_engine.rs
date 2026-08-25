@@ -32,15 +32,22 @@ pub struct GapSpan {
     pub end_ms: u64,
 }
 
-pub fn datatype_dir(binding_root: &Path, datatype: &str) -> anyhow::Result<PathBuf> {
+pub fn datatype_dir(binding_root: &Path, datatype: &str) -> anyhow::Result<Option<PathBuf>> {
     let mut level = binding_root.to_path_buf();
     for _ in 0..2 {
-        let mut subdirs: Vec<PathBuf> = std::fs::read_dir(&level)?
+        let entries = match std::fs::read_dir(&level) {
+            Ok(e) => e,
+            Err(_) => return Ok(None),
+        };
+        let mut subdirs: Vec<PathBuf> = entries
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.is_dir())
             .collect();
         subdirs.sort();
+        if subdirs.is_empty() {
+            return Ok(None);
+        }
         anyhow::ensure!(
             subdirs.len() == 1,
             "{}: expected exactly one subdir (single exchange/market_type binding), found {}",
@@ -49,7 +56,7 @@ pub fn datatype_dir(binding_root: &Path, datatype: &str) -> anyhow::Result<PathB
         );
         level = subdirs.remove(0);
     }
-    Ok(level.join(datatype))
+    Ok(Some(level.join(datatype)))
 }
 
 pub struct StreamTail {
@@ -95,6 +102,8 @@ impl StreamTail {
 }
 
 pub struct TradeTailer {
+    binding_root: PathBuf,
+    resolved: bool,
     pub tail: StreamTail,
     seen_ids: HashMap<String, u64>,
     pub duplicates_dropped: u64,
@@ -102,16 +111,40 @@ pub struct TradeTailer {
 
 impl TradeTailer {
     pub fn new(binding_root: &Path) -> anyhow::Result<Self> {
-        let dir = datatype_dir(binding_root, "trades")?;
-        Ok(Self {
-            tail: StreamTail::new(dir),
+        let mut tailer = Self {
+            binding_root: binding_root.to_path_buf(),
+            resolved: false,
+            tail: StreamTail::new(PathBuf::new()),
             seen_ids: HashMap::new(),
             duplicates_dropped: 0,
-        })
+        };
+        tailer.try_resolve()?;
+        Ok(tailer)
+    }
+
+    pub fn try_resolve(&mut self) -> anyhow::Result<bool> {
+        if self.resolved {
+            return Ok(true);
+        }
+        match datatype_dir(&self.binding_root, "trades")? {
+            Some(dir) => {
+                self.tail = StreamTail::new(dir);
+                self.resolved = true;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    pub fn pending(&self) -> bool {
+        !self.resolved
     }
 
     pub fn poll(&mut self) -> anyhow::Result<Vec<Print>> {
         let mut out = Vec::new();
+        if !self.try_resolve()? {
+            return Ok(out);
+        }
         for path in self.tail.poll_new_files()? {
             let trades = read_trades_parquet(&path)
                 .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
@@ -146,9 +179,8 @@ impl TradeTailer {
 
 pub fn read_gap_spans(binding_root: &Path) -> anyhow::Result<Vec<GapSpan>> {
     let mut spans = Vec::new();
-    let gaps_dir = match datatype_dir(binding_root, "gaps") {
-        Ok(d) => d,
-        Err(_) => return Ok(spans),
+    let Ok(Some(gaps_dir)) = datatype_dir(binding_root, "gaps") else {
+        return Ok(spans);
     };
     let entries = match std::fs::read_dir(&gaps_dir) {
         Ok(e) => e,
@@ -252,6 +284,53 @@ mod tests {
         let root = binding_fixture("ambiguous");
         std::fs::create_dir_all(root.join("binance/perpetual/trades")).unwrap();
         assert!(TradeTailer::new(&root).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn missing_binding_layout_is_pending_then_resolves() {
+        let root = std::env::temp_dir().join("tracer_me_pending");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut tailer = TradeTailer::new(&root).unwrap();
+        assert!(tailer.pending());
+        assert!(tailer.poll().unwrap().is_empty());
+        std::fs::create_dir_all(root.join("hyperliquid")).unwrap();
+        assert!(tailer.poll().unwrap().is_empty());
+        assert!(tailer.pending());
+        let dir = root.join("hyperliquid/perpetual/trades");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_trades_parquet(
+            &[trade(1_000_000, 100.0, 1.0, true, "t1")],
+            &dir.join("a.parquet"),
+        )
+        .unwrap();
+        let prints = tailer.poll().unwrap();
+        assert_eq!(prints.len(), 1);
+        assert!(!tailer.pending());
+        assert_eq!(tailer.tail.watermark_ms, 1_000);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn datatype_leaf_absent_resolves_and_idles() {
+        let root = std::env::temp_dir().join("tracer_me_leafless");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("hyperliquid/perpetual")).unwrap();
+        let mut tailer = TradeTailer::new(&root).unwrap();
+        assert!(!tailer.pending());
+        assert!(tailer.poll().unwrap().is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ambiguity_appearing_after_start_fails_at_poll() {
+        let root = std::env::temp_dir().join("tracer_me_late_ambiguous");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut tailer = TradeTailer::new(&root).unwrap();
+        assert!(tailer.pending());
+        std::fs::create_dir_all(root.join("hyperliquid/perpetual/trades")).unwrap();
+        std::fs::create_dir_all(root.join("binance/perpetual/trades")).unwrap();
+        assert!(tailer.poll().is_err());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

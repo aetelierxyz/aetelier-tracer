@@ -245,7 +245,8 @@ fn status_fixture() -> serde_json::Value {
         "paper_fees_usd": -0.114,
         "first_post_ts_ms": FIXED_NOW_MS - 30 * 3_600_000,
         "events_written": 208,
-        "ready": true
+        "ready": true,
+        "binding_pending": false
     })
 }
 
