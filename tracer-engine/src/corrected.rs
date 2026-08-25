@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::book::{OppositeEvidence, opposite_evidence};
 use crate::ledger::{
     EVENT_SCHEMA, Event, EventKind, LedgerWriter, Leg, Mode, PostState, Verdict, event_id, trade_id,
 };
@@ -32,6 +33,8 @@ pub struct TradeVerdicts {
     pub exit_outcome: Option<ExitOutcome>,
     pub markout: [Option<f64>; 2],
     pub corrected: Option<ExecutedTrade>,
+    pub entry_evidence: OppositeEvidence,
+    pub exit_evidence: Option<OppositeEvidence>,
 }
 
 pub fn evaluate(
@@ -64,10 +67,13 @@ pub fn evaluate(
             )
         });
 
+        let entry_evidence =
+            opposite_evidence(prints, entry_side, t.entry_px, t.t_entry_ms, window_end);
         let mut exit = None;
         let mut exit_outcome = None;
         let mut markout = [None, None];
         let mut corrected = None;
+        let mut exit_evidence = None;
         if let Some(entry_fill) = entry[0].through {
             let posted_fill = Fill {
                 ts_ms: entry_fill.ts_ms,
@@ -108,6 +114,13 @@ pub fn evaluate(
                 )),
                 ExitOutcome::Unpriced => None,
             };
+            exit_evidence = Some(opposite_evidence(
+                prints,
+                exit_side,
+                t.exit_px,
+                t.t_exit_ms,
+                grace_end,
+            ));
             exit = Some(scan);
             exit_outcome = Some(outcome);
         }
@@ -119,6 +132,8 @@ pub fn evaluate(
             exit_outcome,
             markout,
             corrected,
+            entry_evidence,
+            exit_evidence,
         });
     }
     Ok(out)
@@ -586,7 +601,27 @@ pub fn emit_events(
             cross_px: None,
             cross_kind: None,
             taker_fee_usd: None,
+            evidence_opp_notional_usd: None,
+            evidence_opp_vwap: None,
+            evidence_n_prints: None,
+            bar_buy_usd: None,
+            bar_sell_usd: None,
+            bar_n: None,
             gap_flags: vec![],
+        };
+        let evidence = |seq: u32, leg, ts_ms, posted_px, window_end_ms, ev: &OppositeEvidence| {
+            let mut e = base(
+                seq,
+                EventKind::Evidence,
+                leg,
+                ts_ms,
+                posted_px,
+                window_end_ms,
+            );
+            e.evidence_opp_notional_usd = Some(ev.notional_usd);
+            e.evidence_opp_vwap = ev.vwap;
+            e.evidence_n_prints = Some(ev.n_prints);
+            e
         };
 
         let entry_window = t.t_entry_ms + params.hold_ms;
@@ -648,6 +683,15 @@ pub fn emit_events(
         terminal.filled_touch_ts_ms = scan.touch.map(|f| f.ts_ms);
         terminal.filled_through_ts_ms = scan.through.map(|f| f.ts_ms);
         writer.append(&terminal)?;
+        seq += 1;
+        writer.append(&evidence(
+            seq,
+            Leg::Entry,
+            entry_window,
+            t.entry_px,
+            entry_window,
+            &v.entry_evidence,
+        ))?;
         seq += 1;
 
         if let (Some(scan), Some(outcome)) = (&v.exit, &v.exit_outcome) {
@@ -725,6 +769,17 @@ pub fn emit_events(
                 e.cross_kind = Some("opposite_print".into());
                 e.taker_fee_usd = Some(params.notional_usd * sym.taker_fee_leg_bps / 1e4);
                 writer.append(&e)?;
+                seq += 1;
+            }
+            if let Some(ev) = &v.exit_evidence {
+                writer.append(&evidence(
+                    seq,
+                    Leg::Exit,
+                    grace_end,
+                    t.exit_px,
+                    grace_end,
+                    ev,
+                ))?;
             }
         }
     }
@@ -874,6 +929,29 @@ mod tests {
         let mut writer = LedgerWriter::new(&out.join("ledger")).unwrap();
         emit_events(&v, &params, DEFAULT_GRACE_MS, &mut writer).unwrap();
         assert!(writer.events_written >= 4 * 2);
+
+        let mut evidence_by_leg: BTreeMap<(String, String), u64> = BTreeMap::new();
+        for entry in std::fs::read_dir(out.join("ledger")).unwrap() {
+            let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            for line in text.lines() {
+                let e: serde_json::Value = serde_json::from_str(line).unwrap();
+                if e["kind"] == "EVIDENCE" {
+                    assert!(e["evidence_opp_notional_usd"].is_number());
+                    assert!(e["evidence_n_prints"].is_number());
+                    *evidence_by_leg
+                        .entry((
+                            e["trade_id"].as_str().unwrap().to_string(),
+                            e["leg"].as_str().unwrap().to_string(),
+                        ))
+                        .or_default() += 1;
+                }
+            }
+        }
+        let entry_evidence = evidence_by_leg.keys().filter(|(_, l)| l == "entry").count();
+        let exit_evidence = evidence_by_leg.keys().filter(|(_, l)| l == "exit").count();
+        assert_eq!(entry_evidence, 4);
+        assert_eq!(exit_evidence, 3);
+        assert!(evidence_by_leg.values().all(|n| *n == 1));
         std::fs::remove_dir_all(&out).unwrap();
     }
 }

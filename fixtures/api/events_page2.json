@@ -152,6 +152,30 @@
       "ts_ms": 1787593700000,
       "wall_ts_ms": 1787593701500,
       "window_end_ms": 1787593700000
+    },
+    {
+      "decile": 1,
+      "engine_version": "0.1.0",
+      "event_id": "xyz_TSLA|1787592800000|S|4",
+      "gap_flags": [],
+      "kind": "EXPIRED",
+      "leg": "exit",
+      "maker_side": "buy",
+      "mode": "live",
+      "params_version": 1,
+      "posted_px": 330.39,
+      "qty_usd": 1000.0,
+      "regime": "RTH",
+      "schema": "tracer.event.v1",
+      "score": -0.87,
+      "seq": 4,
+      "signal_side": -1,
+      "symbol": "xyz_TSLA",
+      "trade_id": "xyz_TSLA|1787592800000|S",
+      "ts_ms": 1787594000000,
+      "verdict": "UNFILLED",
+      "wall_ts_ms": 1787594001500,
+      "window_end_ms": 1787593700000
     }
   ],
   "older_cursor": null

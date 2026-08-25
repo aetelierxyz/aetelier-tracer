@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use crate::bars::Bar;
-use crate::book::{BookTailer, DepthAtPost, depth_at_post, prints_as_fillrows, scan_queue};
+use crate::bars::{Bar, FillRow};
+use crate::book::{
+    BookTailer, DepthAtPost, depth_at_post, opposite_evidence, prints_as_fillrows, scan_queue,
+};
 use crate::deciles::decile_of;
 use crate::ledger::{
     EVENT_SCHEMA, Event, EventKind, LedgerWriter, Leg, Mode, PostState, Verdict, event_id, trade_id,
@@ -376,8 +378,41 @@ impl LiveEngine {
             cross_px: None,
             cross_kind: None,
             taker_fee_usd: None,
+            evidence_opp_notional_usd: None,
+            evidence_opp_vwap: None,
+            evidence_n_prints: None,
+            bar_buy_usd: None,
+            bar_sell_usd: None,
+            bar_n: None,
             gap_flags: vec![],
         }
+    }
+
+    fn evidence_event(
+        &self,
+        t: &OpenTrade,
+        leg: Leg,
+        window_end_ms: u64,
+        posted_px: f64,
+        window_start_ms: u64,
+        fillrows: &[FillRow],
+    ) -> Event {
+        let maker_side = match leg {
+            Leg::Entry => MakerSide::entry_for_signal_side(t.side),
+            Leg::Exit => MakerSide::exit_for_signal_side(t.side),
+        };
+        let ev = opposite_evidence(
+            fillrows,
+            maker_side,
+            posted_px,
+            window_start_ms,
+            window_end_ms,
+        );
+        let mut e = self.base_event(t, t.seq, EventKind::Evidence, leg, window_end_ms);
+        e.evidence_opp_notional_usd = Some(ev.notional_usd);
+        e.evidence_opp_vwap = ev.vwap;
+        e.evidence_n_prints = Some(ev.n_prints);
+        e
     }
 
     fn post_trade(&mut self, bar: &Bar, score: f64, decile: usize) -> anyhow::Result<()> {
@@ -419,6 +454,9 @@ impl LiveEngine {
         e.depth_ahead_usd = t.depth.depth_ahead_usd;
         e.book_ts_ms = t.depth.book_ts_ms;
         e.book_staleness_ms = t.depth.book_staleness_ms;
+        e.bar_buy_usd = Some(bar.buy_usd);
+        e.bar_sell_usd = Some(bar.sell_usd);
+        e.bar_n = Some(bar.n);
         self.ledger.append(&e)?;
         t.seq = 1;
         self.counters.posted += 1;
@@ -469,6 +507,16 @@ impl LiveEngine {
                 e.verdict = Some(Verdict::UnfilledGapped);
                 e.gap_flags = vec!["gap_overlap".into()];
                 self.ledger.append(&e)?;
+                t.seq += 1;
+                let ev = self.evidence_event(
+                    &t,
+                    Leg::Entry,
+                    window_end_ms,
+                    t.posted_px,
+                    t.t_post_ms,
+                    &fillrows,
+                );
+                self.ledger.append(&ev)?;
                 self.counters.entry_gapped += 1;
                 continue;
             }
@@ -539,6 +587,16 @@ impl LiveEngine {
                 e.evidence_px = scan.through.map(|f| f.px).or(queue_cleared.map(|f| f.px));
             }
             self.ledger.append(&e)?;
+            t.seq += 1;
+            let ev = self.evidence_event(
+                &t,
+                Leg::Entry,
+                window_end_ms,
+                t.posted_px,
+                t.t_post_ms,
+                &fillrows,
+            );
+            self.ledger.append(&ev)?;
             self.ledger.flush()?;
             t.seq += 1;
             match verdict {
@@ -548,6 +606,8 @@ impl LiveEngine {
             }
             if !filled {
                 self.counters.entry_expired_unfilled += 1;
+            }
+            if !matches!(verdict, Verdict::FilledThrough) {
                 continue;
             }
             let (posted_px, px_ts) = match nominal_exit {
@@ -650,7 +710,17 @@ impl LiveEngine {
                 e.cross_kind = Some("opposite_print".into());
                 e.taker_fee_usd = Some(exit_fee);
                 self.ledger.append(&e)?;
+                t.seq += 1;
             }
+            let ev = self.evidence_event(
+                &t,
+                Leg::Exit,
+                grace_end_ms,
+                posted_px,
+                t_exit_post_ms,
+                &fillrows,
+            );
+            self.ledger.append(&ev)?;
             self.ledger.flush()?;
             if let Some(px) = exit_px {
                 let entry_fee = self.params.notional_usd * self.maker_fee_leg_bps / 1e4;
@@ -681,9 +751,10 @@ impl LiveEngine {
         {
             self.books_last_advance_wall_ms = wall_ms;
         }
-        let mut gaps = read_gap_spans(&self.trades_root)?;
+        let stem = self.cfg.symbol_stem.clone();
+        let mut gaps = read_gap_spans(&self.trades_root, Some(&stem))?;
         if let Some(root) = &self.books_root {
-            gaps.extend(read_gap_spans(root)?);
+            gaps.extend(read_gap_spans(root, Some(&stem))?);
         }
         self.gaps = gaps;
         for p in &new_prints {
@@ -997,6 +1068,129 @@ mod tests {
         let books = st.books.unwrap();
         assert_eq!(books.watermark_ms, 0);
         assert!(books.stalled);
+        std::fs::remove_dir_all(binding.parent().unwrap()).unwrap();
+    }
+
+    fn ledger_events(ledger: &Path) -> Vec<serde_json::Value> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(ledger)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        files.sort();
+        files
+            .iter()
+            .flat_map(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect::<Vec<serde_json::Value>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn queue_only_fill_stays_evidence_and_never_enters_the_ledger() {
+        let (binding, ledger) = fixture("queue_advisory");
+        let dir = binding.join("hyperliquid/perpetual/trades");
+        let books_root = binding.parent().unwrap().join("books_binding");
+        std::fs::create_dir_all(books_root.join("hyperliquid/perpetual/orderbooks")).unwrap();
+        write_trades_parquet(&preamble_and_burst(), &dir.join("a.parquet")).unwrap();
+        write_trades_parquet(
+            &[
+                trade(20_000, 100.0, 4.0, false, "q1"),
+                trade(21_000, 100.0, 4.0, false, "q2"),
+                trade(73_000, 100.0, 0.1, true, "wm73"),
+            ],
+            &dir.join("b.parquet"),
+        )
+        .unwrap();
+        let mut queue_cfg = cfg();
+        queue_cfg.queue_verdicts = true;
+        let mut eng = LiveEngine::new(
+            test_params(),
+            queue_cfg,
+            &binding,
+            Some(&books_root),
+            &ledger,
+        )
+        .unwrap();
+        eng.books
+            .as_mut()
+            .unwrap()
+            .inject_snapshot(crate::book::BookSnapshot {
+                ts_ms: 9_000,
+                bids: vec![(99.0, 10.0), (100.0, 5.0), (100.5, 2.0)],
+                asks: vec![(101.0, 3.0), (102.0, 7.0)],
+            });
+        eng.books.as_mut().unwrap().tail.watermark_ms = 73_000;
+        eng.tick(1_000).unwrap();
+        assert_eq!(eng.counters.posted, 1);
+        assert_eq!(eng.counters.entry_filled_queue_only, 1);
+        assert_eq!(eng.counters.entry_filled_through, 0);
+        assert_eq!(eng.counters.entry_expired_unfilled, 0);
+        assert_eq!(eng.counters.queue_vs_through_disagreements, 1);
+        assert!(eng.open.is_empty());
+        assert!(eng.corrected_points.is_empty());
+        assert_eq!(eng.paper_points.len(), 1);
+        let events = ledger_events(&ledger);
+        let kinds: Vec<&str> = events.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, vec!["POSTED", "OBSERVED", "FILLED", "EVIDENCE"]);
+        let filled = &events[2];
+        assert_eq!(filled["verdict"], "FILLED_QUEUE");
+        assert!(filled["filled_queue_ts_ms"].is_number());
+        assert!(events.iter().all(|e| e["leg"] == "entry"));
+        std::fs::remove_dir_all(binding.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn evidence_event_carries_opposite_aggregates_per_leg() {
+        let (binding, ledger) = fixture("evidence");
+        let dir = binding.join("hyperliquid/perpetual/trades");
+        write_trades_parquet(&preamble_and_burst(), &dir.join("a.parquet")).unwrap();
+        write_trades_parquet(
+            &[
+                trade(20_000, 99.0, 1.0, false, "thru"),
+                trade(73_000, 100.0, 0.1, true, "wm73"),
+            ],
+            &dir.join("b.parquet"),
+        )
+        .unwrap();
+        let mut eng = LiveEngine::new(test_params(), cfg(), &binding, None, &ledger).unwrap();
+        eng.tick(1_000).unwrap();
+        assert_eq!(eng.counters.entry_filled_through, 1);
+        assert_eq!(eng.open.len(), 1);
+        let events = ledger_events(&ledger);
+        let ev: Vec<&serde_json::Value> =
+            events.iter().filter(|e| e["kind"] == "EVIDENCE").collect();
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["leg"], "entry");
+        assert_eq!(ev[0]["evidence_n_prints"], 1);
+        assert!((ev[0]["evidence_opp_notional_usd"].as_f64().unwrap() - 99.0).abs() < 1e-9);
+        assert!((ev[0]["evidence_opp_vwap"].as_f64().unwrap() - 99.0).abs() < 1e-9);
+        std::fs::remove_dir_all(binding.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unfilled_entry_still_gets_an_evidence_event() {
+        let (binding, ledger) = fixture("evidence_unfilled");
+        let dir = binding.join("hyperliquid/perpetual/trades");
+        write_trades_parquet(&preamble_and_burst(), &dir.join("a.parquet")).unwrap();
+        write_trades_parquet(
+            &[trade(73_000, 102.0, 0.1, true, "wm73")],
+            &dir.join("b.parquet"),
+        )
+        .unwrap();
+        let mut eng = LiveEngine::new(test_params(), cfg(), &binding, None, &ledger).unwrap();
+        eng.tick(1_000).unwrap();
+        assert_eq!(eng.counters.entry_expired_unfilled, 1);
+        let events = ledger_events(&ledger);
+        let ev: Vec<&serde_json::Value> =
+            events.iter().filter(|e| e["kind"] == "EVIDENCE").collect();
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["evidence_n_prints"], 0);
+        assert!(ev[0].get("evidence_opp_vwap").is_none());
         std::fs::remove_dir_all(binding.parent().unwrap()).unwrap();
     }
 

@@ -70,6 +70,12 @@ fn event(
         cross_px: None,
         cross_kind: None,
         taker_fee_usd: None,
+        evidence_opp_notional_usd: None,
+        evidence_opp_vwap: None,
+        evidence_n_prints: None,
+        bar_buy_usd: None,
+        bar_sell_usd: None,
+        bar_n: None,
         gap_flags: vec![],
     }
 }
@@ -181,7 +187,57 @@ fn build_fixture_ledger(dir: &Path) {
     e.cum_opp_usd = Some(15_000.0);
     w.append(&e).unwrap();
 
+    let t5 = t4 + 120_000;
+    let mut e = event(t5, -1, 0, EventKind::Posted, Leg::Entry, t5, "RTH");
+    e.post_state = Some(PostState::Passive);
+    e.bar_buy_usd = Some(61_250.0);
+    e.bar_sell_usd = Some(38_750.0);
+    e.bar_n = Some(42);
+    w.append(&e).unwrap();
+    let mut e = event(t5, -1, 1, EventKind::Filled, Leg::Entry, t5 + 7_000, "RTH");
+    e.verdict = Some(Verdict::FilledThrough);
+    e.milestone = Some("through".into());
+    e.filled_touch_ts_ms = Some(t5 + 4_000);
+    e.filled_through_ts_ms = Some(t5 + 7_000);
+    w.append(&e).unwrap();
+    let mut e = event(
+        t5,
+        -1,
+        2,
+        EventKind::Evidence,
+        Leg::Entry,
+        t5 + 900_000,
+        "RTH",
+    );
+    e.evidence_opp_notional_usd = Some(12_345.67);
+    e.evidence_opp_vwap = Some(330.41);
+    e.evidence_n_prints = Some(17);
+    w.append(&e).unwrap();
+
     w.flush().unwrap();
+
+    let gaps_dir = dir.join("binding/hyperliquid/perpetual/gaps");
+    std::fs::create_dir_all(&gaps_dir).unwrap();
+    let in_window_open = (FIXED_NOW_MS - 2 * 3_600_000) * 1_000;
+    let in_window_close = in_window_open + 600_000_000;
+    let old_open = (FIXED_NOW_MS - 9 * 24 * 3_600_000) * 1_000;
+    let old_close = old_open + 60_000_000;
+    std::fs::write(
+        gaps_dir.join("hyperliquid_xyz-TSLA_gap_ledger.jsonl"),
+        format!(
+            "{}\n{}\n{}\n",
+            format_args!(
+                r#"{{"opened_epoch_us":{in_window_open},"closed_epoch_us":{in_window_close},"window_us":600000000,"cause":"disconnect","exchange":"hyperliquid","symbol":"xyz:TSLA","possible_dropped_trades":9}}"#
+            ),
+            format_args!(
+                r#"{{"opened_epoch_us":{old_open},"closed_epoch_us":{old_close},"window_us":60000000,"cause":"resync","exchange":"hyperliquid","symbol":"xyz:TSLA","possible_dropped_trades":null}}"#
+            ),
+            format_args!(
+                r#"{{"opened_epoch_us":{in_window_open},"closed_epoch_us":{in_window_close},"window_us":600000000,"cause":"disconnect","exchange":"hyperliquid","symbol":"xyz:NVDA","possible_dropped_trades":4}}"#
+            ),
+        ),
+    )
+    .unwrap();
 }
 
 fn state(dir: &Path) -> AppState {
@@ -209,6 +265,9 @@ fn state(dir: &Path) -> AppState {
         ready: Arc::new(RwLock::new(true)),
         ledger_dir: dir.to_path_buf(),
         artifacts_dir: None,
+        trades_binding: Some(dir.join("binding")),
+        books_binding: None,
+        symbol_stem: Some("xyz_TSLA".into()),
         now_ms: fixed_now,
     }
 }
@@ -252,6 +311,10 @@ fn status_fixture() -> serde_json::Value {
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/api")
+}
+
+fn urlenc(s: &str) -> String {
+    s.replace('|', "%7C")
 }
 
 async fn get_json(app: axum::Router, uri: &str) -> (u16, serde_json::Value) {
@@ -301,13 +364,13 @@ async fn api_responses_match_committed_goldens() {
     assert_eq!(code, 200);
     assert_or_bless("status.json", &status);
 
-    let (code, page1) = get_json(app(), "/api/tracer/events?limit=6").await;
+    let (code, page1) = get_json(app(), "/api/tracer/events?limit=8").await;
     assert_eq!(code, 200);
     assert_or_bless("events_page1.json", &page1);
     let cursor = page1["older_cursor"].as_str().unwrap();
     let (code, page2) = get_json(
         app(),
-        &format!("/api/tracer/events?limit=6&cursor={cursor}"),
+        &format!("/api/tracer/events?limit=8&cursor={cursor}"),
     )
     .await;
     assert_eq!(code, 200);
@@ -315,7 +378,62 @@ async fn api_responses_match_committed_goldens() {
     assert!(page2["older_cursor"].is_null());
     let total =
         page1["events"].as_array().unwrap().len() + page2["events"].as_array().unwrap().len();
-    assert_eq!(total, 12);
+    assert_eq!(total, 15);
+
+    let (code, ev) = get_json(app(), "/api/tracer/events?kind=EVIDENCE").await;
+    assert_eq!(code, 200);
+    let rows = ev["events"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["evidence_n_prints"], 17);
+    assert_eq!(rows[0]["evidence_opp_notional_usd"], 12_345.67);
+
+    let tid = rows[0]["trade_id"].as_str().unwrap().to_string();
+    let (code, one) = get_json(
+        app(),
+        &format!("/api/tracer/events?trade_id={}", urlenc(&tid)),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert_eq!(one["events"].as_array().unwrap().len(), 3);
+
+    let (code, exits) = get_json(app(), "/api/tracer/events?leg=exit").await;
+    assert_eq!(code, 200);
+    assert_eq!(exits["events"].as_array().unwrap().len(), 3);
+
+    let (code, _) = get_json(app(), "/api/tracer/events?kind=BOGUS").await;
+    assert_eq!(code, 400);
+
+    let mut seen_posted = 0;
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let uri = match &cursor {
+            None => "/api/tracer/events?kind=POSTED&limit=2".to_string(),
+            Some(c) => format!("/api/tracer/events?kind=POSTED&limit=2&cursor={c}"),
+        };
+        let (code, page) = get_json(app(), &uri).await;
+        assert_eq!(code, 200);
+        let rows = page["events"].as_array().unwrap();
+        assert!(rows.iter().all(|e| e["kind"] == "POSTED"));
+        seen_posted += rows.len();
+        match page["older_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => break,
+        }
+    }
+    assert_eq!(seen_posted, 6);
+
+    let (code, gaps24) = get_json(app(), "/api/tracer/gaps?window=24h").await;
+    assert_eq!(code, 200);
+    assert_or_bless("gaps_24h.json", &gaps24);
+    assert_eq!(gaps24["incident_count"], 1);
+    assert_eq!(gaps24["est_dropped_trades_sum"], 9);
+    assert_eq!(gaps24["total_gap_ms"], 600_000);
+    let (code, gaps_all) = get_json(app(), "/api/tracer/gaps?window=all").await;
+    assert_eq!(code, 200);
+    assert_eq!(gaps_all["incident_count"], 2);
+    assert!(gaps_all["coverage_pct"].as_f64().unwrap() < 100.0);
+    let (code, _) = get_json(app(), "/api/tracer/gaps?window=1y").await;
+    assert_eq!(code, 400);
 
     let (code, fr24) = get_json(app(), "/api/tracer/fillrates?window=24h").await;
     assert_eq!(code, 200);
@@ -374,6 +492,12 @@ async fn replay_routes_serve_artifacts_beside_the_live_ledger() {
     let bare = router(no_artifacts, &["http://localhost:3000".to_string()]);
     let (code, _) = get_json(bare, "/api/tracer/replay/ledger").await;
     assert_eq!(code, 404);
+
+    let mut no_bind = state(&dir);
+    no_bind.trades_binding = None;
+    let unbound = router(no_bind, &["http://localhost:3000".to_string()]);
+    let (code, _) = get_json(unbound, "/api/tracer/gaps").await;
+    assert_eq!(code, 404);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -390,6 +514,7 @@ async fn duplicate_reappended_events_do_not_move_displayed_rates() {
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().path())
+        .filter(|p| p.is_file())
         .collect();
     files.sort();
     let replayed: String = files

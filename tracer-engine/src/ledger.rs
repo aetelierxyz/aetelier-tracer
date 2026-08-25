@@ -11,6 +11,7 @@ pub enum EventKind {
     Filled,
     Expired,
     TakerCross,
+    Evidence,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -96,6 +97,18 @@ pub struct Event {
     pub cross_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub taker_fee_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_opp_notional_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_opp_vwap: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_n_prints: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bar_buy_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bar_sell_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bar_n: Option<u32>,
     pub gap_flags: Vec<String>,
 }
 
@@ -207,6 +220,12 @@ mod tests {
             cross_px: None,
             cross_kind: None,
             taker_fee_usd: None,
+            evidence_opp_notional_usd: None,
+            evidence_opp_vwap: None,
+            evidence_n_prints: None,
+            bar_buy_usd: None,
+            bar_sell_usd: None,
+            bar_n: None,
             gap_flags: vec![],
         }
     }

@@ -18,4 +18,5 @@ tracer-engine.workspace = true
 
 [dev-dependencies]
 http-body-util = "0.1"
+sha2 = "0.10"
 tower = { version = "0.5", features = ["util"] }

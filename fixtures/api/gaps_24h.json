@@ -1,0 +1,20 @@
+{
+  "coverage_pct": 99.30555555555556,
+  "est_dropped_trades_sum": 9,
+  "incident_count": 1,
+  "incidents": [
+    {
+      "cause": "disconnect",
+      "end_ms": 1787593400000,
+      "exchange": "hyperliquid",
+      "possible_dropped_trades": 9,
+      "start_ms": 1787592800000,
+      "symbol": "xyz:TSLA",
+      "window_us": 600000000
+    }
+  ],
+  "mode": "live",
+  "schema": "tracer.gaps.v1",
+  "total_gap_ms": 600000,
+  "window": "24h"
+}

@@ -177,15 +177,23 @@ impl TradeTailer {
     }
 }
 
-pub fn read_gap_spans(binding_root: &Path) -> anyhow::Result<Vec<GapSpan>> {
-    let mut spans = Vec::new();
+fn symbol_stem_norm(symbol: &str) -> String {
+    symbol.replace(':', "_")
+}
+
+pub fn read_gap_incidents(
+    binding_root: &Path,
+    symbol_stem: Option<&str>,
+) -> anyhow::Result<Vec<GapIncident>> {
+    let mut incidents = Vec::new();
     let Ok(Some(gaps_dir)) = datatype_dir(binding_root, "gaps") else {
-        return Ok(spans);
+        return Ok(incidents);
     };
     let entries = match std::fs::read_dir(&gaps_dir) {
         Ok(e) => e,
-        Err(_) => return Ok(spans),
+        Err(_) => return Ok(incidents),
     };
+    let want = symbol_stem.map(symbol_stem_norm);
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().is_none_or(|e| e != "jsonl") {
@@ -196,14 +204,29 @@ pub fn read_gap_spans(binding_root: &Path) -> anyhow::Result<Vec<GapSpan>> {
             let Ok(inc) = serde_json::from_str::<GapIncident>(line) else {
                 continue;
             };
-            spans.push(GapSpan {
-                start_ms: inc.opened_epoch_us / 1_000,
-                end_ms: inc.closed_epoch_us / 1_000,
-            });
+            if let Some(w) = &want
+                && symbol_stem_norm(&inc.symbol) != *w
+            {
+                continue;
+            }
+            incidents.push(inc);
         }
     }
-    spans.sort_by_key(|s| s.start_ms);
-    Ok(spans)
+    incidents.sort_by_key(|i| i.opened_epoch_us);
+    Ok(incidents)
+}
+
+pub fn read_gap_spans(
+    binding_root: &Path,
+    symbol_stem: Option<&str>,
+) -> anyhow::Result<Vec<GapSpan>> {
+    Ok(read_gap_incidents(binding_root, symbol_stem)?
+        .into_iter()
+        .map(|inc| GapSpan {
+            start_ms: inc.opened_epoch_us / 1_000,
+            end_ms: inc.closed_epoch_us / 1_000,
+        })
+        .collect())
 }
 
 pub fn gap_overlaps(spans: &[GapSpan], start_ms: u64, end_ms: u64) -> bool {
@@ -350,7 +373,15 @@ mod tests {
             ),
         )
         .unwrap();
-        let spans = read_gap_spans(&root).unwrap();
+        let spans = read_gap_spans(&root, Some("xyz_TSLA")).unwrap();
+        let foreign = read_gap_spans(&root, Some("xyz_NVDA")).unwrap();
+        assert!(foreign.is_empty());
+        let incidents = read_gap_incidents(&root, None).unwrap();
+        assert_eq!(incidents.len(), 2);
+        assert_eq!(incidents[0].cause, "disconnect");
+        assert_eq!(incidents[0].possible_dropped_trades, Some(5));
+        assert_eq!(incidents[0].exchange, "hyperliquid");
+        assert_eq!(incidents[0].symbol, "xyz:TSLA");
         assert_eq!(spans.len(), 2);
         assert_eq!(
             spans[0],
@@ -367,7 +398,7 @@ mod tests {
         assert!(!gap_overlaps(&spans, 60_000, 70_000));
 
         let no_gaps = binding_fixture("nogaps");
-        assert!(read_gap_spans(&no_gaps).unwrap().is_empty());
+        assert!(read_gap_spans(&no_gaps, None).unwrap().is_empty());
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&no_gaps).unwrap();
     }
