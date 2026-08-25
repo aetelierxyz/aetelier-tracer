@@ -172,6 +172,9 @@ pub struct EngineStatus {
     pub events_written: u64,
     pub ready: bool,
     pub binding_pending: bool,
+    pub maker_fee_leg_bps: f64,
+    pub taker_fee_leg_bps: f64,
+    pub notional_usd: f64,
 }
 
 pub struct LiveEngine {
@@ -320,6 +323,9 @@ impl LiveEngine {
             ready: self.ready,
             binding_pending: self.trades.pending()
                 || self.books.as_ref().is_some_and(|b| b.pending()),
+            maker_fee_leg_bps: self.maker_fee_leg_bps,
+            taker_fee_leg_bps: self.taker_fee_leg_bps,
+            notional_usd: self.params.notional_usd,
             trades,
             books,
         }

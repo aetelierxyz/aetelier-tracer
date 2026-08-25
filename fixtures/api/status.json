@@ -30,8 +30,10 @@
   "events_written": 208,
   "first_post_ts_ms": 1787492000000,
   "idle": true,
+  "maker_fee_leg_bps": -0.015,
   "merged_watermark_ms": 1787599755000,
   "mode": "live",
+  "notional_usd": 1000.0,
   "open_trades": 3,
   "paper_fees_usd": -0.114,
   "paper_n": 38,
@@ -42,6 +44,7 @@
   "schema": "tracer.status.v1",
   "session": "RTH",
   "symbol": "xyz_TSLA",
+  "taker_fee_leg_bps": 1.044,
   "trades": {
     "advance_age_ms": 48000,
     "files_read": 412,
