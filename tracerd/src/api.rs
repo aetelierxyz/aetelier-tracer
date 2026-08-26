@@ -35,6 +35,7 @@ pub struct AppState {
     pub trades_binding: Option<PathBuf>,
     pub books_binding: Option<PathBuf>,
     pub symbol_stem: Option<String>,
+    pub traces: Option<Arc<crate::traces::TraceRuntime>>,
     pub now_ms: fn() -> u64,
 }
 
@@ -45,8 +46,45 @@ pub fn wall_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+const TRACE_UPLOAD_BODY_CAP: usize = 450 * 1024 * 1024;
+
 pub fn router(state: AppState, allowed_origins: &[String]) -> axum::Router {
     let cors = cors_layer(allowed_origins);
+    let traces = axum::Router::new()
+        .route(
+            "/api/tracer/traces",
+            get(crate::traces::list_traces).post(crate::traces::create_trace),
+        )
+        .route("/api/tracer/traces/{id}", get(crate::traces::get_trace))
+        .route(
+            "/api/tracer/traces/{id}/ledger",
+            get(crate::traces::trace_ledger),
+        )
+        .route(
+            "/api/tracer/traces/{id}/fillrates",
+            get(crate::traces::trace_fillrates),
+        )
+        .route(
+            "/api/tracer/traces/{id}/events",
+            get(crate::traces::trace_events),
+        )
+        .route(
+            "/api/tracer/traces/{id}/book",
+            get(crate::traces::trace_book),
+        )
+        .route(
+            "/api/tracer/traces/{id}/depth",
+            get(crate::traces::trace_depth),
+        )
+        .route(
+            "/api/tracer/traces/{id}/prints",
+            get(crate::traces::trace_prints),
+        )
+        .route(
+            "/api/tracer/traces/{id}/schema",
+            get(crate::traces::trace_schema),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(TRACE_UPLOAD_BODY_CAP));
     axum::Router::new()
         .route("/health", get(health))
         .route("/readyz", get(readyz))
@@ -57,6 +95,7 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> axum::Router {
         .route("/api/tracer/ledger", get(ledger))
         .route("/api/tracer/replay/ledger", get(replay_ledger))
         .route("/api/tracer/replay/fillrates", get(replay_fillrates))
+        .merge(traces)
         .layer(cors)
         .with_state(state)
 }
@@ -66,7 +105,11 @@ fn cors_layer(origins: &[String]) -> tower_http::cors::CorsLayer {
         origins.iter().filter_map(|o| o.parse().ok()).collect();
     tower_http::cors::CorsLayer::new()
         .allow_origin(parsed)
-        .allow_methods([axum::http::Method::GET])
+        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderName::from_static(crate::traces::USER_HEADER),
+        ])
 }
 
 pub fn origins_from_env() -> Vec<String> {
@@ -130,16 +173,16 @@ fn read_event_lines(path: &PathBuf) -> Vec<Event> {
 }
 
 #[derive(serde::Deserialize)]
-struct EventsQuery {
-    cursor: Option<String>,
-    limit: Option<usize>,
-    trade_id: Option<String>,
-    kind: Option<String>,
-    leg: Option<String>,
-    regime: Option<String>,
-    symbol: Option<String>,
-    since_ms: Option<u64>,
-    until_ms: Option<u64>,
+pub struct EventsQuery {
+    pub cursor: Option<String>,
+    pub limit: Option<usize>,
+    pub trade_id: Option<String>,
+    pub kind: Option<String>,
+    pub leg: Option<String>,
+    pub regime: Option<String>,
+    pub symbol: Option<String>,
+    pub since_ms: Option<u64>,
+    pub until_ms: Option<u64>,
 }
 
 fn parse_kind(s: &str) -> Option<EventKind> {
@@ -163,7 +206,7 @@ fn parse_leg(s: &str) -> Option<Leg> {
 }
 
 #[derive(serde::Serialize)]
-struct EventsPage {
+pub struct EventsPage {
     events: Vec<Event>,
     older_cursor: Option<String>,
 }
@@ -193,10 +236,7 @@ fn deduped_events(ledger_dir: &PathBuf) -> Vec<(String, usize, Event)> {
     all
 }
 
-async fn events(
-    State(s): State<AppState>,
-    Query(q): Query<EventsQuery>,
-) -> Result<Json<EventsPage>, StatusCode> {
+pub fn paged_events(ledger_dir: &PathBuf, q: &EventsQuery) -> Result<EventsPage, StatusCode> {
     let limit = q.limit.unwrap_or(200).min(1000);
     let start = match &q.cursor {
         None => None,
@@ -210,7 +250,7 @@ async fn events(
         None => None,
         Some(l) => Some(parse_leg(l).ok_or(StatusCode::BAD_REQUEST)?),
     };
-    let mut all = deduped_events(&s.ledger_dir);
+    let mut all = deduped_events(ledger_dir);
     if let Some((cf, cl)) = &start {
         all.retain(|(name, idx, _)| name < cf || (name == cf && idx < cl));
     }
@@ -226,10 +266,17 @@ async fn events(
     let cut = all.len().saturating_sub(limit);
     let older = (cut > 0).then(|| encode_cursor(&all[cut].0, all[cut].1));
     let events = all.split_off(cut).into_iter().map(|(_, _, e)| e).collect();
-    Ok(Json(EventsPage {
+    Ok(EventsPage {
         events,
         older_cursor: older,
-    }))
+    })
+}
+
+async fn events(
+    State(s): State<AppState>,
+    Query(q): Query<EventsQuery>,
+) -> Result<Json<EventsPage>, StatusCode> {
+    paged_events(&s.ledger_dir, &q).map(Json)
 }
 
 #[derive(serde::Deserialize)]
@@ -437,11 +484,11 @@ struct LiveFillrates {
     exit_cells: BTreeMap<String, LiveExitCell>,
 }
 
-async fn fillrates(
-    State(s): State<AppState>,
-    Query(q): Query<FillratesQuery>,
+pub fn live_fillrates_json(
+    s: &AppState,
+    window: &str,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let window = q.window.unwrap_or_else(|| "24h".into());
+    let window = window.to_string();
     let cutoff = match window.as_str() {
         "24h" => (s.now_ms)().saturating_sub(24 * 3_600_000),
         "7d" => (s.now_ms)().saturating_sub(7 * 24 * 3_600_000),
@@ -561,17 +608,21 @@ async fn fillrates(
     Ok(Json(serde_json::to_value(body).unwrap()))
 }
 
+async fn fillrates(
+    State(s): State<AppState>,
+    Query(q): Query<FillratesQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    live_fillrates_json(&s, &q.window.unwrap_or_else(|| "24h".into()))
+}
+
 #[derive(serde::Deserialize)]
 struct LedgerQuery {
     points: Option<usize>,
 }
 
-async fn ledger(
-    State(s): State<AppState>,
-    Query(q): Query<LedgerQuery>,
-) -> Json<serde_json::Value> {
+pub fn live_ledger_json(s: &AppState, points: Option<usize>) -> Json<serde_json::Value> {
     let c = s.ledger_live.read().unwrap().clone();
-    let points = q.points.unwrap_or(500);
+    let points = points.unwrap_or(500);
     let tail = |v: &[(u64, f64)]| -> Vec<(u64, f64)> {
         v.iter().rev().take(points).rev().copied().collect()
     };
@@ -592,6 +643,13 @@ async fn ledger(
         },
         "delta_total_usd": c.total_usd - c.paper_total_usd,
     }))
+}
+
+async fn ledger(
+    State(s): State<AppState>,
+    Query(q): Query<LedgerQuery>,
+) -> Json<serde_json::Value> {
+    live_ledger_json(&s, q.points)
 }
 
 fn artifact_json(s: &AppState, name: &str) -> Result<Json<serde_json::Value>, StatusCode> {

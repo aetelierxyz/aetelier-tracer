@@ -26,6 +26,7 @@ pub enum Leg {
 pub enum Mode {
     Live,
     Replay,
+    Trace,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -54,6 +55,8 @@ pub struct Event {
     pub kind: EventKind,
     pub leg: Leg,
     pub mode: Mode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
     pub ts_ms: u64,
     pub wall_ts_ms: u64,
     pub engine_version: String,
@@ -192,6 +195,7 @@ mod tests {
             kind: EventKind::Posted,
             leg: Leg::Entry,
             mode: Mode::Replay,
+            trace_id: None,
             ts_ms,
             wall_ts_ms: ts_ms,
             engine_version: "0.1.0".into(),

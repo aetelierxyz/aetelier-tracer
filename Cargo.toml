@@ -12,8 +12,11 @@ publish = false
 aetelier-io = { path = "../aetelier-sdk/aetelier-io", features = ["parquet"] }
 aetelier-types = { path = "../aetelier-sdk/aetelier-types" }
 anyhow = "1"
-axum = "0.8"
+arrow-schema = "57.2"
+axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
+parquet = "57.2"
+sha2 = "0.10"
 chrono = "0.4"
 chrono-tz = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
