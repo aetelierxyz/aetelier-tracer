@@ -8,9 +8,10 @@ use axum::response::{IntoResponse, Json};
 use tracer_engine::market_engine::read_gap_spans;
 use tracer_engine::params::TracerParams;
 use tracer_engine::trace::{
-    BookTick, MAX_SIGNALS_BYTES, MAX_TAPE_BYTES, OrderSourceSpec, PreflightReport, RowError,
-    SchemaFieldOut, TapeRole, TraceOverrides, TraceRequest, TraceSummary, book_series, execute,
-    load_books_files, load_live_tape_files, load_trades_files, parquet_schema_fields, prepare,
+    BookTick, DEPTH_ROWS_CAP, DEPTH_ROWS_DEFAULT, DepthRow, MAX_SIGNALS_BYTES, MAX_TAPE_BYTES,
+    OrderSourceSpec, PreflightReport, RowError, SchemaFieldOut, TapeRole, TraceOverrides,
+    TraceRequest, TraceSummary, book_series, decimate_depth, execute, load_books_files,
+    load_depth_rows, load_live_tape_files, load_trades_files, parquet_schema_fields, prepare,
 };
 
 use crate::api::{AppState, EventsQuery, paged_events};
@@ -713,6 +714,54 @@ pub async fn trace_book(
         "schema": "tracer.tracebook.v1",
         "trace_id": id,
         "points": series,
+    })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct DepthQuery {
+    from: Option<u64>,
+    to: Option<u64>,
+    max: Option<usize>,
+}
+
+pub async fn trace_depth(
+    State(s): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<DepthQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let rt = runtime(&s)?;
+    let max_rows = q.max.unwrap_or(DEPTH_ROWS_DEFAULT).clamp(1, DEPTH_ROWS_CAP);
+    let rows: Vec<DepthRow> = if id == "live" {
+        let root = rt.books_binding.as_deref().ok_or(StatusCode::NOT_FOUND)?;
+        let dir = tracer_engine::market_engine::datatype_dir(root, "orderbooks")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+        let path = latest_parquet_in(&dir).ok_or(StatusCode::NOT_FOUND)?;
+        let rows =
+            load_depth_rows(&[&path], None, None).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        rows.last().cloned().into_iter().collect()
+    } else {
+        let record = rt.read_record(&id).ok_or(StatusCode::NOT_FOUND)?;
+        let req = rt
+            .request_for(&record)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let paths: Vec<&Path> = req
+            .tape_files
+            .iter()
+            .filter(|(role, _)| *role == TapeRole::Orderbook)
+            .map(|(_, p)| p.as_path())
+            .collect();
+        if paths.is_empty() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let rows =
+            load_depth_rows(&paths, q.from, q.to).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        decimate_depth(rows, max_rows)
+    };
+    Ok(Json(serde_json::json!({
+        "schema": "tracer.tracedepth.v1",
+        "trace_id": id,
+        "rows": rows,
     })))
 }
 

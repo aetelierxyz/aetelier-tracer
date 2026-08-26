@@ -73,6 +73,10 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> axum::Router {
             get(crate::traces::trace_book),
         )
         .route(
+            "/api/tracer/traces/{id}/depth",
+            get(crate::traces::trace_depth),
+        )
+        .route(
             "/api/tracer/traces/{id}/prints",
             get(crate::traces::trace_prints),
         )

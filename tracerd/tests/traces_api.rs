@@ -412,3 +412,127 @@ async fn resubmitting_the_same_config_is_idempotent() {
     assert_eq!(body2["trace_id"], id.as_str());
     assert_eq!(body2["status"], "complete");
 }
+
+fn deep_ob_parquet(w: &World, n_levels: usize, ts_list: &[u64]) -> PathBuf {
+    let pair = TradingPair::from_str("xyz:TSLA/USDC").unwrap();
+    let mut bids = std::collections::BTreeMap::new();
+    let mut asks = std::collections::BTreeMap::new();
+    for i in 0..n_levels {
+        let bid_px = 390.0 - i as f64 * 0.1;
+        let ask_px = 390.1 + i as f64 * 0.1;
+        bids.insert(
+            f64_to_decimal(bid_px),
+            aetelier_types::levels::Level::new(
+                i as u32,
+                aetelier_types::OrderSide::Bids,
+                f64_to_decimal(bid_px),
+                f64_to_decimal(1.0 + i as f64),
+                vec![],
+            ),
+        );
+        asks.insert(
+            f64_to_decimal(ask_px),
+            aetelier_types::levels::Level::new(
+                i as u32,
+                aetelier_types::OrderSide::Asks,
+                f64_to_decimal(ask_px),
+                f64_to_decimal(2.0 + i as f64),
+                vec![],
+            ),
+        );
+    }
+    let snaps: Vec<Orderbook> = ts_list
+        .iter()
+        .map(|t| Orderbook {
+            orderbook_id: 0,
+            orderbook_ts_us: t * 1_000,
+            source_orderbook_ts_us: t * 1_000,
+            local_orderbook_ts_us: t * 1_000,
+            source_orderbook_rtt_us: 0,
+            pair: pair.clone(),
+            exchange: "hyperliquid".into(),
+            bids: bids.clone(),
+            asks: asks.clone(),
+        })
+        .collect();
+    let dir = w.dir.join("deep_ob");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_ob_parquet(&snaps, &dir, "sync").unwrap()
+}
+
+#[tokio::test]
+async fn depth_route_truncates_levels_windows_and_decimates() {
+    let w = world("depth");
+    let (t_min, t_max) = w.span;
+    let step = (t_max - t_min) / 4;
+    let ts_list: Vec<u64> = (0..5).map(|i| t_min + i * step).collect();
+    let deep_ob = deep_ob_parquet(&w, 12, &ts_list);
+
+    let config = serde_json::json!({
+        "order_source": "strategy",
+        "tape": "upload",
+        "notional_usd": 1000.0,
+        "grace_ms": 300000,
+        "cross_window_ms": 60000,
+    });
+    let (status, body) = post_trace(
+        &w,
+        &config,
+        &[("orderbook", &deep_ob), ("trades", &w.trades_parquet)],
+        None,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let trace_id = body["trace_id"].as_str().unwrap().to_string();
+    wait_complete(&w, &trace_id).await;
+
+    let (status, depth) = get_json(&w, &format!("/api/tracer/traces/{trace_id}/depth"), None).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let depth = depth.unwrap();
+    assert_eq!(depth["schema"], "tracer.tracedepth.v1");
+    let rows = depth["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 5);
+    let bids = rows[0]["bids"].as_array().unwrap();
+    let asks = rows[0]["asks"].as_array().unwrap();
+    assert_eq!(bids.len(), 10);
+    assert_eq!(asks.len(), 10);
+    assert_eq!(bids[0][0], 390.0);
+    assert_eq!(bids[9][0].as_f64().unwrap(), 389.1);
+    assert_eq!(asks[0][0], 390.1);
+    assert!((rows[0]["mid"].as_f64().unwrap() - 390.05).abs() < 1e-9);
+
+    let (status, windowed) = get_json(
+        &w,
+        &format!(
+            "/api/tracer/traces/{trace_id}/depth?from={}&to={}",
+            ts_list[1], ts_list[3]
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let windowed = windowed.unwrap();
+    let wrows = windowed["rows"].as_array().unwrap();
+    assert_eq!(wrows.len(), 3);
+    assert_eq!(wrows[0]["ts_ms"].as_u64().unwrap(), ts_list[1]);
+    assert_eq!(wrows[2]["ts_ms"].as_u64().unwrap(), ts_list[3]);
+
+    let (status, capped) = get_json(
+        &w,
+        &format!("/api/tracer/traces/{trace_id}/depth?max=2"),
+        None,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let capped = capped.unwrap();
+    let crows = capped["rows"].as_array().unwrap();
+    assert!(crows.len() <= 3, "got {}", crows.len());
+    assert_eq!(crows[0]["ts_ms"].as_u64().unwrap(), ts_list[0]);
+    assert_eq!(crows.last().unwrap()["ts_ms"].as_u64().unwrap(), ts_list[4]);
+
+    let (status, _) = get_json(&w, "/api/tracer/traces/tr_missing0000/depth", None).await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+
+    let (status, _) = get_json(&w, "/api/tracer/traces/live/depth", None).await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+}

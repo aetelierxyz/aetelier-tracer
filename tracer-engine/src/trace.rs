@@ -1024,6 +1024,81 @@ pub fn load_live_tape_files(
     Ok(out)
 }
 
+pub const DEPTH_LEVELS: usize = 10;
+pub const DEPTH_ROWS_DEFAULT: usize = 2_000;
+pub const DEPTH_ROWS_CAP: usize = 20_000;
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DepthRow {
+    pub ts_ms: u64,
+    pub bids: Vec<(f64, f64)>,
+    pub asks: Vec<(f64, f64)>,
+    pub mid: Option<f64>,
+}
+
+pub fn load_depth_rows(
+    paths: &[&Path],
+    t0: Option<u64>,
+    t1: Option<u64>,
+) -> anyhow::Result<Vec<DepthRow>> {
+    let lo = t0.unwrap_or(0);
+    let hi = t1.unwrap_or(u64::MAX);
+    let mut rows: Vec<DepthRow> = Vec::new();
+    for path in paths {
+        let data = read_ob_parquet(path, OrderbookTarget::Snapshot)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let OrderbookTargetData::Snapshot(books) = data else {
+            anyhow::bail!("{}: not an orderbook snapshot parquet", path.display());
+        };
+        for ob in books {
+            let ts_ms = ob.orderbook_ts_us / 1_000;
+            if ts_ms < lo || ts_ms > hi {
+                continue;
+            }
+            let bids: Vec<(f64, f64)> = ob
+                .bids
+                .iter()
+                .rev()
+                .take(DEPTH_LEVELS)
+                .filter_map(|(px, level)| Some((px.to_f64()?, level.volume.to_f64()?)))
+                .collect();
+            let asks: Vec<(f64, f64)> = ob
+                .asks
+                .iter()
+                .take(DEPTH_LEVELS)
+                .filter_map(|(px, level)| Some((px.to_f64()?, level.volume.to_f64()?)))
+                .collect();
+            let mid = match (bids.first(), asks.first()) {
+                (Some((b, _)), Some((a, _))) => Some((b + a) / 2.0),
+                _ => None,
+            };
+            rows.push(DepthRow {
+                ts_ms,
+                bids,
+                asks,
+                mid,
+            });
+        }
+    }
+    rows.sort_by_key(|r| r.ts_ms);
+    rows.dedup_by_key(|r| r.ts_ms);
+    Ok(rows)
+}
+
+pub fn decimate_depth(rows: Vec<DepthRow>, max_rows: usize) -> Vec<DepthRow> {
+    if max_rows == 0 || rows.len() <= max_rows {
+        return rows;
+    }
+    let stride = rows.len().div_ceil(max_rows);
+    let mut out: Vec<DepthRow> = rows.iter().step_by(stride).cloned().collect();
+    if let (Some(last), Some(kept)) = (rows.last(), out.last())
+        && kept.ts_ms != last.ts_ms
+    {
+        out.push(last.clone());
+    }
+    out
+}
+
 pub fn book_series(
     ticks: &[BookTick],
     t0: Option<u64>,
@@ -1048,4 +1123,45 @@ pub fn book_series(
         out.push(*last);
     }
     out
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    fn row(ts_ms: u64) -> DepthRow {
+        DepthRow {
+            ts_ms,
+            bids: vec![(100.0, 1.0)],
+            asks: vec![(101.0, 1.0)],
+            mid: Some(100.5),
+        }
+    }
+
+    #[test]
+    fn decimate_keeps_all_when_under_cap() {
+        let rows: Vec<DepthRow> = (0..5).map(|i| row(i * 1_000)).collect();
+        let out = decimate_depth(rows, 5);
+        assert_eq!(out.len(), 5);
+    }
+
+    #[test]
+    fn decimate_keeps_first_and_last_over_cap() {
+        let rows: Vec<DepthRow> = (0..1_000).map(|i| row(i * 100)).collect();
+        let out = decimate_depth(rows, 100);
+        assert!(out.len() <= 101, "got {}", out.len());
+        assert_eq!(out.first().unwrap().ts_ms, 0);
+        assert_eq!(out.last().unwrap().ts_ms, 99_900);
+    }
+
+    #[test]
+    fn decimate_zero_cap_passes_through() {
+        let rows: Vec<DepthRow> = (0..7).map(row).collect();
+        assert_eq!(decimate_depth(rows, 0).len(), 7);
+    }
+
+    #[test]
+    fn decimate_empty_is_empty() {
+        assert!(decimate_depth(Vec::new(), 10).is_empty());
+    }
 }
