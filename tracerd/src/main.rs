@@ -1,4 +1,5 @@
 mod api;
+mod claims;
 mod traces;
 
 use std::path::PathBuf;
@@ -60,6 +61,8 @@ enum Command {
         idle_after_ms: u64,
         #[arg(long, env = "TRACER_TRACES_DIR")]
         traces_dir: Option<PathBuf>,
+        #[arg(long, env = "KAFKA_BROKERS")]
+        kafka_brokers: Option<String>,
     },
     Replay {
         #[arg(long, env = "TRACER_FILLS_DIR")]
@@ -153,9 +156,16 @@ async fn run_live(
     cross_window_ms: u64,
     idle_after_ms: u64,
     traces_dir: Option<PathBuf>,
+    kafka_brokers: Option<String>,
 ) -> anyhow::Result<()> {
     let params = TracerParams::load(&params_path)?;
     let stem = symbol.replace(':', "_");
+    let claim_publisher = claims::ClaimPublisher::start(
+        kafka_brokers.as_deref(),
+        &trades_binding,
+        books_binding.as_deref(),
+        &stem,
+    );
     let traces_rt = traces_dir
         .map(|dir| {
             traces::TraceRuntime::start(
@@ -221,6 +231,9 @@ async fn run_live(
                 paper_equity: engine.paper_points.clone(),
             };
             *publish.ready.write().unwrap() = true;
+            if let Some(publisher) = &claim_publisher {
+                publisher.announce(wall_now_ms());
+            }
             std::thread::sleep(std::time::Duration::from_millis(poll_ms));
         }
     });
@@ -382,6 +395,7 @@ async fn main() -> anyhow::Result<()> {
             cross_window_ms,
             idle_after_ms,
             traces_dir,
+            kafka_brokers,
         } => {
             run_live(
                 symbol,
@@ -397,6 +411,7 @@ async fn main() -> anyhow::Result<()> {
                 cross_window_ms,
                 idle_after_ms,
                 traces_dir,
+                kafka_brokers,
             )
             .await
         }

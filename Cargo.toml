@@ -10,12 +10,16 @@ publish = false
 
 [workspace.dependencies]
 aetelier-io = { path = "../aetelier-sdk/aetelier-io", features = ["parquet"] }
+aetelier-proto = { path = "../aetelier-proto" }
 aetelier-types = { path = "../aetelier-sdk/aetelier-types" }
 anyhow = "1"
 arrow-schema = "57.2"
 axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
 parquet = "57.2"
+prost = "0.13"
+prost-types = "0.13"
+rdkafka = { version = "0.36", features = ["cmake-build"] }
 sha2 = "0.10"
 chrono = "0.4"
 chrono-tz = "0.10"
@@ -26,3 +30,4 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracer-engine = { path = "tracer-engine" }
+uuid = "1"
