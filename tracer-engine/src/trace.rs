@@ -264,6 +264,7 @@ pub fn load_trades_files(paths: &[&Path]) -> anyhow::Result<(PrintsByStem, Vec<T
             read_trades_parquet(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         anyhow::ensure!(!trades.is_empty(), "{}: no trades", path.display());
         let mut kept = 0usize;
+        let mut fresh = 0usize;
         let mut min_ts = u64::MAX;
         let mut max_ts = 0u64;
         let mut stems: BTreeSet<String> = BTreeSet::new();
@@ -271,6 +272,7 @@ pub fn load_trades_files(paths: &[&Path]) -> anyhow::Result<(PrintsByStem, Vec<T
             if !seen.insert(t.id.clone()) {
                 continue;
             }
+            fresh += 1;
             let (Some(px), Some(sz)) = (t.price.to_f64(), t.amount.to_f64()) else {
                 continue;
             };
@@ -281,6 +283,9 @@ pub fn load_trades_files(paths: &[&Path]) -> anyhow::Result<(PrintsByStem, Vec<T
             max_ts = max_ts.max(ts_ms);
             stems.insert(stem.clone());
             merged.push((ts_ms, t.id, px, sz, matches!(t.side, TradeSide::Buy), stem));
+        }
+        if fresh == 0 {
+            continue;
         }
         anyhow::ensure!(kept > 0, "{}: no new priced trades", path.display());
         summaries.push(TapeFileSummary {

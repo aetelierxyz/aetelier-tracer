@@ -624,6 +624,49 @@ fn live_shaped_multifile_tape_prepares_with_the_union_span() {
 }
 
 #[test]
+fn a_fully_duplicated_live_trades_file_is_skipped_not_rejected() {
+    let w = mini_world("dupfile");
+    let rows = read_fills_csv(&w.dir.join("fills").join("xyz_TSLA.csv")).unwrap();
+    let t_min = rows.first().unwrap().time_ms;
+    let t_max = rows.last().unwrap().time_ms;
+
+    let trades_a = w.dir.join("trades_a.parquet");
+    let trades_dup = w.dir.join("trades_dup.parquet");
+    rows_to_trades_parquet(&rows, "xyz:TSLA", &trades_a, 0);
+    rows_to_trades_parquet(&rows, "xyz:TSLA", &trades_dup, 0);
+
+    let ob_dir = w.dir.join("ob");
+    std::fs::create_dir_all(&ob_dir).unwrap();
+    let ob = write_ob_file(&ob_dir, "xyz:TSLA", &[t_min, t_max]);
+
+    let req = TraceRequest {
+        tape_files: vec![
+            (TapeRole::Trades, trades_a),
+            (TapeRole::Trades, trades_dup),
+            (TapeRole::Orderbook, ob),
+        ],
+        orders: OrderSourceSpec::Strategy,
+        overrides: None,
+        grace_ms: DEFAULT_GRACE_MS,
+        cross_window_ms: DEFAULT_CROSS_WINDOW_MS,
+        gap_spans: Vec::new(),
+    };
+    let prepared = match prepare(&req, &w.params).unwrap() {
+        Ok(p) => p,
+        Err(r) => panic!("duplicated live file rejected: {:?}", r.row_errors),
+    };
+    let span = prepared.report.span.unwrap();
+    assert_eq!(span.start_ms, t_min);
+    assert_eq!(span.end_ms, t_max);
+    assert_eq!(
+        prepared.report.files.len(),
+        2,
+        "the all-duplicate file must not produce a summary"
+    );
+    assert_eq!(prepared.trades, w.replay_trades);
+}
+
+#[test]
 fn full_golden_signals_trace_reproduces_frozen_replay_artifacts() {
     let Ok(fills_dir) = std::env::var("TRACER_FILLS_DIR") else {
         eprintln!("TRACER_FILLS_DIR unset; full signals parity gate skipped");
