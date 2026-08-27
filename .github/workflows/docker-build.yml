@@ -55,6 +55,13 @@ jobs:
           path: aetelier-sdk
           token: ${{ secrets.INTER_AETELIER_READ_PAT }}
           persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: IteraLabs/aetelier-proto
+          path: aetelier-proto
+          token: ${{ secrets.INTER_AETELIER_READ_PAT }}
+          persist-credentials: false
       - name: docker build (native amd64)
         env:
           CARGO_GIT_TOKEN: ${{ secrets.INTER_AETELIER_READ_PAT }}
@@ -85,6 +92,13 @@ jobs:
         with:
           repository: IteraLabs/aetelier-sdk
           path: aetelier-sdk
+          token: ${{ secrets.INTER_AETELIER_READ_PAT }}
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: IteraLabs/aetelier-proto
+          path: aetelier-proto
           token: ${{ secrets.INTER_AETELIER_READ_PAT }}
           persist-credentials: false
       - name: write ghcr auth

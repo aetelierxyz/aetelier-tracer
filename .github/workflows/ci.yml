@@ -37,6 +37,21 @@ jobs:
           path: aetelier-sdk
           token: ${{ secrets.INTER_AETELIER_READ_PAT }}
 
+      - uses: actions/checkout@v5
+        with:
+          repository: IteraLabs/aetelier-proto
+          path: aetelier-proto
+          token: ${{ secrets.INTER_AETELIER_READ_PAT }}
+
+      - name: install build deps (protoc + librdkafka C deps)
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler \
+            libprotobuf-dev \
+            libcurl4-openssl-dev \
+            libsasl2-dev \
+            libzstd-dev
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -77,6 +92,21 @@ jobs:
           path: aetelier-sdk
           token: ${{ secrets.INTER_AETELIER_READ_PAT }}
 
+      - uses: actions/checkout@v5
+        with:
+          repository: IteraLabs/aetelier-proto
+          path: aetelier-proto
+          token: ${{ secrets.INTER_AETELIER_READ_PAT }}
+
+      - name: install build deps (protoc + librdkafka C deps)
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            protobuf-compiler \
+            libprotobuf-dev \
+            libcurl4-openssl-dev \
+            libsasl2-dev \
+            libzstd-dev
+
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
@@ -101,6 +131,12 @@ jobs:
         with:
           repository: IteraLabs/aetelier-sdk
           path: aetelier-sdk
+          token: ${{ secrets.INTER_AETELIER_READ_PAT }}
+
+      - uses: actions/checkout@v5
+        with:
+          repository: IteraLabs/aetelier-proto
+          path: aetelier-proto
           token: ${{ secrets.INTER_AETELIER_READ_PAT }}
 
       - uses: dtolnay/rust-toolchain@stable

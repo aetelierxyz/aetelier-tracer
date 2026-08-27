@@ -1,4 +1,5 @@
 mod api;
+mod claims;
 mod traces;
 
 use std::path::PathBuf;
@@ -60,6 +61,8 @@ enum Command {
         idle_after_ms: u64,
         #[arg(long, env = "TRACER_TRACES_DIR")]
         traces_dir: Option<PathBuf>,
+        #[arg(long, env = "KAFKA_BROKERS")]
+        kafka_brokers: Option<String>,
     },
     Replay {
         #[arg(long, env = "TRACER_FILLS_DIR")]
@@ -153,9 +156,17 @@ async fn run_live(
     cross_window_ms: u64,
     idle_after_ms: u64,
     traces_dir: Option<PathBuf>,
+    kafka_brokers: Option<String>,
 ) -> anyhow::Result<()> {
     let params = TracerParams::load(&params_path)?;
     let stem = symbol.replace(':', "_");
+    let claim_publisher = claims::ClaimPublisher::start(
+        kafka_brokers.as_deref(),
+        &trades_binding,
+        books_binding.as_deref(),
+        &stem,
+        poll_ms,
+    );
     let traces_rt = traces_dir
         .map(|dir| {
             traces::TraceRuntime::start(
@@ -199,6 +210,9 @@ async fn run_live(
     std::thread::spawn(move || {
         loop {
             let wall = wall_now_ms();
+            if let Some(publisher) = &claim_publisher {
+                publisher.announce(wall);
+            }
             if let Err(e) = engine.tick(wall) {
                 eprintln!("tick error: {e:#}");
             }
@@ -382,6 +396,7 @@ async fn main() -> anyhow::Result<()> {
             cross_window_ms,
             idle_after_ms,
             traces_dir,
+            kafka_brokers,
         } => {
             run_live(
                 symbol,
@@ -397,6 +412,7 @@ async fn main() -> anyhow::Result<()> {
                 cross_window_ms,
                 idle_after_ms,
                 traces_dir,
+                kafka_brokers,
             )
             .await
         }
