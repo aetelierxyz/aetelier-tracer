@@ -13,6 +13,8 @@ use crate::api::wall_now_ms;
 
 pub const TOPIC: &str = "control.tracer.claims";
 
+pub const ANNOUNCE_INTERVAL_WARN_MS: u64 = 30_000;
+
 const ERROR_LOG_INTERVAL_MS: u64 = 60_000;
 
 struct ClaimContext {
@@ -62,6 +64,7 @@ impl ClaimPublisher {
         trades_binding: &Path,
         books_binding: Option<&Path>,
         symbol_stem: &str,
+        poll_ms: u64,
     ) -> Option<Self> {
         let brokers = match brokers {
             Some(b) if !b.is_empty() => b,
@@ -100,6 +103,11 @@ impl ClaimPublisher {
                 return None;
             }
         };
+        if poll_ms > ANNOUNCE_INTERVAL_WARN_MS {
+            eprintln!(
+                "tracer claims: poll interval {poll_ms} ms exceeds {ANNOUNCE_INTERVAL_WARN_MS} ms; claims can lapse between announcements and the platform delete guard may not hold"
+            );
+        }
         println!(
             "tracer claims: announcing {} binding(s) on {TOPIC}",
             claims.len()
@@ -199,8 +207,8 @@ mod tests {
     #[test]
     fn missing_or_empty_brokers_disable_claims() {
         let dir = Path::new("/d/585ccad2-0110-4abe-bfe3-a5ac63eba26d");
-        assert!(ClaimPublisher::start(None, dir, None, "xyz_TSLA").is_none());
-        assert!(ClaimPublisher::start(Some(""), dir, None, "xyz_TSLA").is_none());
+        assert!(ClaimPublisher::start(None, dir, None, "xyz_TSLA", 2_000).is_none());
+        assert!(ClaimPublisher::start(Some(""), dir, None, "xyz_TSLA", 2_000).is_none());
     }
 
     #[test]
@@ -210,8 +218,15 @@ mod tests {
             Path::new("./fixtures/trades"),
             None,
             "xyz_TSLA",
+            2_000,
         );
         assert!(publisher.is_none());
+    }
+
+    #[test]
+    fn the_warn_bound_keeps_three_missed_beats_inside_the_consumer_ttl() {
+        let overseer_claim_ttl_ms: u64 = 90_000;
+        assert!(ANNOUNCE_INTERVAL_WARN_MS * 3 <= overseer_claim_ttl_ms);
     }
 
     #[test]

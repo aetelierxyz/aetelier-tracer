@@ -165,6 +165,7 @@ async fn run_live(
         &trades_binding,
         books_binding.as_deref(),
         &stem,
+        poll_ms,
     );
     let traces_rt = traces_dir
         .map(|dir| {
@@ -209,6 +210,9 @@ async fn run_live(
     std::thread::spawn(move || {
         loop {
             let wall = wall_now_ms();
+            if let Some(publisher) = &claim_publisher {
+                publisher.announce(wall);
+            }
             if let Err(e) = engine.tick(wall) {
                 eprintln!("tick error: {e:#}");
             }
@@ -231,9 +235,6 @@ async fn run_live(
                 paper_equity: engine.paper_points.clone(),
             };
             *publish.ready.write().unwrap() = true;
-            if let Some(publisher) = &claim_publisher {
-                publisher.announce(wall_now_ms());
-            }
             std::thread::sleep(std::time::Duration::from_millis(poll_ms));
         }
     });
