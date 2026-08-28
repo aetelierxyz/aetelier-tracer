@@ -825,6 +825,19 @@ fn latest_parquet_in(dir: &Path) -> Option<PathBuf> {
     names.pop()
 }
 
+/// Newest parquet under the running daemon's binding dir for `role`.
+fn live_role_parquet(rt: &TraceRuntime, role: TapeRole) -> Result<PathBuf, StatusCode> {
+    let (binding, datatype) = match role {
+        TapeRole::Orderbook => (rt.books_binding.as_deref(), "orderbooks"),
+        TapeRole::Trades => (rt.trades_binding.as_deref(), "trades"),
+    };
+    let root = binding.ok_or(StatusCode::NOT_FOUND)?;
+    let dir = tracer_engine::market_engine::datatype_dir(root, datatype)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    latest_parquet_in(&dir).ok_or(StatusCode::NOT_FOUND)
+}
+
 pub async fn trace_schema(
     State(s): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -837,23 +850,18 @@ pub async fn trace_schema(
         _ => return Err(StatusCode::BAD_REQUEST),
     };
     let path: PathBuf = if id == "live" {
-        let (binding, datatype) = match role {
-            TapeRole::Orderbook => (rt.books_binding.as_deref(), "orderbooks"),
-            TapeRole::Trades => (rt.trades_binding.as_deref(), "trades"),
-        };
-        let root = binding.ok_or(StatusCode::NOT_FOUND)?;
-        let dir = tracer_engine::market_engine::datatype_dir(root, datatype)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::NOT_FOUND)?;
-        latest_parquet_in(&dir).ok_or(StatusCode::NOT_FOUND)?
+        live_role_parquet(&rt, role)?
     } else {
         let record = rt.read_record(&id).ok_or(StatusCode::NOT_FOUND)?;
-        let file = record
-            .inputs
-            .iter()
-            .find(|f| f.role == role.label())
-            .ok_or(StatusCode::NOT_FOUND)?;
-        rt.dir.join(&id).join("inputs").join(&file.file)
+        match record.inputs.iter().find(|f| f.role == role.label()) {
+            Some(file) => rt.dir.join(&id).join("inputs").join(&file.file),
+            // A trace that ran on the LIVE tape uploaded no parquet, so it has
+            // no input to describe: its tape was — and still is — the daemon's
+            // binding dirs. Describe those. Any other trace genuinely lacks
+            // this role and keeps its 404.
+            None if record.tape_source == "live" => live_role_parquet(&rt, role)?,
+            None => return Err(StatusCode::NOT_FOUND),
+        }
     };
     let fields: Vec<SchemaFieldOut> =
         parquet_schema_fields(&path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
