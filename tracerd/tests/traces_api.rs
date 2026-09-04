@@ -536,3 +536,74 @@ async fn depth_route_truncates_levels_windows_and_decimates() {
     let (status, _) = get_json(&w, "/api/tracer/traces/live/depth", None).await;
     assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
 }
+
+/// A trace that ran on the LIVE tape uploads no parquet, so its record has no
+/// input to describe. Its schema must come from the daemon's binding dirs
+/// instead of 404ing.
+#[tokio::test]
+async fn a_live_tape_trace_serves_its_schema_from_the_binding_dirs() {
+    let mut w = world("live_schema_fallback");
+
+    // Collector layout: <binding>/<exchange>/<market_type>/<datatype>/*.parquet
+    let books_binding = w.dir.join("bnd_books");
+    let trades_binding = w.dir.join("bnd_trades");
+    let books_dir = books_binding.join("hyperliquid/perpetual/orderbooks");
+    let trades_dir = trades_binding.join("hyperliquid/perpetual/trades");
+    std::fs::create_dir_all(&books_dir).unwrap();
+    std::fs::create_dir_all(&trades_dir).unwrap();
+    std::fs::copy(&w.ob_parquet, books_dir.join("ob_sync_1.parquet")).unwrap();
+    std::fs::copy(&w.trades_parquet, trades_dir.join("trades_sync_1.parquet")).unwrap();
+
+    let rt = traces::TraceRuntime::start(
+        w.dir.join("traces_live"),
+        repo_root().join("params/tracer_params.v1.json"),
+        300_000,
+        60_000,
+        Some(trades_binding),
+        Some(books_binding),
+        Some("xyz_TSLA".into()),
+    )
+    .unwrap();
+
+    // A completed live-tape trace: signals input only, no parquet. Written as
+    // the on-disk record so the handler's own read path is exercised.
+    let trace_dir = w.dir.join("traces_live").join("tr_livetape0001");
+    std::fs::create_dir_all(&trace_dir).unwrap();
+    std::fs::write(
+        trace_dir.join("trace.json"),
+        serde_json::json!({
+            "schema": "tracer.trace.v1",
+            "trace_id": "tr_livetape0001",
+            "created_ms": 1,
+            "user_id": "user-a",
+            "status": "complete",
+            "order_source": "signals",
+            "tape_source": "live",
+            "inputs": [{"role": "signals", "file": "signals__x.csv"}],
+            "grace_ms": 300000,
+            "cross_window_ms": 60000,
+            "preflight": null
+        })
+        .to_string(),
+    )
+    .unwrap();
+    w.state.traces = Some(rt);
+
+    for (source, first_field) in [
+        ("orderbook", "orderbook_ts_us"),
+        ("trades", "source_trade_ts_us"),
+    ] {
+        let (status, schema) = get_json(
+            &w,
+            &format!("/api/tracer/traces/tr_livetape0001/schema?source={source}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "live-tape trace must serve {source} schema"
+        );
+        assert_eq!(schema.unwrap()["fields"][0]["name"], first_field);
+    }
+}
