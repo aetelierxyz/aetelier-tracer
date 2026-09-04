@@ -16,6 +16,7 @@ prost-types.workspace = true
 rdkafka.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracer-engine.workspace = true
@@ -26,5 +27,4 @@ aetelier-io.workspace = true
 aetelier-types.workspace = true
 http-body-util = "0.1"
 rust_decimal.workspace = true
-sha2.workspace = true
 tower = { version = "0.5", features = ["util"] }

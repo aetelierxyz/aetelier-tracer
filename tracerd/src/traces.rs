@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use axum::extract::{Multipart, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json};
+use sha2::Digest;
 
 use tracer_engine::market_engine::read_gap_spans;
 use tracer_engine::params::TracerParams;
@@ -314,6 +315,31 @@ fn user_of(headers: &HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn scoped_trace_id(engine_id: &str, user: Option<&str>) -> String {
+    let Some(user) = user else {
+        return engine_id.to_string();
+    };
+    let mut h = sha2::Sha256::new();
+    h.update(engine_id.as_bytes());
+    h.update(b"\n");
+    h.update(user.as_bytes());
+    let hex = format!("{:x}", h.finalize());
+    format!("tr_{}", &hex[..12])
+}
+
+fn visible_to(record: &TraceRecord, headers: &HeaderMap) -> Result<(), StatusCode> {
+    match (user_of(headers), &record.user_id) {
+        (Some(caller), Some(owner)) if &caller != owner => Err(StatusCode::NOT_FOUND),
+        _ => Ok(()),
+    }
+}
+
+fn read_owned(rt: &TraceRuntime, id: &str, headers: &HeaderMap) -> Result<TraceRecord, StatusCode> {
+    let record = rt.read_record(id).ok_or(StatusCode::NOT_FOUND)?;
+    visible_to(&record, headers)?;
+    Ok(record)
+}
+
 #[derive(serde::Deserialize)]
 struct TraceConfigIn {
     order_source: String,
@@ -499,19 +525,21 @@ pub async fn create_trace(
             Err(report) => return Err(rejection(&report)),
             Ok(p) => p,
         };
+    let user = user_of(&headers);
+    let trace_id = scoped_trace_id(&prepared.trace_id, user.as_deref());
 
     if config.preflight_only {
         return Ok((
             StatusCode::OK,
             Json(serde_json::json!({
-                "trace_id": prepared.trace_id,
+                "trace_id": trace_id,
                 "status": "preflight",
                 "preflight": prepared.report,
             })),
         ));
     }
 
-    if let Some(existing) = rt.read_record(&prepared.trace_id) {
+    if let Some(existing) = rt.read_record(&trace_id) {
         return Ok((
             StatusCode::OK,
             Json(serde_json::json!({
@@ -522,7 +550,7 @@ pub async fn create_trace(
         ));
     }
 
-    let trace_dir = rt.dir.join(&prepared.trace_id);
+    let trace_dir = rt.dir.join(&trace_id);
     let inputs_dir = trace_dir.join("inputs");
     std::fs::create_dir_all(&inputs_dir).map_err(|e| bad_request(format!("trace dir: {e}")))?;
     let mut inputs: Vec<TraceInputFile> = Vec::new();
@@ -543,9 +571,9 @@ pub async fn create_trace(
     }
     let record = TraceRecord {
         schema: TRACE_SCHEMA.into(),
-        trace_id: prepared.trace_id.clone(),
+        trace_id: trace_id.clone(),
         created_ms: now,
-        user_id: user_of(&headers),
+        user_id: user,
         status: "queued".into(),
         error: None,
         order_source: config.order_source.clone(),
@@ -598,12 +626,13 @@ pub async fn list_traces(
 pub async fn get_trace(
     State(s): State<AppState>,
     AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let rt = runtime(&s)?;
     if id == "live" {
         return rt.live_record().map(Json).ok_or(StatusCode::NOT_FOUND);
     }
-    let record = rt.read_record(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let record = read_owned(&rt, &id, &headers)?;
     Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
 }
 
@@ -611,8 +640,9 @@ fn trace_artifact(
     rt: &TraceRuntime,
     id: &str,
     name: &str,
+    headers: &HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let record = rt.read_record(id).ok_or(StatusCode::NOT_FOUND)?;
+    let record = read_owned(rt, id, headers)?;
     if record.status != "complete" {
         return Err(StatusCode::CONFLICT);
     }
@@ -626,35 +656,38 @@ fn trace_artifact(
 pub async fn trace_ledger(
     State(s): State<AppState>,
     AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     if id == "live" {
         return Ok(crate::api::live_ledger_json(&s, None));
     }
     let rt = runtime(&s)?;
-    trace_artifact(&rt, &id, "corrected_ledger.json")
+    trace_artifact(&rt, &id, "corrected_ledger.json", &headers)
 }
 
 pub async fn trace_fillrates(
     State(s): State<AppState>,
     AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     if id == "live" {
         return crate::api::live_fillrates_json(&s, "all");
     }
     let rt = runtime(&s)?;
-    trace_artifact(&rt, &id, "fillrates.json")
+    trace_artifact(&rt, &id, "fillrates.json", &headers)
 }
 
 pub async fn trace_events(
     State(s): State<AppState>,
     AxumPath(id): AxumPath<String>,
     Query(q): Query<EventsQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let ledger_dir = if id == "live" {
         s.ledger_dir.clone()
     } else {
         let rt = runtime(&s)?;
-        rt.read_record(&id).ok_or(StatusCode::NOT_FOUND)?;
+        read_owned(&rt, &id, &headers)?;
         rt.dir.join(&id).join("ledger")
     };
     let page = paged_events(&ledger_dir, &q)?;
@@ -698,13 +731,24 @@ fn record_or_live(rt: &TraceRuntime, id: &str) -> Result<TraceRecord, StatusCode
     rt.read_record(id).ok_or(StatusCode::NOT_FOUND)
 }
 
+fn owned_record_or_live(
+    rt: &TraceRuntime,
+    id: &str,
+    headers: &HeaderMap,
+) -> Result<TraceRecord, StatusCode> {
+    let record = record_or_live(rt, id)?;
+    visible_to(&record, headers)?;
+    Ok(record)
+}
+
 pub async fn trace_book(
     State(s): State<AppState>,
     AxumPath(id): AxumPath<String>,
     Query(q): Query<BookQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let rt = runtime(&s)?;
-    let record = record_or_live(&rt, &id)?;
+    let record = owned_record_or_live(&rt, &id, &headers)?;
     let tape = rt
         .cached_tape(&record)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -728,6 +772,7 @@ pub async fn trace_depth(
     State(s): State<AppState>,
     AxumPath(id): AxumPath<String>,
     Query(q): Query<DepthQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let rt = runtime(&s)?;
     let max_rows = q.max.unwrap_or(DEPTH_ROWS_DEFAULT).clamp(1, DEPTH_ROWS_CAP);
@@ -741,7 +786,7 @@ pub async fn trace_depth(
             load_depth_rows(&[&path], None, None).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         rows.last().cloned().into_iter().collect()
     } else {
-        let record = rt.read_record(&id).ok_or(StatusCode::NOT_FOUND)?;
+        let record = read_owned(&rt, &id, &headers)?;
         let req = rt
             .request_for(&record)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -775,9 +820,10 @@ pub async fn trace_prints(
     State(s): State<AppState>,
     AxumPath(id): AxumPath<String>,
     Query(q): Query<PrintsQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let rt = runtime(&s)?;
-    let record = record_or_live(&rt, &id)?;
+    let record = owned_record_or_live(&rt, &id, &headers)?;
     let tape = rt
         .cached_tape(&record)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -842,6 +888,7 @@ pub async fn trace_schema(
     State(s): State<AppState>,
     AxumPath(id): AxumPath<String>,
     Query(q): Query<SchemaQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let rt = runtime(&s)?;
     let role = match q.source.as_str() {
@@ -852,7 +899,7 @@ pub async fn trace_schema(
     let path: PathBuf = if id == "live" {
         live_role_parquet(&rt, role)?
     } else {
-        let record = rt.read_record(&id).ok_or(StatusCode::NOT_FOUND)?;
+        let record = read_owned(&rt, &id, &headers)?;
         match record.inputs.iter().find(|f| f.role == role.label()) {
             Some(file) => rt.dir.join(&id).join("inputs").join(&file.file),
             // A trace that ran on the LIVE tape uploaded no parquet, so it has

@@ -400,17 +400,172 @@ async fn preflight_only_reports_without_persisting() {
 
 #[tokio::test]
 async fn resubmitting_the_same_config_is_idempotent() {
-    let w = world("idempotent");
+    for (name, user) in [("idempotent", None), ("idempotent_user", Some("user-a"))] {
+        let w = world(name);
+        let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+        let files: &[(&str, &Path)] =
+            &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+        let (status, body) = post_trace(&w, &config, files, user).await;
+        assert_eq!(status, axum::http::StatusCode::CREATED, "{user:?}");
+        let id = body["trace_id"].as_str().unwrap().to_string();
+        wait_complete(&w, &id).await;
+        let (status, body2) = post_trace(&w, &config, files, user).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{user:?}");
+        assert_eq!(body2["trace_id"], id.as_str());
+        assert_eq!(body2["status"], "complete");
+    }
+}
+
+fn trace_routes(id: &str) -> Vec<String> {
+    vec![
+        format!("/api/tracer/traces/{id}"),
+        format!("/api/tracer/traces/{id}/ledger"),
+        format!("/api/tracer/traces/{id}/fillrates"),
+        format!("/api/tracer/traces/{id}/events?limit=1"),
+        format!("/api/tracer/traces/{id}/book"),
+        format!("/api/tracer/traces/{id}/depth"),
+        format!("/api/tracer/traces/{id}/prints?limit=1"),
+        format!("/api/tracer/traces/{id}/schema?source=trades"),
+    ]
+}
+
+#[tokio::test]
+async fn a_trace_is_invisible_to_a_caller_who_is_not_its_owner() {
+    let w = world("owner_scope");
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let (status, body) = post_trace(&w, &config, files, Some("user-a")).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let id = body["trace_id"].as_str().unwrap().to_string();
+    wait_complete(&w, &id).await;
+    for route in trace_routes(&id) {
+        let (status, _) = get_json(&w, &route, Some("user-b")).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "user-b {route}");
+        let (status, _) = get_json(&w, &route, Some("user-a")).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "owner {route}");
+        let (status, _) = get_json(&w, &route, None).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "in-network {route}");
+    }
+}
+
+#[tokio::test]
+async fn identical_strategy_uploads_by_two_users_get_separate_traces() {
+    let w = world("two_users");
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let (status, a) = post_trace(&w, &config, files, Some("user-a")).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{a}");
+    let (status, b) = post_trace(&w, &config, files, Some("user-b")).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{b}");
+    let id_a = a["trace_id"].as_str().unwrap().to_string();
+    let id_b = b["trace_id"].as_str().unwrap().to_string();
+    assert_ne!(id_a, id_b);
+    let rec_a = wait_complete(&w, &id_a).await;
+    let rec_b = wait_complete(&w, &id_b).await;
+    assert!(w.dir.join("traces").join(&id_a).is_dir());
+    assert!(w.dir.join("traces").join(&id_b).is_dir());
+    assert_eq!(rec_a["user_id"], "user-a");
+    assert_eq!(rec_b["user_id"], "user-b");
+    for key in [
+        "n_signals",
+        "entry_through",
+        "corrected_kept",
+        "events_written",
+    ] {
+        assert_eq!(rec_a["summary"][key], rec_b["summary"][key], "{key}");
+    }
+    let (_, ledger_a) = get_json(
+        &w,
+        &format!("/api/tracer/traces/{id_a}/ledger"),
+        Some("user-a"),
+    )
+    .await;
+    let (_, ledger_b) = get_json(
+        &w,
+        &format!("/api/tracer/traces/{id_b}/ledger"),
+        Some("user-b"),
+    )
+    .await;
+    let mut ledger_a = ledger_a.unwrap();
+    let mut ledger_b = ledger_b.unwrap();
+    for ledger in [&mut ledger_a, &mut ledger_b] {
+        ledger.as_object_mut().unwrap().remove("trace_id");
+    }
+    assert_eq!(ledger_a, ledger_b);
+}
+
+#[tokio::test]
+async fn preflight_only_returns_the_id_the_create_will_use() {
+    let w = world("preflight_id");
+    let preflight =
+        serde_json::json!({"order_source": "strategy", "tape": "upload", "preflight_only": true});
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let (status, pre_a) = post_trace(&w, &preflight, files, Some("user-a")).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{pre_a}");
+    let (status, pre_b) = post_trace(&w, &preflight, files, Some("user-b")).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{pre_b}");
+    let (status, pre_none) = post_trace(&w, &preflight, files, None).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{pre_none}");
+    assert_ne!(pre_a["trace_id"], pre_b["trace_id"]);
+    assert_ne!(pre_a["trace_id"], pre_none["trace_id"]);
+    let (status, created) = post_trace(&w, &config, files, Some("user-a")).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{created}");
+    assert_eq!(created["trace_id"], pre_a["trace_id"]);
+}
+
+#[tokio::test]
+async fn an_owner_less_record_stays_readable_by_any_caller() {
+    let w = world("ownerless");
     let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
     let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
     let (status, body) = post_trace(&w, &config, files, None).await;
-    assert_eq!(status, axum::http::StatusCode::CREATED);
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
     let id = body["trace_id"].as_str().unwrap().to_string();
-    wait_complete(&w, &id).await;
-    let (status, body2) = post_trace(&w, &config, files, None).await;
-    assert_eq!(status, axum::http::StatusCode::OK);
-    assert_eq!(body2["trace_id"], id.as_str());
-    assert_eq!(body2["status"], "complete");
+    let record = wait_complete(&w, &id).await;
+    assert!(record["user_id"].is_null());
+    for route in trace_routes(&id) {
+        for user in [Some("user-a"), None] {
+            let (status, _) = get_json(&w, &route, user).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{user:?} {route}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_live_record_ignores_identity() {
+    let mut w = world("live_identity");
+    let books_binding = w.dir.join("bnd_books");
+    let trades_binding = w.dir.join("bnd_trades");
+    let books_dir = books_binding.join("hyperliquid/perpetual/orderbooks");
+    let trades_dir = trades_binding.join("hyperliquid/perpetual/trades");
+    std::fs::create_dir_all(&books_dir).unwrap();
+    std::fs::create_dir_all(&trades_dir).unwrap();
+    std::fs::copy(&w.ob_parquet, books_dir.join("ob_sync_1.parquet")).unwrap();
+    std::fs::copy(&w.trades_parquet, trades_dir.join("trades_sync_1.parquet")).unwrap();
+    let rt = traces::TraceRuntime::start(
+        w.dir.join("traces_live"),
+        repo_root().join("params/tracer_params.v1.json"),
+        300_000,
+        60_000,
+        Some(trades_binding),
+        Some(books_binding),
+        Some("xyz_TSLA".into()),
+    )
+    .unwrap();
+    w.state.traces = Some(rt);
+    for user in [Some("user-a"), Some("user-b"), None] {
+        let (status, body) = get_json(&w, "/api/tracer/traces/live", user).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{user:?}");
+        assert_eq!(body.unwrap()["trace_id"], "live");
+        for route in [
+            "/api/tracer/traces/live/prints?limit=1",
+            "/api/tracer/traces/live/schema?source=trades",
+        ] {
+            let (status, _) = get_json(&w, route, user).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{user:?} {route}");
+        }
+    }
 }
 
 fn deep_ob_parquet(w: &World, n_levels: usize, ts_list: &[u64]) -> PathBuf {
