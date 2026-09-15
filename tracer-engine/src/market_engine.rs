@@ -33,6 +33,17 @@ pub struct GapSpan {
 }
 
 pub fn datatype_dir(binding_root: &Path, datatype: &str) -> anyhow::Result<Option<PathBuf>> {
+    if binding_root
+        .parent()
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n == datatype)
+    {
+        return if binding_root.is_dir() {
+            Ok(Some(binding_root.to_path_buf()))
+        } else {
+            Ok(None)
+        };
+    }
     let mut level = binding_root.to_path_buf();
     for _ in 0..2 {
         let entries = match std::fs::read_dir(&level) {
@@ -59,6 +70,40 @@ pub fn datatype_dir(binding_root: &Path, datatype: &str) -> anyhow::Result<Optio
     Ok(Some(level.join(datatype)))
 }
 
+fn is_day_dir_name(name: &str) -> bool {
+    name.len() == 10
+        && name.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+}
+
+pub fn tape_files_sorted(dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path.is_dir() && is_day_dir_name(&name) {
+            let Ok(day_entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for de in day_entries.filter_map(|e| e.ok()) {
+                let fname = de.file_name().to_string_lossy().into_owned();
+                if fname.ends_with(".parquet") {
+                    out.push((format!("{name}/{fname}"), de.path()));
+                }
+            }
+        } else if name.ends_with(".parquet") {
+            out.push((name, path));
+        }
+    }
+    out.sort();
+    out
+}
+
 pub struct StreamTail {
     dir: PathBuf,
     processed: BTreeSet<String>,
@@ -80,21 +125,11 @@ impl StreamTail {
 
     pub fn poll_new_files(&mut self) -> anyhow::Result<Vec<PathBuf>> {
         let mut fresh = Vec::new();
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(e) => e,
-            Err(_) => return Ok(fresh),
-        };
-        let mut names: Vec<String> = entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".parquet"))
-            .collect();
-        names.sort();
-        for name in names {
-            if self.processed.insert(name.clone()) {
-                self.last_file = Some(name.clone());
+        for (key, path) in tape_files_sorted(&self.dir) {
+            if self.processed.insert(key.clone()) {
+                self.last_file = Some(key);
                 self.files_read += 1;
-                fresh.push(self.dir.join(name));
+                fresh.push(path);
             }
         }
         Ok(fresh)
@@ -181,13 +216,28 @@ fn symbol_stem_norm(symbol: &str) -> String {
     symbol.replace(':', "_")
 }
 
+fn wave_leaf_gaps(binding_root: &Path) -> Option<(PathBuf, String)> {
+    let datatype = binding_root.parent()?.file_name()?.to_str()?;
+    if datatype != "trades" && datatype != "orderbooks" {
+        return None;
+    }
+    let binding = binding_root.file_name()?.to_string_lossy().into_owned();
+    let collected = binding_root.ancestors().nth(5)?;
+    Some((collected.join("gaps"), binding))
+}
+
 pub fn read_gap_incidents(
     binding_root: &Path,
     symbol_stem: Option<&str>,
 ) -> anyhow::Result<Vec<GapIncident>> {
     let mut incidents = Vec::new();
-    let Ok(Some(gaps_dir)) = datatype_dir(binding_root, "gaps") else {
-        return Ok(incidents);
+    let wave = wave_leaf_gaps(binding_root);
+    let gaps_dir = match &wave {
+        Some((dir, _)) => dir.clone(),
+        None => match datatype_dir(binding_root, "gaps") {
+            Ok(Some(dir)) => dir,
+            _ => return Ok(incidents),
+        },
     };
     let entries = match std::fs::read_dir(&gaps_dir) {
         Ok(e) => e,
@@ -197,6 +247,14 @@ pub fn read_gap_incidents(
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        if let Some((_, binding)) = &wave
+            && !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(binding.as_str())
+        {
             continue;
         }
         let text = std::fs::read_to_string(&path)?;
@@ -401,5 +459,114 @@ mod tests {
         assert!(read_gap_spans(&no_gaps, None).unwrap().is_empty());
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&no_gaps).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod wave_layout_tests {
+    use super::*;
+
+    fn leaf_fixture(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("tracer_wave_{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let leaf =
+            root.join("recorded/hyperliquid/perpetual/trades/0f0f0f0f-aaaa-bbbb-cccc-dddddddddddd");
+        std::fs::create_dir_all(&leaf).unwrap();
+        leaf
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    #[test]
+    fn a_wave_leaf_root_resolves_to_itself() {
+        let leaf = leaf_fixture("leaf_self");
+        let resolved = datatype_dir(&leaf, "trades").unwrap();
+        assert_eq!(resolved, Some(leaf));
+    }
+
+    #[test]
+    fn a_wave_leaf_that_does_not_exist_yet_stays_pending() {
+        let leaf = leaf_fixture("leaf_absent");
+        std::fs::remove_dir_all(&leaf).unwrap();
+        assert_eq!(datatype_dir(&leaf, "trades").unwrap(), None);
+    }
+
+    #[test]
+    fn a_legacy_binding_root_still_descends_to_the_datatype_dir() {
+        let root = std::env::temp_dir().join("tracer_wave_legacy");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("hyperliquid/perpetual/trades")).unwrap();
+        assert_eq!(
+            datatype_dir(&root, "trades").unwrap(),
+            Some(root.join("hyperliquid/perpetual/trades"))
+        );
+    }
+
+    #[test]
+    fn day_dirs_are_tailed_in_order_and_a_rollover_day_appends() {
+        let leaf = leaf_fixture("day_tail");
+        touch(&leaf.join("2026-09-14/b.parquet"));
+        touch(&leaf.join("2026-09-14/a.parquet"));
+        touch(&leaf.join("2026-09-14/index.jsonl"));
+        let mut tail = StreamTail::new(leaf.clone());
+        let first: Vec<_> = tail.poll_new_files().unwrap();
+        assert_eq!(
+            first,
+            vec![
+                leaf.join("2026-09-14/a.parquet"),
+                leaf.join("2026-09-14/b.parquet")
+            ]
+        );
+        assert_eq!(tail.files_read, 2);
+        touch(&leaf.join("2026-09-15/c.parquet"));
+        let second = tail.poll_new_files().unwrap();
+        assert_eq!(second, vec![leaf.join("2026-09-15/c.parquet")]);
+        assert_eq!(tail.last_file.as_deref(), Some("2026-09-15/c.parquet"));
+    }
+
+    #[test]
+    fn a_flat_legacy_dir_still_tails_and_ignores_non_day_subdirs() {
+        let root = std::env::temp_dir().join("tracer_wave_flat");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("not-a-day")).unwrap();
+        touch(&root.join("not-a-day/hidden.parquet"));
+        touch(&root.join("a.parquet"));
+        let mut tail = StreamTail::new(root.clone());
+        assert_eq!(tail.poll_new_files().unwrap(), vec![root.join("a.parquet")]);
+    }
+}
+
+#[cfg(test)]
+mod wave_gap_tests {
+    use super::*;
+
+    #[test]
+    fn wave_leaf_reads_only_its_own_ledger_from_collected_gaps() {
+        let root = std::env::temp_dir().join("tracer_wave_gaps");
+        let _ = std::fs::remove_dir_all(&root);
+        let leaf = root.join(
+            "collected/recorded/hyperliquid/perpetual/trades/aaaa1111-0000-0000-0000-000000000000",
+        );
+        std::fs::create_dir_all(&leaf).unwrap();
+        let gaps = root.join("collected/gaps");
+        std::fs::create_dir_all(&gaps).unwrap();
+        let own = r#"{"opened_epoch_us":1000,"closed_epoch_us":2000,"window_us":1000,"cause":"ws","exchange":"hyperliquid","symbol":"xyz:TSLA","possible_dropped_trades":1}"#;
+        let foreign = r#"{"opened_epoch_us":9000,"closed_epoch_us":9500,"window_us":500,"cause":"ws","exchange":"hyperliquid","symbol":"xyz:TSLA","possible_dropped_trades":2}"#;
+        std::fs::write(
+            gaps.join("aaaa1111-0000-0000-0000-000000000000_gap_ledger.jsonl"),
+            own,
+        )
+        .unwrap();
+        std::fs::write(
+            gaps.join("bbbb2222-0000-0000-0000-000000000000_gap_ledger.jsonl"),
+            foreign,
+        )
+        .unwrap();
+        let incidents = read_gap_incidents(&leaf, None).unwrap();
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].opened_epoch_us, 1000);
     }
 }

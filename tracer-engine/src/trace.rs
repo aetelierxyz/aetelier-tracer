@@ -1003,12 +1003,10 @@ pub fn load_live_tape_files(
     let mut out = Vec::new();
     let trades_dir = datatype_dir(trades_binding, "trades")?
         .ok_or_else(|| anyhow::anyhow!("{}: no trades binding dir", trades_binding.display()))?;
-    let mut names: Vec<PathBuf> = std::fs::read_dir(&trades_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+    let names: Vec<PathBuf> = crate::market_engine::tape_files_sorted(&trades_dir)
+        .into_iter()
+        .map(|(_, p)| p)
         .collect();
-    names.sort();
     anyhow::ensure!(
         !names.is_empty(),
         "{}: no trades parquet yet",
@@ -1018,12 +1016,10 @@ pub fn load_live_tape_files(
     if let Some(books) = books_binding
         && let Some(dir) = datatype_dir(books, "orderbooks")?
     {
-        let mut names: Vec<PathBuf> = std::fs::read_dir(&dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
+        let names: Vec<PathBuf> = crate::market_engine::tape_files_sorted(&dir)
+            .into_iter()
+            .map(|(_, p)| p)
             .collect();
-        names.sort();
         out.extend(names.into_iter().map(|p| (TapeRole::Orderbook, p)));
     }
     Ok(out)
