@@ -119,6 +119,23 @@ impl ClaimPublisher {
         })
     }
 
+    /// announce the pair's claims ONLY when a live trace is
+    /// actively running (`EngineStatus::live_trace_active`). Returns whether it
+    /// announced, so the gate is unit-testable without a broker. An idle /
+    /// paused / half-broken pair announces nothing; its overseer claim ages out
+    /// and the collector becomes deletable.
+    pub fn announce_if_active(
+        &self,
+        wall_ms: u64,
+        status: &tracer_engine::engine::EngineStatus,
+    ) -> bool {
+        if !status.live_trace_active() {
+            return false;
+        }
+        self.announce(wall_ms);
+        true
+    }
+
     pub fn announce(&self, wall_ms: u64) {
         for (binding_id, role) in &self.claims {
             let payload = encode_claim(binding_id, &self.trace_id, *role, wall_ms);
@@ -235,5 +252,65 @@ mod tests {
         assert!(ctx.should_log(1_000_000));
         assert!(!ctx.should_log(1_000_000 + ERROR_LOG_INTERVAL_MS - 1));
         assert!(ctx.should_log(1_000_000 + ERROR_LOG_INTERVAL_MS));
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use tracer_engine::engine::EngineStatus;
+
+    fn publisher() -> ClaimPublisher {
+        // Broker is never contacted: BaseRecord::send only enqueues, and these
+        // tests assert the GATE decision, not delivery.
+        ClaimPublisher::start(
+            Some("127.0.0.1:59999"),
+            Path::new("/opt/aetelier/datasets/585ccad2-0110-4abe-bfe3-a5ac63eba26d"),
+            Some(Path::new(
+                "/opt/aetelier/datasets/111ccad2-0110-4abe-bfe3-a5ac63eba26d",
+            )),
+            "xyz_TSLA",
+            2_000,
+        )
+        .expect("publisher constructs with a broker string and uuid bindings")
+    }
+
+    fn status(ready: bool, idle: bool, binding_pending: bool) -> EngineStatus {
+        EngineStatus {
+            ready,
+            idle,
+            binding_pending,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn announces_only_while_a_live_trace_is_active() {
+        let p = publisher();
+        assert!(
+            p.announce_if_active(1_000, &status(true, false, false)),
+            "fresh, ready, resolved pair = active = must announce (claim held)"
+        );
+    }
+
+    #[test]
+    fn does_not_announce_when_idle() {
+        let p = publisher();
+        assert!(
+            !p.announce_if_active(1_000, &status(true, true, false)),
+            "idle pair must NOT announce — collector becomes deletable"
+        );
+    }
+
+    #[test]
+    fn does_not_announce_when_binding_pending() {
+        let p = publisher();
+        assert!(!p.announce_if_active(1_000, &status(true, false, true)));
+    }
+
+    #[test]
+    fn does_not_announce_before_ready() {
+        let p = publisher();
+        assert!(!p.announce_if_active(1_000, &status(false, false, false)));
     }
 }
