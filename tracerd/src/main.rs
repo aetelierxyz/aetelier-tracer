@@ -210,13 +210,18 @@ async fn run_live(
     std::thread::spawn(move || {
         loop {
             let wall = wall_now_ms();
-            if let Some(publisher) = &claim_publisher {
-                publisher.announce(wall);
-            }
             if let Err(e) = engine.tick(wall) {
                 eprintln!("tick error: {e:#}");
             }
             let status = engine.status(wall_now_ms());
+            // claim the collector bindings ONLY while a live
+            // trace is actively running on a healthy pair. An idle / paused /
+            // half-deleted pair announces nothing, its overseer claim ages
+            // out, and the collector becomes deletable — the delete guard
+            // then blocks only a genuinely active trace.
+            if let Some(publisher) = &claim_publisher {
+                publisher.announce_if_active(wall, &status);
+            }
             *publish.status.write().unwrap() =
                 serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
             *publish.ledger_live.write().unwrap() = LedgerLive {
