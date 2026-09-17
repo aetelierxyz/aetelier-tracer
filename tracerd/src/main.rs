@@ -1,5 +1,4 @@
 mod api;
-mod claims;
 mod traces;
 
 use std::path::PathBuf;
@@ -160,13 +159,7 @@ async fn run_live(
 ) -> anyhow::Result<()> {
     let params = TracerParams::load(&params_path)?;
     let stem = symbol.replace(':', "_");
-    let claim_publisher = claims::ClaimPublisher::start(
-        kafka_brokers.as_deref(),
-        &trades_binding,
-        books_binding.as_deref(),
-        &stem,
-        poll_ms,
-    );
+    let _ = kafka_brokers;
     let traces_rt = traces_dir
         .map(|dir| {
             traces::TraceRuntime::start(
@@ -214,14 +207,6 @@ async fn run_live(
                 eprintln!("tick error: {e:#}");
             }
             let status = engine.status(wall_now_ms());
-            // claim the collector bindings ONLY while a live
-            // trace is actively running on a healthy pair. An idle / paused /
-            // half-deleted pair announces nothing, its overseer claim ages
-            // out, and the collector becomes deletable — the delete guard
-            // then blocks only a genuinely active trace.
-            if let Some(publisher) = &claim_publisher {
-                publisher.announce_if_active(wall, &status);
-            }
             *publish.status.write().unwrap() =
                 serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
             *publish.ledger_live.write().unwrap() = LedgerLive {

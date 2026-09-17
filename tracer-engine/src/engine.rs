@@ -177,20 +177,6 @@ pub struct EngineStatus {
     pub notional_usd: f64,
 }
 
-impl EngineStatus {
-    /// is a live trace ACTIVELY running on a healthy pair right
-    /// now? Only then does the tracer claim its collector bindings (so the
-    /// delete guard blocks). `ready` = initial tape loaded; `!binding_pending`
-    /// = both leaf dirs resolved; `!idle` = fresh data advanced within
-    /// `idle_after_ms`. A paused, deleted, or otherwise dead pair goes
-    /// idle/pending, drops the claim, and the collector becomes deletable —
-    /// the general rule ("a collector bound to an ACTIVE process is blocked")
-    /// applied to the tracing module first.
-    pub fn live_trace_active(&self) -> bool {
-        self.ready && !self.idle && !self.binding_pending
-    }
-}
-
 pub struct LiveEngine {
     params: TracerParams,
     cfg: LiveConfig,
@@ -901,18 +887,11 @@ mod tests {
         assert!(eng.status(1_000).binding_pending);
         eng.tick(1_000).unwrap();
         assert_eq!(eng.counters.posted, 0);
-        // A pending binding is never an active trace — no claim, so the
-        // (absent) collector is not falsely protected.
-        assert!(!eng.status(1_000).live_trace_active());
         let dir = binding.join("hyperliquid/perpetual/trades");
         std::fs::create_dir_all(&dir).unwrap();
         write_trades_parquet(&preamble_and_burst(), &dir.join("a.parquet")).unwrap();
         eng.tick(2_000).unwrap();
         assert!(!eng.status(2_000).binding_pending);
-        assert!(
-            eng.status(2_000).live_trace_active(),
-            "once the skeleton appears and data flows, the trace is active"
-        );
         assert_eq!(eng.counters.posted, 1);
     }
 
@@ -1233,21 +1212,12 @@ mod tests {
         assert!(!fresh.idle);
         assert!(!fresh.trades.stalled);
         assert_eq!(fresh.trades.advance_age_ms, 1_000);
-        assert!(
-            fresh.live_trace_active(),
-            "fresh data flowing = an active live trace = claim held"
-        );
         eng.tick(3_000).unwrap();
         let stalled = eng.status(10_000);
         assert!(stalled.idle);
         assert!(stalled.trades.stalled);
         assert_eq!(stalled.verdict_trail_ms, 0);
         assert!(stalled.books.is_none());
-        assert!(
-            !stalled.live_trace_active(),
-            "an idle pair is not an active trace — claim must drop so the \
-             collector is deletable"
-        );
         assert!(!stalled.session.is_empty());
         assert_eq!(stalled.counters.entry_expired_unfilled, 0);
         std::fs::remove_dir_all(binding.parent().unwrap()).unwrap();
