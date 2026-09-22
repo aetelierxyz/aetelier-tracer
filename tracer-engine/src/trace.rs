@@ -22,7 +22,8 @@ pub const SIGNALS_HEADER: &str = "symbol,side,score,decile,t_entry_ms,entry_px,t
 pub const PREFLIGHT_SCHEMA: &str = "tracer.preflight.v1";
 pub const MAX_SIGNAL_ROWS: usize = 50_000;
 pub const MAX_SIGNALS_BYTES: u64 = 10 * 1024 * 1024;
-pub const MAX_TAPE_BYTES: u64 = 200 * 1024 * 1024;
+pub const MAX_TRADES_BYTES: u64 = 50 * 1024 * 1024;
+pub const MAX_BOOKS_BYTES: u64 = 75 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RowError {
@@ -235,12 +236,33 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn check_size(path: &Path, errors: &mut Vec<RowError>) -> bool {
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    #[test]
+    fn each_tape_role_carries_its_own_cap() {
+        assert_eq!(tape_cap(TapeRole::Trades), 50 * 1024 * 1024);
+        assert_eq!(tape_cap(TapeRole::Orderbook), 75 * 1024 * 1024);
+        assert!(tape_cap(TapeRole::Trades) < tape_cap(TapeRole::Orderbook));
+        assert!(MAX_SIGNALS_BYTES < tape_cap(TapeRole::Trades));
+    }
+}
+
+pub fn tape_cap(role: TapeRole) -> u64 {
+    match role {
+        TapeRole::Trades => MAX_TRADES_BYTES,
+        TapeRole::Orderbook => MAX_BOOKS_BYTES,
+    }
+}
+
+fn check_size(path: &Path, role: TapeRole, errors: &mut Vec<RowError>) -> bool {
+    let cap = tape_cap(role);
     match std::fs::metadata(path) {
-        Ok(m) if m.len() > MAX_TAPE_BYTES => {
+        Ok(m) if m.len() > cap => {
             errors.push(file_error(
                 &file_name(path),
-                format!("{} bytes exceeds tape cap {MAX_TAPE_BYTES}", m.len()),
+                format!("{} bytes exceeds tape cap {cap}", m.len()),
             ));
             false
         }
@@ -722,7 +744,7 @@ pub fn prepare(
     let mut trades_paths: Vec<&Path> = Vec::new();
     let mut ob_paths: Vec<&Path> = Vec::new();
     for (role, path) in &req.tape_files {
-        if !check_size(path, &mut errors) {
+        if !check_size(path, *role, &mut errors) {
             continue;
         }
         match role {

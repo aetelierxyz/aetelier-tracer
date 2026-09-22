@@ -122,6 +122,7 @@ fn world_with_quota(name: &str, quota: usize) -> World {
         None,
         None,
         quota,
+        traces::DEFAULT_TAPE_RETENTION_MS,
     )
     .unwrap();
     let ledger_dir = dir.join("live_ledger");
@@ -578,6 +579,7 @@ async fn the_live_record_ignores_ownership_but_needs_a_caller() {
         Some(books_binding),
         Some("xyz_TSLA".into()),
         traces::DEFAULT_MAX_TRACES_PER_USER,
+        traces::DEFAULT_TAPE_RETENTION_MS,
     )
     .unwrap();
     w.state.traces = Some(rt);
@@ -729,6 +731,79 @@ async fn the_service_credential_replaces_header_absence() {
         axum::http::StatusCode::UNAUTHORIZED
     );
     unsafe { std::env::remove_var("TRACER_SERVICE_TOKEN") };
+}
+
+#[tokio::test]
+async fn the_sweep_evicts_tapes_past_retention_and_frees_the_quota() {
+    let w = world_with_quota("retention", 1);
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let (status, body) = post_trace(&w, &config, files, Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let id = body["trace_id"].as_str().unwrap().to_string();
+    let record = wait_complete(&w, &id, OWNER).await;
+    let terminal_ms = record["terminal_ms"].as_u64().expect("terminal_ms stamped");
+    let inputs = w.dir.join("traces").join(&id).join("inputs");
+    assert!(inputs.is_dir());
+
+    let rt = w.state.traces.clone().unwrap();
+    assert!(rt.sweep_tapes(terminal_ms).is_empty(), "nothing due at t0");
+    let just_under = terminal_ms + traces::DEFAULT_TAPE_RETENTION_MS - 1;
+    assert!(
+        rt.sweep_tapes(just_under).is_empty(),
+        "nothing due before the mark"
+    );
+
+    let due = terminal_ms + traces::DEFAULT_TAPE_RETENTION_MS;
+    assert_eq!(rt.sweep_tapes(due), vec![id.clone()]);
+    assert!(!inputs.exists(), "inputs removed");
+    assert!(rt.sweep_tapes(due).is_empty(), "eviction is not repeated");
+
+    let (status, after) = get_json(&w, &format!("/api/tracer/traces/{id}"), Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let after = after.unwrap();
+    assert_eq!(after["tape_evicted"], true);
+    assert!(after["inputs"].as_array().unwrap().is_empty());
+
+    for route in [
+        format!("/api/tracer/traces/{id}/ledger"),
+        format!("/api/tracer/traces/{id}/fillrates"),
+    ] {
+        let (status, _) = get_json(&w, &route, Some(OWNER)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "{route} survives eviction"
+        );
+    }
+
+    let other = serde_json::json!({
+        "order_source": "strategy", "tape": "upload", "notional_usd": 2_000.0
+    });
+    let (status, _) = post_trace(&w, &other, files, Some(OWNER)).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CREATED,
+        "an evicted trace must not hold a quota slot"
+    );
+}
+
+#[tokio::test]
+async fn a_running_trace_is_never_swept() {
+    let w = world("retention_running");
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let (status, body) = post_trace(&w, &config, files, Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let id = body["trace_id"].as_str().unwrap().to_string();
+    let rt = w.state.traces.clone().unwrap();
+    let far_future = 10 * traces::DEFAULT_TAPE_RETENTION_MS;
+    let swept = rt.sweep_tapes(far_future);
+    wait_complete(&w, &id, OWNER).await;
+    assert!(
+        !swept.contains(&id) || w.dir.join("traces").join(&id).join("inputs").exists(),
+        "a trace still queued or running kept its inputs"
+    );
 }
 
 fn deep_ob_parquet(w: &World, n_levels: usize, ts_list: &[u64]) -> PathBuf {
@@ -886,6 +961,7 @@ async fn a_live_tape_trace_serves_its_schema_from_the_binding_dirs() {
         Some(books_binding),
         Some("xyz_TSLA".into()),
         traces::DEFAULT_MAX_TRACES_PER_USER,
+        traces::DEFAULT_TAPE_RETENTION_MS,
     )
     .unwrap();
 

@@ -62,6 +62,8 @@ enum Command {
         traces_dir: Option<PathBuf>,
         #[arg(long, env = "TRACER_MAX_TRACES_PER_USER", default_value_t = traces::DEFAULT_MAX_TRACES_PER_USER)]
         max_traces_per_user: usize,
+        #[arg(long, env = "TRACER_TAPE_RETENTION_MS", default_value_t = traces::DEFAULT_TAPE_RETENTION_MS)]
+        tape_retention_ms: u64,
         #[arg(long, env = "KAFKA_BROKERS")]
         kafka_brokers: Option<String>,
     },
@@ -88,6 +90,8 @@ enum Command {
         traces_dir: Option<PathBuf>,
         #[arg(long, env = "TRACER_MAX_TRACES_PER_USER", default_value_t = traces::DEFAULT_MAX_TRACES_PER_USER)]
         max_traces_per_user: usize,
+        #[arg(long, env = "TRACER_TAPE_RETENTION_MS", default_value_t = traces::DEFAULT_TAPE_RETENTION_MS)]
+        tape_retention_ms: u64,
         #[arg(
             long,
             env = "TRACER_PARAMS",
@@ -160,6 +164,7 @@ async fn run_live(
     idle_after_ms: u64,
     traces_dir: Option<PathBuf>,
     max_traces_per_user: usize,
+    tape_retention_ms: u64,
     kafka_brokers: Option<String>,
 ) -> anyhow::Result<()> {
     let params = TracerParams::load(&params_path)?;
@@ -176,6 +181,7 @@ async fn run_live(
                 books_binding.clone(),
                 Some(stem.clone()),
                 max_traces_per_user,
+                tape_retention_ms,
             )
         })
         .transpose()?;
@@ -393,6 +399,7 @@ async fn main() -> anyhow::Result<()> {
             idle_after_ms,
             traces_dir,
             max_traces_per_user,
+            tape_retention_ms,
             kafka_brokers,
         } => {
             run_live(
@@ -410,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
                 idle_after_ms,
                 traces_dir,
                 max_traces_per_user,
+                tape_retention_ms,
                 kafka_brokers,
             )
             .await
@@ -420,6 +428,7 @@ async fn main() -> anyhow::Result<()> {
             port,
             traces_dir,
             max_traces_per_user,
+            tape_retention_ms,
             params,
         } => {
             let traces_rt = traces_dir
@@ -433,6 +442,7 @@ async fn main() -> anyhow::Result<()> {
                         None,
                         None,
                         max_traces_per_user,
+                        tape_retention_ms,
                     )
                 })
                 .transpose()?;
