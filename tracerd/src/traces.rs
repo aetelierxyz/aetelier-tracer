@@ -9,10 +9,10 @@ use sha2::Digest;
 use tracer_engine::market_engine::read_gap_spans;
 use tracer_engine::params::TracerParams;
 use tracer_engine::trace::{
-    BookTick, DEPTH_ROWS_CAP, DEPTH_ROWS_DEFAULT, DepthRow, MAX_SIGNALS_BYTES, MAX_TAPE_BYTES,
-    OrderSourceSpec, PreflightReport, RowError, SchemaFieldOut, TapeRole, TraceOverrides,
-    TraceRequest, TraceSummary, book_series, decimate_depth, execute, load_books_files,
-    load_depth_rows, load_live_tape_files, load_trades_files, parquet_schema_fields, prepare,
+    BookTick, DEPTH_ROWS_CAP, DEPTH_ROWS_DEFAULT, DepthRow, MAX_SIGNALS_BYTES, OrderSourceSpec,
+    PreflightReport, RowError, SchemaFieldOut, TapeRole, TraceOverrides, TraceRequest,
+    TraceSummary, book_series, decimate_depth, execute, load_books_files, load_depth_rows,
+    load_live_tape_files, load_trades_files, parquet_schema_fields, prepare,
 };
 
 use crate::api::{AppState, EventsQuery, paged_events};
@@ -24,6 +24,8 @@ pub const SERVICE_TOKEN_ENV: &str = "TRACER_SERVICE_TOKEN";
 pub const SERVICE_PRINCIPAL: &str = "svc:in-network";
 pub const LIVE_ID: &str = "live";
 pub const DEFAULT_MAX_TRACES_PER_USER: usize = 50;
+pub const DEFAULT_TAPE_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+pub const DEFAULT_SWEEP_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TraceInputFile {
@@ -41,6 +43,10 @@ pub struct TraceRecord {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tape_evicted: bool,
     pub order_source: String,
     pub tape_source: String,
     pub inputs: Vec<TraceInputFile>,
@@ -69,6 +75,7 @@ pub struct TraceRuntime {
     pub books_binding: Option<PathBuf>,
     pub symbol_stem: Option<String>,
     pub max_traces_per_user: usize,
+    pub tape_retention_ms: u64,
     tx: mpsc::Sender<String>,
     cache: Mutex<Option<(String, Arc<CachedTape>)>>,
     deleted: Mutex<std::collections::HashSet<String>>,
@@ -85,6 +92,7 @@ impl TraceRuntime {
         books_binding: Option<PathBuf>,
         symbol_stem: Option<String>,
         max_traces_per_user: usize,
+        tape_retention_ms: u64,
     ) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(&dir)?;
         let (tx, rx) = mpsc::channel::<String>();
@@ -97,6 +105,7 @@ impl TraceRuntime {
             books_binding,
             symbol_stem,
             max_traces_per_user,
+            tape_retention_ms,
             tx,
             cache: Mutex::new(None),
             deleted: Mutex::new(std::collections::HashSet::new()),
@@ -106,6 +115,15 @@ impl TraceRuntime {
                 let _ = rt.tx.send(record.trace_id.clone());
             }
         }
+        let sweeper = rt.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(DEFAULT_SWEEP_INTERVAL_MS));
+                for id in sweeper.sweep_tapes(wall_ms()) {
+                    eprintln!("trace {id}: tape evicted");
+                }
+            }
+        });
         let worker = rt.clone();
         std::thread::spawn(move || {
             while let Ok(trace_id) = rx.recv() {
@@ -113,6 +131,7 @@ impl TraceRuntime {
                     eprintln!("trace {trace_id}: {e:#}");
                     let _ = worker.update_record(&trace_id, |r| {
                         r.status = "failed".into();
+                        r.terminal_ms = Some(wall_ms());
                         r.error = Some(format!("{e:#}"));
                     });
                 }
@@ -186,8 +205,43 @@ impl TraceRuntime {
     pub fn count_for(&self, owner: &str) -> usize {
         self.list_records()
             .iter()
-            .filter(|r| r.user_id.as_deref() == Some(owner))
+            .filter(|r| r.user_id.as_deref() == Some(owner) && !r.tape_evicted)
             .count()
+    }
+
+    fn eviction_due(&self, record: &TraceRecord, now_ms: u64) -> bool {
+        if record.tape_evicted || record.inputs.is_empty() {
+            return false;
+        }
+        if record.status != "complete" && record.status != "failed" {
+            return false;
+        }
+        let since = record.terminal_ms.unwrap_or(record.created_ms);
+        now_ms.saturating_sub(since) >= self.tape_retention_ms
+    }
+
+    pub fn sweep_tapes(&self, now_ms: u64) -> Vec<String> {
+        let mut evicted = Vec::new();
+        for record in self.list_records() {
+            if !self.eviction_due(&record, now_ms) {
+                continue;
+            }
+            let inputs = self.trace_dir(&record.trace_id).join("inputs");
+            if inputs.exists() && std::fs::remove_dir_all(&inputs).is_err() {
+                continue;
+            }
+            self.drop_cached(&record.trace_id);
+            if self
+                .update_record(&record.trace_id, |r| {
+                    r.tape_evicted = true;
+                    r.inputs.clear();
+                })
+                .is_ok()
+            {
+                evicted.push(record.trace_id);
+            }
+        }
+        evicted
     }
 
     pub fn list_records(&self) -> Vec<TraceRecord> {
@@ -270,6 +324,7 @@ impl TraceRuntime {
         match prepare(&req, &base_params)? {
             Err(report) => self.update_record(trace_id, |r| {
                 r.status = "failed".into();
+                r.terminal_ms = Some(wall_ms());
                 r.error = Some(format!(
                     "strict validation failed at run time: {} errors",
                     report.row_errors.len()
@@ -297,6 +352,7 @@ impl TraceRuntime {
                 }
                 self.update_record(trace_id, |r| {
                     r.status = "complete".into();
+                    r.terminal_ms = Some(wall_ms());
                     r.summary = serde_json::to_value(&summary).ok();
                     r.effective = Some(effective);
                 })
@@ -358,6 +414,13 @@ fn now_from(state: &AppState) -> u64 {
 
 fn runtime(state: &AppState) -> Result<Arc<TraceRuntime>, StatusCode> {
     state.traces.clone().ok_or(StatusCode::NOT_FOUND)
+}
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -505,10 +568,10 @@ async fn stage_upload(
                     .map(|f| f.to_string())
                     .filter(|f| !f.is_empty() && !f.contains('/') && !f.contains(".."))
                     .unwrap_or_else(|| format!("{name}.{ext}"));
-                let cap = if name == "signals" {
-                    MAX_SIGNALS_BYTES
-                } else {
-                    MAX_TAPE_BYTES
+                let cap = match name.as_str() {
+                    "signals" => MAX_SIGNALS_BYTES,
+                    "trades" => tracer_engine::trace::tape_cap(TapeRole::Trades),
+                    _ => tracer_engine::trace::tape_cap(TapeRole::Orderbook),
                 };
                 let bytes = field
                     .bytes()
@@ -676,6 +739,8 @@ pub async fn create_trace(
         schema: TRACE_SCHEMA.into(),
         trace_id: trace_id.clone(),
         created_ms: now,
+        terminal_ms: None,
+        tape_evicted: false,
         user_id: Some(user),
         status: "queued".into(),
         error: None,
@@ -821,6 +886,8 @@ fn live_pseudo_record(rt: &TraceRuntime) -> TraceRecord {
         schema: TRACE_SCHEMA.into(),
         trace_id: "live".into(),
         created_ms: 0,
+        terminal_ms: None,
+        tape_evicted: false,
         user_id: None,
         status: "live".into(),
         error: None,
