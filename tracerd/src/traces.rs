@@ -19,6 +19,11 @@ use crate::api::{AppState, EventsQuery, paged_events};
 
 pub const TRACE_SCHEMA: &str = "tracer.trace.v1";
 pub const USER_HEADER: &str = "x-aetelier-user";
+pub const SERVICE_HEADER: &str = "x-aetelier-service";
+pub const SERVICE_TOKEN_ENV: &str = "TRACER_SERVICE_TOKEN";
+pub const SERVICE_PRINCIPAL: &str = "svc:in-network";
+pub const LIVE_ID: &str = "live";
+pub const DEFAULT_MAX_TRACES_PER_USER: usize = 50;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TraceInputFile {
@@ -63,8 +68,10 @@ pub struct TraceRuntime {
     pub trades_binding: Option<PathBuf>,
     pub books_binding: Option<PathBuf>,
     pub symbol_stem: Option<String>,
+    pub max_traces_per_user: usize,
     tx: mpsc::Sender<String>,
     cache: Mutex<Option<(String, Arc<CachedTape>)>>,
+    deleted: Mutex<std::collections::HashSet<String>>,
 }
 
 impl TraceRuntime {
@@ -77,6 +84,7 @@ impl TraceRuntime {
         trades_binding: Option<PathBuf>,
         books_binding: Option<PathBuf>,
         symbol_stem: Option<String>,
+        max_traces_per_user: usize,
     ) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(&dir)?;
         let (tx, rx) = mpsc::channel::<String>();
@@ -88,8 +96,10 @@ impl TraceRuntime {
             trades_binding,
             books_binding,
             symbol_stem,
+            max_traces_per_user,
             tx,
             cache: Mutex::new(None),
+            deleted: Mutex::new(std::collections::HashSet::new()),
         });
         for record in rt.list_records() {
             if record.status == "queued" || record.status == "running" {
@@ -143,6 +153,41 @@ impl TraceRuntime {
             .ok_or_else(|| anyhow::anyhow!("{trace_id}: record missing"))?;
         f(&mut record);
         self.write_record(&record)
+    }
+
+    fn is_deleted(&self, trace_id: &str) -> bool {
+        self.deleted.lock().unwrap().contains(trace_id)
+    }
+
+    fn drop_cached(&self, trace_id: &str) {
+        let mut cache = self.cache.lock().unwrap();
+        if cache.as_ref().is_some_and(|(id, _)| id == trace_id) {
+            *cache = None;
+        }
+    }
+
+    fn purge_dir(&self, trace_id: &str) {
+        let dir = self.trace_dir(trace_id);
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    pub fn delete_trace(&self, trace_id: &str) -> Result<(), StatusCode> {
+        if !is_trace_id(trace_id) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        self.deleted.lock().unwrap().insert(trace_id.to_string());
+        self.drop_cached(trace_id);
+        self.purge_dir(trace_id);
+        Ok(())
+    }
+
+    pub fn count_for(&self, owner: &str) -> usize {
+        self.list_records()
+            .iter()
+            .filter(|r| r.user_id.as_deref() == Some(owner))
+            .count()
     }
 
     pub fn list_records(&self) -> Vec<TraceRecord> {
@@ -205,6 +250,10 @@ impl TraceRuntime {
     }
 
     fn run_one(&self, trace_id: &str) -> anyhow::Result<()> {
+        if self.is_deleted(trace_id) {
+            self.purge_dir(trace_id);
+            return Ok(());
+        }
         let record = self
             .read_record(trace_id)
             .ok_or_else(|| anyhow::anyhow!("{trace_id}: record missing"))?;
@@ -242,6 +291,10 @@ impl TraceRuntime {
                 });
                 let summary: TraceSummary =
                     execute(&prepared, record.grace_ms, record.cross_window_ms, &out_dir)?;
+                if self.is_deleted(trace_id) {
+                    self.purge_dir(trace_id);
+                    return Ok(());
+                }
                 self.update_record(trace_id, |r| {
                     r.status = "complete".into();
                     r.summary = serde_json::to_value(&summary).ok();
@@ -307,18 +360,50 @@ fn runtime(state: &AppState) -> Result<Arc<TraceRuntime>, StatusCode> {
     state.traces.clone().ok_or(StatusCode::NOT_FOUND)
 }
 
-fn user_of(headers: &HeaderMap) -> Option<String> {
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
-        .get(USER_HEADER)
+        .get(name)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
 }
 
-fn scoped_trace_id(engine_id: &str, user: Option<&str>) -> String {
-    let Some(user) = user else {
-        return engine_id.to_string();
+fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn service_credential_matches(headers: &HeaderMap) -> bool {
+    let Some(expected) = std::env::var(SERVICE_TOKEN_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
     };
+    header_value(headers, SERVICE_HEADER).is_some_and(|presented| secret_eq(&expected, &presented))
+}
+
+fn caller_of(headers: &HeaderMap) -> Result<String, StatusCode> {
+    if service_credential_matches(headers) {
+        return Ok(SERVICE_PRINCIPAL.to_string());
+    }
+    header_value(headers, USER_HEADER).ok_or(StatusCode::UNAUTHORIZED)
+}
+
+fn is_service(caller: &str) -> bool {
+    caller == SERVICE_PRINCIPAL
+}
+
+fn is_trace_id(id: &str) -> bool {
+    id.len() == 15
+        && id.starts_with("tr_")
+        && id
+            .bytes()
+            .skip(3)
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn scoped_trace_id(engine_id: &str, user: &str) -> String {
     let mut h = sha2::Sha256::new();
     h.update(engine_id.as_bytes());
     h.update(b"\n");
@@ -327,16 +412,20 @@ fn scoped_trace_id(engine_id: &str, user: Option<&str>) -> String {
     format!("tr_{}", &hex[..12])
 }
 
-fn visible_to(record: &TraceRecord, headers: &HeaderMap) -> Result<(), StatusCode> {
-    match (user_of(headers), &record.user_id) {
-        (Some(caller), Some(owner)) if &caller != owner => Err(StatusCode::NOT_FOUND),
-        _ => Ok(()),
+fn visible_to(record: &TraceRecord, caller: &str) -> Result<(), StatusCode> {
+    if record.trace_id == LIVE_ID || is_service(caller) {
+        return Ok(());
+    }
+    match &record.user_id {
+        Some(owner) if owner == caller => Ok(()),
+        _ => Err(StatusCode::NOT_FOUND),
     }
 }
 
 fn read_owned(rt: &TraceRuntime, id: &str, headers: &HeaderMap) -> Result<TraceRecord, StatusCode> {
+    let caller = caller_of(headers)?;
     let record = rt.read_record(id).ok_or(StatusCode::NOT_FOUND)?;
-    visible_to(&record, headers)?;
+    visible_to(&record, &caller)?;
     Ok(record)
 }
 
@@ -455,6 +544,21 @@ pub async fn create_trace(
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let rt = runtime(&s).map_err(|c| (c, Json(serde_json::json!({"error": "traces disabled"}))))?;
+    let user = caller_of(&headers).map_err(|c| {
+        (
+            c,
+            Json(serde_json::json!({"error": "caller identity required"})),
+        )
+    })?;
+    if !is_service(&user) && rt.count_for(&user) >= rt.max_traces_per_user {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "trace quota reached",
+                "limit": rt.max_traces_per_user,
+            })),
+        ));
+    }
     let now = now_from(&s);
     let (config, staged) = stage_upload(&rt.dir, now, &mut multipart).await?;
     let config = config.ok_or_else(|| bad_request("missing config part".into()))?;
@@ -525,8 +629,7 @@ pub async fn create_trace(
             Err(report) => return Err(rejection(&report)),
             Ok(p) => p,
         };
-    let user = user_of(&headers);
-    let trace_id = scoped_trace_id(&prepared.trace_id, user.as_deref());
+    let trace_id = scoped_trace_id(&prepared.trace_id, &user);
 
     if config.preflight_only {
         return Ok((
@@ -573,7 +676,7 @@ pub async fn create_trace(
         schema: TRACE_SCHEMA.into(),
         trace_id: trace_id.clone(),
         created_ms: now,
-        user_id: user,
+        user_id: Some(user),
         status: "queued".into(),
         error: None,
         order_source: config.order_source.clone(),
@@ -606,14 +709,11 @@ pub async fn list_traces(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let rt = runtime(&s)?;
-    let user = user_of(&headers);
+    let caller = caller_of(&headers)?;
     let traces: Vec<serde_json::Value> = rt
         .list_records()
         .into_iter()
-        .filter(|r| match (&user, &r.user_id) {
-            (Some(u), Some(owner)) => u == owner,
-            _ => true,
-        })
+        .filter(|r| is_service(&caller) || r.user_id.as_deref() == Some(caller.as_str()))
         .map(|r| serde_json::to_value(&r).unwrap_or_default())
         .collect();
     Ok(Json(serde_json::json!({
@@ -629,11 +729,23 @@ pub async fn get_trace(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let rt = runtime(&s)?;
-    if id == "live" {
+    caller_of(&headers)?;
+    if id == LIVE_ID {
         return rt.live_record().map(Json).ok_or(StatusCode::NOT_FOUND);
     }
     let record = read_owned(&rt, &id, &headers)?;
     Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+}
+
+pub async fn delete_trace(
+    State(s): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    let rt = runtime(&s)?;
+    let record = read_owned(&rt, &id, &headers)?;
+    rt.delete_trace(&record.trace_id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn trace_artifact(
@@ -658,7 +770,8 @@ pub async fn trace_ledger(
     AxumPath(id): AxumPath<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if id == "live" {
+    caller_of(&headers)?;
+    if id == LIVE_ID {
         return Ok(crate::api::live_ledger_json(&s, None));
     }
     let rt = runtime(&s)?;
@@ -670,7 +783,8 @@ pub async fn trace_fillrates(
     AxumPath(id): AxumPath<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    if id == "live" {
+    caller_of(&headers)?;
+    if id == LIVE_ID {
         return crate::api::live_fillrates_json(&s, "all");
     }
     let rt = runtime(&s)?;
@@ -683,7 +797,8 @@ pub async fn trace_events(
     Query(q): Query<EventsQuery>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let ledger_dir = if id == "live" {
+    caller_of(&headers)?;
+    let ledger_dir = if id == LIVE_ID {
         s.ledger_dir.clone()
     } else {
         let rt = runtime(&s)?;
@@ -736,8 +851,9 @@ fn owned_record_or_live(
     id: &str,
     headers: &HeaderMap,
 ) -> Result<TraceRecord, StatusCode> {
+    let caller = caller_of(headers)?;
     let record = record_or_live(rt, id)?;
-    visible_to(&record, headers)?;
+    visible_to(&record, &caller)?;
     Ok(record)
 }
 

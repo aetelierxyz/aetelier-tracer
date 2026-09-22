@@ -55,7 +55,10 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> axum::Router {
             "/api/tracer/traces",
             get(crate::traces::list_traces).post(crate::traces::create_trace),
         )
-        .route("/api/tracer/traces/{id}", get(crate::traces::get_trace))
+        .route(
+            "/api/tracer/traces/{id}",
+            get(crate::traces::get_trace).delete(crate::traces::delete_trace),
+        )
         .route(
             "/api/tracer/traces/{id}/ledger",
             get(crate::traces::trace_ledger),
@@ -105,7 +108,11 @@ fn cors_layer(origins: &[String]) -> tower_http::cors::CorsLayer {
         origins.iter().filter_map(|o| o.parse().ok()).collect();
     tower_http::cors::CorsLayer::new()
         .allow_origin(parsed)
-        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::DELETE,
+        ])
         .allow_headers([
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderName::from_static(crate::traces::USER_HEADER),

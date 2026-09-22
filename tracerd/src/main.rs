@@ -60,6 +60,8 @@ enum Command {
         idle_after_ms: u64,
         #[arg(long, env = "TRACER_TRACES_DIR")]
         traces_dir: Option<PathBuf>,
+        #[arg(long, env = "TRACER_MAX_TRACES_PER_USER", default_value_t = traces::DEFAULT_MAX_TRACES_PER_USER)]
+        max_traces_per_user: usize,
         #[arg(long, env = "KAFKA_BROKERS")]
         kafka_brokers: Option<String>,
     },
@@ -84,6 +86,8 @@ enum Command {
         port: u16,
         #[arg(long, env = "TRACER_TRACES_DIR")]
         traces_dir: Option<PathBuf>,
+        #[arg(long, env = "TRACER_MAX_TRACES_PER_USER", default_value_t = traces::DEFAULT_MAX_TRACES_PER_USER)]
+        max_traces_per_user: usize,
         #[arg(
             long,
             env = "TRACER_PARAMS",
@@ -155,6 +159,7 @@ async fn run_live(
     cross_window_ms: u64,
     idle_after_ms: u64,
     traces_dir: Option<PathBuf>,
+    max_traces_per_user: usize,
     kafka_brokers: Option<String>,
 ) -> anyhow::Result<()> {
     let params = TracerParams::load(&params_path)?;
@@ -170,6 +175,7 @@ async fn run_live(
                 Some(trades_binding.clone()),
                 books_binding.clone(),
                 Some(stem.clone()),
+                max_traces_per_user,
             )
         })
         .transpose()?;
@@ -386,6 +392,7 @@ async fn main() -> anyhow::Result<()> {
             cross_window_ms,
             idle_after_ms,
             traces_dir,
+            max_traces_per_user,
             kafka_brokers,
         } => {
             run_live(
@@ -402,6 +409,7 @@ async fn main() -> anyhow::Result<()> {
                 cross_window_ms,
                 idle_after_ms,
                 traces_dir,
+                max_traces_per_user,
                 kafka_brokers,
             )
             .await
@@ -411,6 +419,7 @@ async fn main() -> anyhow::Result<()> {
             artifacts,
             port,
             traces_dir,
+            max_traces_per_user,
             params,
         } => {
             let traces_rt = traces_dir
@@ -423,6 +432,7 @@ async fn main() -> anyhow::Result<()> {
                         None,
                         None,
                         None,
+                        max_traces_per_user,
                     )
                 })
                 .transpose()?;
