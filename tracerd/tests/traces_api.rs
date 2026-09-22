@@ -41,6 +41,10 @@ struct World {
 }
 
 fn world(name: &str) -> World {
+    world_with_quota(name, traces::DEFAULT_MAX_TRACES_PER_USER)
+}
+
+fn world_with_quota(name: &str, quota: usize) -> World {
     let dir = temp_dir(name);
     let rows = read_fills_csv(&repo_root().join("fixtures/mini_fills_xyz_TSLA.csv")).unwrap();
     let pair = TradingPair::from_str("xyz:TSLA/USDC").unwrap();
@@ -117,6 +121,7 @@ fn world(name: &str) -> World {
         None,
         None,
         None,
+        quota,
     )
     .unwrap();
     let ledger_dir = dir.join("live_ledger");
@@ -171,6 +176,8 @@ fn multipart_body(config: &serde_json::Value, files: &[(&str, &Path)]) -> Vec<u8
     body
 }
 
+const OWNER: &str = "user-a";
+
 async fn post_trace(
     w: &World,
     config: &serde_json::Value,
@@ -212,9 +219,10 @@ async fn get_json(
     (status, serde_json::from_slice(&bytes).ok())
 }
 
-async fn wait_complete(w: &World, trace_id: &str) -> serde_json::Value {
+async fn wait_complete(w: &World, trace_id: &str, user: &str) -> serde_json::Value {
     for _ in 0..300 {
-        let (status, body) = get_json(w, &format!("/api/tracer/traces/{trace_id}"), None).await;
+        let (status, body) =
+            get_json(w, &format!("/api/tracer/traces/{trace_id}"), Some(user)).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         let body = body.unwrap();
         match body["status"].as_str().unwrap() {
@@ -244,13 +252,17 @@ async fn strategy_upload_trace_lifecycle_and_artifact_routes() {
     assert_eq!(body["preflight"]["schema"], "tracer.preflight.v1");
     assert_eq!(body["preflight"]["files"].as_array().unwrap().len(), 2);
 
-    let record = wait_complete(&w, &trace_id).await;
+    let record = wait_complete(&w, &trace_id, OWNER).await;
     assert_eq!(record["order_source"], "strategy");
     assert_eq!(record["user_id"], "user-a");
     assert!(record["summary"]["n_signals"].as_u64().unwrap() > 0);
 
-    let (status, ledger) =
-        get_json(&w, &format!("/api/tracer/traces/{trace_id}/ledger"), None).await;
+    let (status, ledger) = get_json(
+        &w,
+        &format!("/api/tracer/traces/{trace_id}/ledger"),
+        Some(OWNER),
+    )
+    .await;
     assert_eq!(status, axum::http::StatusCode::OK);
     let ledger = ledger.unwrap();
     assert_eq!(ledger["schema"], "tracer.corrected.v1");
@@ -260,7 +272,7 @@ async fn strategy_upload_trace_lifecycle_and_artifact_routes() {
     let (status, fr) = get_json(
         &w,
         &format!("/api/tracer/traces/{trace_id}/fillrates"),
-        None,
+        Some(OWNER),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
@@ -269,7 +281,7 @@ async fn strategy_upload_trace_lifecycle_and_artifact_routes() {
     let (status, events) = get_json(
         &w,
         &format!("/api/tracer/traces/{trace_id}/events?limit=10"),
-        None,
+        Some(OWNER),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
@@ -277,7 +289,12 @@ async fn strategy_upload_trace_lifecycle_and_artifact_routes() {
     assert_eq!(events["events"].as_array().unwrap().len(), 10);
     assert_eq!(events["events"][0]["mode"], "trace");
 
-    let (status, book) = get_json(&w, &format!("/api/tracer/traces/{trace_id}/book"), None).await;
+    let (status, book) = get_json(
+        &w,
+        &format!("/api/tracer/traces/{trace_id}/book"),
+        Some(OWNER),
+    )
+    .await;
     assert_eq!(status, axum::http::StatusCode::OK);
     let book = book.unwrap();
     assert_eq!(book["schema"], "tracer.tracebook.v1");
@@ -287,7 +304,7 @@ async fn strategy_upload_trace_lifecycle_and_artifact_routes() {
     let (status, prints) = get_json(
         &w,
         &format!("/api/tracer/traces/{trace_id}/prints?limit=5"),
-        None,
+        Some(OWNER),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
@@ -304,7 +321,7 @@ async fn strategy_upload_trace_lifecycle_and_artifact_routes() {
         let (status, schema) = get_json(
             &w,
             &format!("/api/tracer/traces/{trace_id}/schema?source={source}"),
-            None,
+            Some(OWNER),
         )
         .await;
         assert_eq!(status, axum::http::StatusCode::OK);
@@ -327,7 +344,7 @@ async fn strategy_upload_trace_lifecycle_and_artifact_routes() {
     assert_eq!(status, axum::http::StatusCode::OK);
     assert_eq!(list_b.unwrap()["traces"].as_array().unwrap().len(), 0);
 
-    let (status, _) = get_json(&w, "/api/tracer/traces/tr_missing000000", None).await;
+    let (status, _) = get_json(&w, "/api/tracer/traces/tr_missing000000", Some(OWNER)).await;
     assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
 }
 
@@ -358,7 +375,7 @@ async fn strict_rejection_returns_422_row_error_report() {
             ("trades", &w.trades_parquet),
             ("signals", &signals_path),
         ],
-        None,
+        Some(OWNER),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
@@ -374,7 +391,7 @@ async fn strict_rejection_returns_422_row_error_report() {
     }
     assert!(errors.iter().all(|e| e["row"] == 1));
 
-    let (status, _) = get_json(&w, "/api/tracer/traces", None).await;
+    let (status, _) = get_json(&w, "/api/tracer/traces", Some(OWNER)).await;
     assert_eq!(status, axum::http::StatusCode::OK);
 }
 
@@ -387,20 +404,23 @@ async fn preflight_only_reports_without_persisting() {
         &w,
         &config,
         &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)],
-        None,
+        Some(OWNER),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
     assert_eq!(body["status"], "preflight");
     assert!(body["preflight"]["span"]["start_ms"].as_u64().is_some());
 
-    let (_, list) = get_json(&w, "/api/tracer/traces", None).await;
+    let (_, list) = get_json(&w, "/api/tracer/traces", Some(OWNER)).await;
     assert_eq!(list.unwrap()["traces"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
 async fn resubmitting_the_same_config_is_idempotent() {
-    for (name, user) in [("idempotent", None), ("idempotent_user", Some("user-a"))] {
+    for (name, user) in [
+        ("idempotent", Some(OWNER)),
+        ("idempotent_user", Some("user-a")),
+    ] {
         let w = world(name);
         let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
         let files: &[(&str, &Path)] =
@@ -408,7 +428,7 @@ async fn resubmitting_the_same_config_is_idempotent() {
         let (status, body) = post_trace(&w, &config, files, user).await;
         assert_eq!(status, axum::http::StatusCode::CREATED, "{user:?}");
         let id = body["trace_id"].as_str().unwrap().to_string();
-        wait_complete(&w, &id).await;
+        wait_complete(&w, &id, OWNER).await;
         let (status, body2) = post_trace(&w, &config, files, user).await;
         assert_eq!(status, axum::http::StatusCode::OK, "{user:?}");
         assert_eq!(body2["trace_id"], id.as_str());
@@ -437,14 +457,14 @@ async fn a_trace_is_invisible_to_a_caller_who_is_not_its_owner() {
     let (status, body) = post_trace(&w, &config, files, Some("user-a")).await;
     assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
     let id = body["trace_id"].as_str().unwrap().to_string();
-    wait_complete(&w, &id).await;
+    wait_complete(&w, &id, OWNER).await;
     for route in trace_routes(&id) {
         let (status, _) = get_json(&w, &route, Some("user-b")).await;
         assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "user-b {route}");
         let (status, _) = get_json(&w, &route, Some("user-a")).await;
         assert_eq!(status, axum::http::StatusCode::OK, "owner {route}");
         let (status, _) = get_json(&w, &route, None).await;
-        assert_eq!(status, axum::http::StatusCode::OK, "in-network {route}");
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED, "anon {route}");
     }
 }
 
@@ -460,8 +480,8 @@ async fn identical_strategy_uploads_by_two_users_get_separate_traces() {
     let id_a = a["trace_id"].as_str().unwrap().to_string();
     let id_b = b["trace_id"].as_str().unwrap().to_string();
     assert_ne!(id_a, id_b);
-    let rec_a = wait_complete(&w, &id_a).await;
-    let rec_b = wait_complete(&w, &id_b).await;
+    let rec_a = wait_complete(&w, &id_a, "user-a").await;
+    let rec_b = wait_complete(&w, &id_b, "user-b").await;
     assert!(w.dir.join("traces").join(&id_a).is_dir());
     assert!(w.dir.join("traces").join(&id_b).is_dir());
     assert_eq!(rec_a["user_id"], "user-a");
@@ -505,35 +525,41 @@ async fn preflight_only_returns_the_id_the_create_will_use() {
     assert_eq!(status, axum::http::StatusCode::OK, "{pre_a}");
     let (status, pre_b) = post_trace(&w, &preflight, files, Some("user-b")).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{pre_b}");
-    let (status, pre_none) = post_trace(&w, &preflight, files, None).await;
-    assert_eq!(status, axum::http::StatusCode::OK, "{pre_none}");
+    let (status, _) = post_trace(&w, &preflight, files, None).await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
     assert_ne!(pre_a["trace_id"], pre_b["trace_id"]);
-    assert_ne!(pre_a["trace_id"], pre_none["trace_id"]);
     let (status, created) = post_trace(&w, &config, files, Some("user-a")).await;
     assert_eq!(status, axum::http::StatusCode::CREATED, "{created}");
     assert_eq!(created["trace_id"], pre_a["trace_id"]);
 }
 
 #[tokio::test]
-async fn an_owner_less_record_stays_readable_by_any_caller() {
+async fn an_owner_less_record_is_quarantined_from_every_caller() {
     let w = world("ownerless");
     let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
     let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
-    let (status, body) = post_trace(&w, &config, files, None).await;
+    let (status, body) = post_trace(&w, &config, files, Some(OWNER)).await;
     assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
     let id = body["trace_id"].as_str().unwrap().to_string();
-    let record = wait_complete(&w, &id).await;
-    assert!(record["user_id"].is_null());
+    wait_complete(&w, &id, OWNER).await;
+    let record_path = w.dir.join("traces").join(&id).join("trace.json");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+    record.as_object_mut().unwrap().remove("user_id");
+    std::fs::write(&record_path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
     for route in trace_routes(&id) {
-        for user in [Some("user-a"), None] {
-            let (status, _) = get_json(&w, &route, user).await;
-            assert_eq!(status, axum::http::StatusCode::OK, "{user:?} {route}");
-        }
+        let (status, _) = get_json(&w, &route, Some(OWNER)).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "owner {route}");
+        let (status, _) = get_json(&w, &route, None).await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED, "anon {route}");
     }
+    let (status, list) = get_json(&w, "/api/tracer/traces", Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(list.unwrap()["traces"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn the_live_record_ignores_identity() {
+async fn the_live_record_ignores_ownership_but_needs_a_caller() {
     let mut w = world("live_identity");
     let books_binding = w.dir.join("bnd_books");
     let trades_binding = w.dir.join("bnd_trades");
@@ -551,10 +577,13 @@ async fn the_live_record_ignores_identity() {
         Some(trades_binding),
         Some(books_binding),
         Some("xyz_TSLA".into()),
+        traces::DEFAULT_MAX_TRACES_PER_USER,
     )
     .unwrap();
     w.state.traces = Some(rt);
-    for user in [Some("user-a"), Some("user-b"), None] {
+    let (status, _) = get_json(&w, "/api/tracer/traces/live", None).await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    for user in [Some("user-a"), Some("user-b")] {
         let (status, body) = get_json(&w, "/api/tracer/traces/live", user).await;
         assert_eq!(status, axum::http::StatusCode::OK, "{user:?}");
         assert_eq!(body.unwrap()["trace_id"], "live");
@@ -566,6 +595,140 @@ async fn the_live_record_ignores_identity() {
             assert_eq!(status, axum::http::StatusCode::OK, "{user:?} {route}");
         }
     }
+}
+
+async fn delete_trace(w: &World, trace_id: &str, user: Option<&str>) -> axum::http::StatusCode {
+    let mut req = axum::http::Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/tracer/traces/{trace_id}"));
+    if let Some(u) = user {
+        req = req.header("x-aetelier-user", u);
+    }
+    let req = req.body(axum::body::Body::empty()).unwrap();
+    app(w).oneshot(req).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn an_owner_deletes_a_trace_and_its_whole_subtree() {
+    let w = world("delete_owner");
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let (status, body) = post_trace(&w, &config, files, Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let id = body["trace_id"].as_str().unwrap().to_string();
+    wait_complete(&w, &id, OWNER).await;
+    let dir = w.dir.join("traces").join(&id);
+    assert!(dir.join("inputs").is_dir());
+    assert!(dir.join("corrected_ledger.json").is_file());
+    assert_eq!(
+        delete_trace(&w, &id, Some(OWNER)).await,
+        axum::http::StatusCode::NO_CONTENT
+    );
+    assert!(!dir.exists());
+    for route in trace_routes(&id) {
+        let (status, _) = get_json(&w, &route, Some(OWNER)).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{route}");
+    }
+    let (_, list) = get_json(&w, "/api/tracer/traces", Some(OWNER)).await;
+    assert!(list.unwrap()["traces"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn delete_is_refused_to_strangers_anonymous_callers_and_bad_ids() {
+    let w = world("delete_refused");
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let (status, body) = post_trace(&w, &config, files, Some("user-a")).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let id = body["trace_id"].as_str().unwrap().to_string();
+    wait_complete(&w, &id, "user-a").await;
+    let dir = w.dir.join("traces").join(&id);
+    assert_eq!(
+        delete_trace(&w, &id, Some("user-b")).await,
+        axum::http::StatusCode::NOT_FOUND
+    );
+    assert!(dir.is_dir());
+    assert_eq!(
+        delete_trace(&w, &id, None).await,
+        axum::http::StatusCode::UNAUTHORIZED
+    );
+    assert!(dir.is_dir());
+    for bad in ["../traces", "staging_1_2", "tr_NOTHEX000000", "live"] {
+        assert_eq!(
+            delete_trace(&w, bad, Some("user-a")).await,
+            axum::http::StatusCode::NOT_FOUND,
+            "{bad}"
+        );
+    }
+    assert!(dir.is_dir());
+    assert_eq!(
+        delete_trace(&w, &id, Some("user-a")).await,
+        axum::http::StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn the_quota_refuses_a_further_upload_from_the_same_owner() {
+    let w = world_with_quota("quota", 1);
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let (status, body) = post_trace(&w, &config, files, Some("user-a")).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let id = body["trace_id"].as_str().unwrap().to_string();
+    wait_complete(&w, &id, "user-a").await;
+    let other = serde_json::json!({
+        "order_source": "strategy", "tape": "upload", "notional_usd": 2_000.0
+    });
+    let (status, body) = post_trace(&w, &other, files, Some("user-a")).await;
+    assert_eq!(status, axum::http::StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["limit"], 1);
+    let (status, _) = post_trace(&w, &other, files, Some("user-b")).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED);
+    assert_eq!(
+        delete_trace(&w, &id, Some("user-a")).await,
+        axum::http::StatusCode::NO_CONTENT
+    );
+    let (status, _) = post_trace(&w, &other, files, Some("user-a")).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn the_service_credential_replaces_header_absence() {
+    let w = world("service_cred");
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let (status, body) = post_trace(&w, &config, files, Some("user-a")).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let id = body["trace_id"].as_str().unwrap().to_string();
+    wait_complete(&w, &id, "user-a").await;
+
+    let route = format!("/api/tracer/traces/{id}");
+    let svc = |token: Option<&str>| {
+        let mut req = axum::http::Request::builder().method("GET").uri(&route);
+        if let Some(t) = token {
+            req = req.header("x-aetelier-service", t);
+        }
+        req.body(axum::body::Body::empty()).unwrap()
+    };
+
+    assert_eq!(
+        app(&w).oneshot(svc(Some("s3cret"))).await.unwrap().status(),
+        axum::http::StatusCode::UNAUTHORIZED
+    );
+    unsafe { std::env::set_var("TRACER_SERVICE_TOKEN", "s3cret") };
+    assert_eq!(
+        app(&w).oneshot(svc(Some("s3cret"))).await.unwrap().status(),
+        axum::http::StatusCode::OK
+    );
+    assert_eq!(
+        app(&w).oneshot(svc(Some("wrong"))).await.unwrap().status(),
+        axum::http::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app(&w).oneshot(svc(None)).await.unwrap().status(),
+        axum::http::StatusCode::UNAUTHORIZED
+    );
+    unsafe { std::env::remove_var("TRACER_SERVICE_TOKEN") };
 }
 
 fn deep_ob_parquet(w: &World, n_levels: usize, ts_list: &[u64]) -> PathBuf {
@@ -634,14 +797,19 @@ async fn depth_route_truncates_levels_windows_and_decimates() {
         &w,
         &config,
         &[("orderbook", &deep_ob), ("trades", &w.trades_parquet)],
-        None,
+        Some(OWNER),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
     let trace_id = body["trace_id"].as_str().unwrap().to_string();
-    wait_complete(&w, &trace_id).await;
+    wait_complete(&w, &trace_id, OWNER).await;
 
-    let (status, depth) = get_json(&w, &format!("/api/tracer/traces/{trace_id}/depth"), None).await;
+    let (status, depth) = get_json(
+        &w,
+        &format!("/api/tracer/traces/{trace_id}/depth"),
+        Some(OWNER),
+    )
+    .await;
     assert_eq!(status, axum::http::StatusCode::OK);
     let depth = depth.unwrap();
     assert_eq!(depth["schema"], "tracer.tracedepth.v1");
@@ -662,7 +830,7 @@ async fn depth_route_truncates_levels_windows_and_decimates() {
             "/api/tracer/traces/{trace_id}/depth?from={}&to={}",
             ts_list[1], ts_list[3]
         ),
-        None,
+        Some(OWNER),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
@@ -675,7 +843,7 @@ async fn depth_route_truncates_levels_windows_and_decimates() {
     let (status, capped) = get_json(
         &w,
         &format!("/api/tracer/traces/{trace_id}/depth?max=2"),
-        None,
+        Some(OWNER),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
@@ -685,10 +853,10 @@ async fn depth_route_truncates_levels_windows_and_decimates() {
     assert_eq!(crows[0]["ts_ms"].as_u64().unwrap(), ts_list[0]);
     assert_eq!(crows.last().unwrap()["ts_ms"].as_u64().unwrap(), ts_list[4]);
 
-    let (status, _) = get_json(&w, "/api/tracer/traces/tr_missing0000/depth", None).await;
+    let (status, _) = get_json(&w, "/api/tracer/traces/tr_missing0000/depth", Some(OWNER)).await;
     assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
 
-    let (status, _) = get_json(&w, "/api/tracer/traces/live/depth", None).await;
+    let (status, _) = get_json(&w, "/api/tracer/traces/live/depth", Some(OWNER)).await;
     assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
 }
 
@@ -717,6 +885,7 @@ async fn a_live_tape_trace_serves_its_schema_from_the_binding_dirs() {
         Some(trades_binding),
         Some(books_binding),
         Some("xyz_TSLA".into()),
+        traces::DEFAULT_MAX_TRACES_PER_USER,
     )
     .unwrap();
 
@@ -751,7 +920,7 @@ async fn a_live_tape_trace_serves_its_schema_from_the_binding_dirs() {
         let (status, schema) = get_json(
             &w,
             &format!("/api/tracer/traces/tr_livetape0001/schema?source={source}"),
-            None,
+            Some(OWNER),
         )
         .await;
         assert_eq!(
