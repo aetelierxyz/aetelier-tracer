@@ -437,6 +437,57 @@ async fn resubmitting_the_same_config_is_idempotent() {
     }
 }
 
+#[tokio::test]
+async fn a_failed_trace_is_requeued_when_its_config_is_submitted_again() {
+    let w = world("requeue_failed");
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let (status, body) = post_trace(&w, &config, files, Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let id = body["trace_id"].as_str().unwrap().to_string();
+    wait_complete(&w, &id, OWNER).await;
+
+    let record_path = w.dir.join("traces").join(&id).join("trace.json");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+    record["status"] = serde_json::json!("failed");
+    record["error"] = serde_json::json!("engine died mid-run");
+    std::fs::write(&record_path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+
+    let (status, body) = post_trace(&w, &config, files, Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    assert_eq!(body["trace_id"], id.as_str());
+    let done = wait_complete(&w, &id, OWNER).await;
+    assert!(done["error"].is_null(), "{done}");
+}
+
+#[tokio::test]
+async fn a_deleted_trace_runs_again_when_its_config_is_submitted_again() {
+    let w = world("recreate_deleted");
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let (status, body) = post_trace(&w, &config, files, Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let id = body["trace_id"].as_str().unwrap().to_string();
+    wait_complete(&w, &id, OWNER).await;
+    assert_eq!(
+        delete_trace(&w, &id, Some(OWNER)).await,
+        axum::http::StatusCode::NO_CONTENT
+    );
+
+    let (status, body) = post_trace(&w, &config, files, Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    assert_eq!(body["trace_id"], id.as_str());
+    wait_complete(&w, &id, OWNER).await;
+    assert!(
+        w.dir
+            .join("traces")
+            .join(&id)
+            .join("corrected_ledger.json")
+            .is_file()
+    );
+}
+
 fn trace_routes(id: &str) -> Vec<String> {
     vec![
         format!("/api/tracer/traces/{id}"),

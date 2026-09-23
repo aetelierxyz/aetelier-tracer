@@ -178,6 +178,10 @@ impl TraceRuntime {
         self.deleted.lock().unwrap().contains(trace_id)
     }
 
+    fn clear_tombstone(&self, trace_id: &str) {
+        self.deleted.lock().unwrap().remove(trace_id);
+    }
+
     fn drop_cached(&self, trace_id: &str) {
         let mut cache = self.cache.lock().unwrap();
         if cache.as_ref().is_some_and(|(id, _)| id == trace_id) {
@@ -705,7 +709,9 @@ pub async fn create_trace(
         ));
     }
 
-    if let Some(existing) = rt.read_record(&trace_id) {
+    if let Some(existing) = rt.read_record(&trace_id)
+        && existing.status != "failed"
+    {
         return Ok((
             StatusCode::OK,
             Json(serde_json::json!({
@@ -754,6 +760,7 @@ pub async fn create_trace(
         summary: None,
         effective: None,
     };
+    rt.clear_tombstone(&trace_id);
     rt.write_record(&record)
         .map_err(|e| bad_request(format!("record: {e:#}")))?;
     rt.tx
