@@ -350,7 +350,7 @@ pub fn load_books_files(paths: &[&Path]) -> anyhow::Result<(Vec<BookTick>, Vec<T
         let mut kept = 0usize;
         for ob in &books {
             stems.insert(stem_of_symbol(&ob.pair.to_canonical()));
-            let ts_ms = ob.orderbook_ts_us / 1_000;
+            let ts_ms = ob.effective_ts_us() / 1_000;
             min_ts = min_ts.min(ts_ms);
             max_ts = max_ts.max(ts_ms);
             kept += 1;
@@ -1074,7 +1074,7 @@ pub fn load_depth_rows(
             anyhow::bail!("{}: not an orderbook snapshot parquet", path.display());
         };
         for ob in books {
-            let ts_ms = ob.orderbook_ts_us / 1_000;
+            let ts_ms = ob.effective_ts_us() / 1_000;
             if ts_ms < lo || ts_ms > hi {
                 continue;
             }
