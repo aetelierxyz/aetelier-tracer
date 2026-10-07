@@ -91,7 +91,7 @@ impl BookTailer {
                 continue;
             };
             for ob in books {
-                let ts_ms = ob.orderbook_ts_us / 1_000;
+                let ts_ms = ob.effective_ts_us() / 1_000;
                 let level_vec = |m: &BTreeMap<
                     rust_decimal::Decimal,
                     aetelier_types::levels::Level,

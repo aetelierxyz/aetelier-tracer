@@ -769,3 +769,27 @@ fn full_strategy_trace_reproduces_14433_paper_trades() {
     assert_eq!(prepared.trades.len(), 14_433);
     assert_eq!(prepared.trades, golden);
 }
+
+#[test]
+fn books_tape_reads_event_time_not_grid_ticks() {
+    let dir = temp_dir("event_book_time");
+    let pair = TradingPair::from_str("xyz:TSLA/USDC").unwrap();
+    let venue_ts_us = 1_791_321_096_929_000;
+    let snaps: Vec<Orderbook> = [
+        1_791_321_097_000_000u64,
+        1_791_321_097_100_000,
+        1_791_321_097_200_000,
+    ]
+    .iter()
+    .map(|grid_ts_us| Orderbook {
+        orderbook_ts_us: *grid_ts_us,
+        ..ob_snapshot(venue_ts_us, &pair, 100.0, 100.1)
+    })
+    .collect();
+    let path = write_ob_parquet(&snaps, &dir, "sync").unwrap();
+
+    let (ticks, _) = tracer_engine::trace::load_books_files(&[path.as_path()]).unwrap();
+
+    let stamps: Vec<u64> = ticks.iter().map(|t| t.ts_ms).collect();
+    assert_eq!(stamps, vec![venue_ts_us / 1_000]);
+}
