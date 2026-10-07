@@ -52,9 +52,8 @@ jobs:
             libsasl2-dev \
             libzstd-dev
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      - name: install rust toolchain
+        run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: aetelier-tracer
@@ -76,7 +75,7 @@ jobs:
         run: cargo test --locked --workspace
 
   msrv:
-    name: MSRV (1.88.0)
+    name: MSRV (1.99.0)
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -107,7 +106,8 @@ jobs:
             libsasl2-dev \
             libzstd-dev
 
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: install rust toolchain
+        run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: aetelier-tracer
@@ -139,7 +139,8 @@ jobs:
           path: aetelier-proto
           token: ${{ secrets.INTER_AETELIER_READ_PAT }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: install rust toolchain
+        run: rustup toolchain install --no-self-update
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny

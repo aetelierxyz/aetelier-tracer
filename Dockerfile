@@ -1,4 +1,4 @@
-FROM rust:1.88-slim AS build
+FROM rust:1.99-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config git libssl-dev build-essential cmake protobuf-compiler libprotobuf-dev zlib1g-dev libcurl4-openssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY . .
