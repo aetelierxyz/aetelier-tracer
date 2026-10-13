@@ -8,6 +8,9 @@ use tower::ServiceExt;
 #[path = "../src/api.rs"]
 #[allow(dead_code)]
 mod api;
+#[path = "../src/tape_cache.rs"]
+#[allow(dead_code)]
+mod tape_cache;
 #[path = "../src/traces.rs"]
 #[allow(dead_code)]
 mod traces;
@@ -1057,4 +1060,313 @@ async fn a_live_tape_trace_serves_its_schema_from_the_binding_dirs() {
         );
         assert_eq!(schema.unwrap()["fields"][0]["name"], first_field);
     }
+}
+
+fn live_world(name: &str, day_dir: bool) -> (World, PathBuf, PathBuf) {
+    let mut w = world(name);
+    let books_binding = w.dir.join("bnd_books");
+    let trades_binding = w.dir.join("bnd_trades");
+    let mut books_dir = books_binding.join("hyperliquid/perpetual/orderbooks");
+    let mut trades_dir = trades_binding.join("hyperliquid/perpetual/trades");
+    if day_dir {
+        books_dir = books_dir.join("2026-10-13");
+        trades_dir = trades_dir.join("2026-10-13");
+    }
+    std::fs::create_dir_all(&books_dir).unwrap();
+    std::fs::create_dir_all(&trades_dir).unwrap();
+    std::fs::copy(&w.ob_parquet, books_dir.join("ob_sync_1.parquet")).unwrap();
+    std::fs::copy(&w.trades_parquet, trades_dir.join("trades_sync_1.parquet")).unwrap();
+    let rt = traces::TraceRuntime::start(
+        w.dir.join("traces_live"),
+        repo_root().join("params/tracer_params.v1.json"),
+        300_000,
+        60_000,
+        Some(trades_binding),
+        Some(books_binding),
+        Some("xyz_TSLA".into()),
+        traces::DEFAULT_MAX_TRACES_PER_USER,
+        traces::DEFAULT_TAPE_RETENTION_MS,
+    )
+    .unwrap();
+    w.state.traces = Some(rt);
+    (w, trades_dir, books_dir)
+}
+
+fn write_live_signals_record(w: &World, trace_id: &str, evicted: bool) {
+    let trace_dir = w.dir.join("traces_live").join(trace_id);
+    std::fs::create_dir_all(&trace_dir).unwrap();
+    let inputs: Vec<serde_json::Value> = if evicted {
+        Vec::new()
+    } else {
+        vec![serde_json::json!({"role": "signals", "file": "signals__x.csv"})]
+    };
+    std::fs::write(
+        trace_dir.join("trace.json"),
+        serde_json::json!({
+            "schema": "tracer.trace.v1",
+            "trace_id": trace_id,
+            "created_ms": 1,
+            "user_id": OWNER,
+            "status": "complete",
+            "tape_evicted": evicted,
+            "order_source": "signals",
+            "tape_source": "live",
+            "inputs": inputs,
+            "grace_ms": 300000,
+            "cross_window_ms": 60000,
+            "preflight": null
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+async fn upload_deep_trace(w: &World, name: &str, ts_list: &[u64]) -> String {
+    let deep_ob = {
+        let pair = TradingPair::from_str("xyz:TSLA/USDC").unwrap();
+        let mut bids = std::collections::BTreeMap::new();
+        let mut asks = std::collections::BTreeMap::new();
+        bids.insert(
+            f64_to_decimal(390.0),
+            aetelier_types::levels::Level::new(
+                0,
+                aetelier_types::OrderSide::Bids,
+                f64_to_decimal(390.0),
+                f64_to_decimal(1.0),
+                vec![],
+            ),
+        );
+        asks.insert(
+            f64_to_decimal(390.1),
+            aetelier_types::levels::Level::new(
+                0,
+                aetelier_types::OrderSide::Asks,
+                f64_to_decimal(390.1),
+                f64_to_decimal(2.0),
+                vec![],
+            ),
+        );
+        let snaps: Vec<Orderbook> = ts_list
+            .iter()
+            .map(|t| Orderbook {
+                orderbook_id: 0,
+                orderbook_ts_us: t * 1_000,
+                source_orderbook_ts_us: t * 1_000,
+                local_orderbook_ts_us: t * 1_000,
+                source_orderbook_rtt_us: 0,
+                pair: pair.clone(),
+                exchange: "hyperliquid".into(),
+                bids: bids.clone(),
+                asks: asks.clone(),
+            })
+            .collect();
+        let dir = w.dir.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_ob_parquet(&snaps, &dir, "sync").unwrap()
+    };
+    let config = serde_json::json!({
+        "order_source": "strategy",
+        "tape": "upload",
+        "notional_usd": 1000.0 + ts_list.len() as f64,
+        "grace_ms": 300000,
+        "cross_window_ms": 60000,
+    });
+    let (status, body) = post_trace(
+        w,
+        &config,
+        &[("orderbook", &deep_ob), ("trades", &w.trades_parquet)],
+        Some(OWNER),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let trace_id = body["trace_id"].as_str().unwrap().to_string();
+    wait_complete(w, &trace_id, OWNER).await;
+    trace_id
+}
+
+fn inputs_dir(w: &World, trace_id: &str) -> PathBuf {
+    w.dir.join("traces").join(trace_id).join("inputs")
+}
+
+#[tokio::test]
+async fn live_depth_and_schema_find_parquet_under_day_directories() {
+    let (w, _, _) = live_world("live_day_dirs", true);
+
+    let (status, depth) = get_json(&w, "/api/tracer/traces/live/depth", Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let rows = depth.unwrap()["rows"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["ts_ms"].as_u64().unwrap(), w.span.1);
+
+    for (source, first_field) in [
+        ("orderbook", "orderbook_ts_us"),
+        ("trades", "source_trade_ts_us"),
+    ] {
+        let (status, schema) = get_json(
+            &w,
+            &format!("/api/tracer/traces/live/schema?source={source}"),
+            Some(OWNER),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{source}");
+        assert_eq!(schema.unwrap()["fields"][0]["name"], first_field);
+    }
+
+    let (status, prints) =
+        get_json(&w, "/api/tracer/traces/live/prints?limit=5", Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(prints.unwrap()["total"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn an_evicted_live_tape_signals_trace_still_serves_its_tape() {
+    let (w, _, _) = live_world("live_evicted_signals", false);
+    write_live_signals_record(&w, "tr_liveevict001", true);
+
+    for route in ["book", "prints", "depth"] {
+        let (status, body) = get_json(
+            &w,
+            &format!("/api/tracer/traces/tr_liveevict001/{route}"),
+            Some(OWNER),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{route}: {body:?}");
+    }
+    let (_, prints) = get_json(&w, "/api/tracer/traces/tr_liveevict001/prints", Some(OWNER)).await;
+    assert!(prints.unwrap()["total"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn depth_and_prints_are_served_from_the_cache_after_the_first_read() {
+    let w = world("cache_survives_file_loss");
+    let (t_min, t_max) = w.span;
+    let ts_list: Vec<u64> = (0..5).map(|i| t_min + i * (t_max - t_min) / 4).collect();
+    let trace_id = upload_deep_trace(&w, "deep_a", &ts_list).await;
+
+    let (status, first) = get_json(
+        &w,
+        &format!("/api/tracer/traces/{trace_id}/depth"),
+        Some(OWNER),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(first.unwrap()["rows"].as_array().unwrap().len(), 5);
+    std::fs::remove_dir_all(inputs_dir(&w, &trace_id)).unwrap();
+
+    let (status, again) = get_json(
+        &w,
+        &format!(
+            "/api/tracer/traces/{trace_id}/depth?from={}&to={}&max=2",
+            ts_list[1], ts_list[3]
+        ),
+        Some(OWNER),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let rows = again.unwrap()["rows"].as_array().unwrap().clone();
+    assert_eq!(rows.first().unwrap()["ts_ms"].as_u64().unwrap(), ts_list[1]);
+    assert_eq!(rows.last().unwrap()["ts_ms"].as_u64().unwrap(), ts_list[3]);
+    assert!(rows.len() <= 3);
+
+    let (status, prints) = get_json(
+        &w,
+        &format!("/api/tracer/traces/{trace_id}/prints"),
+        Some(OWNER),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(prints.unwrap()["total"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn the_tape_cache_keeps_several_traces_at_once() {
+    let w = world("cache_capacity");
+    let (t_min, t_max) = w.span;
+    let a = upload_deep_trace(&w, "deep_a", &[t_min, t_max]).await;
+    let b = upload_deep_trace(&w, "deep_b", &[t_min, (t_min + t_max) / 2, t_max]).await;
+    assert_ne!(a, b);
+
+    for id in [&a, &b] {
+        let (status, _) =
+            get_json(&w, &format!("/api/tracer/traces/{id}/depth"), Some(OWNER)).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+    }
+    std::fs::remove_dir_all(inputs_dir(&w, &a)).unwrap();
+
+    let (status, depth) = get_json(&w, &format!("/api/tracer/traces/{a}/depth"), Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(depth.unwrap()["rows"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn deleting_a_trace_drops_its_cached_tape() {
+    let w = world("cache_delete");
+    let (t_min, t_max) = w.span;
+    let a = upload_deep_trace(&w, "deep_a", &[t_min, t_max]).await;
+    let (status, _) = get_json(&w, &format!("/api/tracer/traces/{a}/depth"), Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    assert_eq!(
+        delete_trace(&w, &a, Some(OWNER)).await,
+        axum::http::StatusCode::NO_CONTENT
+    );
+
+    let (status, _) = get_json(&w, &format!("/api/tracer/traces/{a}/depth"), Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_list_omits_preflight_files_and_reports_their_count() {
+    let w = world("list_trim");
+    let (t_min, t_max) = w.span;
+    let a = upload_deep_trace(&w, "deep_a", &[t_min, t_max]).await;
+
+    let (status, list) = get_json(&w, "/api/tracer/traces", Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let list = list.unwrap();
+    let listed = list["traces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["trace_id"] == a)
+        .unwrap();
+    assert!(listed["preflight"].get("files").is_none(), "{listed}");
+    assert_eq!(listed["preflight"]["files_n"], 2);
+    assert!(listed["preflight"].get("span").is_some());
+
+    let (_, single) = get_json(&w, &format!("/api/tracer/traces/{a}"), Some(OWNER)).await;
+    let single = single.unwrap();
+    assert_eq!(single["preflight"]["files"].as_array().unwrap().len(), 2);
+    assert!(single["preflight"].get("files_n").is_none());
+}
+
+#[tokio::test]
+async fn live_prints_grow_when_a_new_tape_file_appears() {
+    let (w, trades_dir, _) = live_world("live_incremental", true);
+    let (status, before) = get_json(&w, "/api/tracer/traces/live/prints", Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let before = before.unwrap()["total"].as_u64().unwrap();
+
+    let pair = TradingPair::from_str("xyz:TSLA/USDC").unwrap();
+    let extra: Vec<Trade> = (0..3)
+        .map(|i| Trade {
+            source_trade_ts_us: (w.span.1 + 1_000 + i) * 1_000,
+            local_trade_ts_us: (w.span.1 + 1_000 + i) * 1_000,
+            source_trade_rtt_us: 0,
+            pair: pair.clone(),
+            side: TradeSide::Buy,
+            amount: f64_to_decimal(1.0),
+            price: f64_to_decimal(391.0),
+            exchange: "hyperliquid".into(),
+            id: format!("extra{i:08}"),
+            origin: Default::default(),
+        })
+        .collect();
+    write_trades_parquet(&extra, &trades_dir.join("trades_sync_2.parquet")).unwrap();
+
+    let (status, after) = get_json(&w, "/api/tracer/traces/live/prints?limit=1", Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let after = after.unwrap();
+    assert_eq!(after["total"].as_u64().unwrap(), before + 3);
+    assert_eq!(after["prints"][0]["px"], 391.0);
 }

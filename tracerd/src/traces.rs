@@ -1,5 +1,7 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use axum::extract::{Multipart, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -7,15 +9,17 @@ use axum::response::{IntoResponse, Json};
 use sha2::Digest;
 
 use tracer_engine::market_engine::read_gap_spans;
+use tracer_engine::market_engine::{GapSpan, tape_files_sorted};
 use tracer_engine::params::TracerParams;
 use tracer_engine::trace::{
     BookTick, DEPTH_ROWS_CAP, DEPTH_ROWS_DEFAULT, DepthRow, MAX_SIGNALS_BYTES, OrderSourceSpec,
-    PreflightReport, RowError, SchemaFieldOut, TapeRole, TraceOverrides, TraceRequest,
-    TraceSummary, book_series, decimate_depth, execute, load_books_files, load_depth_rows,
-    load_live_tape_files, load_trades_files, parquet_schema_fields, prepare,
+    PreflightReport, Print, RowError, SchemaFieldOut, TapeRole, TraceOverrides, TraceRequest,
+    TraceSummary, book_series, decimate_depth, depth_window, execute, load_depth_files,
+    load_depth_rows, load_live_tape_files, load_prints_files, parquet_schema_fields, prepare,
 };
 
 use crate::api::{AppState, EventsQuery, paged_events};
+use crate::tape_cache::{LoadError, TapeCache};
 
 pub const TRACE_SCHEMA: &str = "tracer.trace.v1";
 pub const USER_HEADER: &str = "x-aetelier-user";
@@ -26,6 +30,11 @@ pub const LIVE_ID: &str = "live";
 pub const DEFAULT_MAX_TRACES_PER_USER: usize = 50;
 pub const DEFAULT_TAPE_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 pub const DEFAULT_SWEEP_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
+pub const TAPE_CACHE_ENTRIES: usize = 4;
+pub const TAPE_LOAD_WAIT_MS: u64 = 20_000;
+pub const TAPE_RETRY_AFTER_S: &str = "2";
+
+pub type TapeFiles = Vec<(TapeRole, PathBuf)>;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TraceInputFile {
@@ -61,9 +70,19 @@ pub struct TraceRecord {
     pub effective: Option<serde_json::Value>,
 }
 
-struct CachedTape {
-    prints: Vec<(u64, f64, f64, bool)>,
-    books: Vec<BookTick>,
+pub struct CachedTape {
+    pub trades_files: Vec<PathBuf>,
+    pub books_files: Vec<PathBuf>,
+    pub prints: Vec<Print>,
+    pub books: Vec<BookTick>,
+    pub depth: Vec<DepthRow>,
+    seen: Mutex<HashSet<String>>,
+}
+
+impl CachedTape {
+    fn extends(&self, trades_files: &[PathBuf], books_files: &[PathBuf]) -> bool {
+        trades_files.starts_with(&self.trades_files) && books_files.starts_with(&self.books_files)
+    }
 }
 
 pub struct TraceRuntime {
@@ -77,8 +96,8 @@ pub struct TraceRuntime {
     pub max_traces_per_user: usize,
     pub tape_retention_ms: u64,
     tx: mpsc::Sender<String>,
-    cache: Mutex<Option<(String, Arc<CachedTape>)>>,
-    deleted: Mutex<std::collections::HashSet<String>>,
+    tapes: Arc<TapeCache<CachedTape>>,
+    deleted: Mutex<HashSet<String>>,
 }
 
 impl TraceRuntime {
@@ -107,8 +126,8 @@ impl TraceRuntime {
             max_traces_per_user,
             tape_retention_ms,
             tx,
-            cache: Mutex::new(None),
-            deleted: Mutex::new(std::collections::HashSet::new()),
+            tapes: TapeCache::new(TAPE_CACHE_ENTRIES),
+            deleted: Mutex::new(HashSet::new()),
         });
         for record in rt.list_records() {
             if record.status == "queued" || record.status == "running" {
@@ -124,6 +143,12 @@ impl TraceRuntime {
                 }
             }
         });
+        if rt.trades_binding.is_some() {
+            let warm = rt.clone();
+            std::thread::spawn(move || {
+                let _ = warm.tape(&live_pseudo_record(&warm), Duration::ZERO);
+            });
+        }
         let worker = rt.clone();
         std::thread::spawn(move || {
             while let Ok(trace_id) = rx.recv() {
@@ -183,10 +208,7 @@ impl TraceRuntime {
     }
 
     fn drop_cached(&self, trace_id: &str) {
-        let mut cache = self.cache.lock().unwrap();
-        if cache.as_ref().is_some_and(|(id, _)| id == trace_id) {
-            *cache = None;
-        }
+        self.tapes.remove(trace_id);
     }
 
     fn purge_dir(&self, trace_id: &str) {
@@ -261,32 +283,36 @@ impl TraceRuntime {
         out
     }
 
-    fn request_for(&self, record: &TraceRecord) -> anyhow::Result<TraceRequest> {
+    fn tape_request_for(&self, record: &TraceRecord) -> anyhow::Result<(TapeFiles, Vec<GapSpan>)> {
         let inputs_dir = self.trace_dir(&record.trace_id).join("inputs");
-        let (tape_files, gap_spans) = if record.tape_source == "live" {
+        if record.tape_source == "live" {
             let trades_root = self
                 .trades_binding
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("live tape unavailable: no trades binding"))?;
-            (
+            return Ok((
                 load_live_tape_files(trades_root, self.books_binding.as_deref())?,
                 read_gap_spans(trades_root, self.symbol_stem.as_deref())?,
-            )
-        } else {
-            let files = record
-                .inputs
-                .iter()
-                .filter(|f| f.role != "signals")
-                .map(|f| {
-                    let role = match f.role.as_str() {
-                        "orderbook" => TapeRole::Orderbook,
-                        _ => TapeRole::Trades,
-                    };
-                    (role, inputs_dir.join(&f.file))
-                })
-                .collect();
-            (files, Vec::new())
-        };
+            ));
+        }
+        let files = record
+            .inputs
+            .iter()
+            .filter(|f| f.role != "signals")
+            .map(|f| {
+                let role = match f.role.as_str() {
+                    "orderbook" => TapeRole::Orderbook,
+                    _ => TapeRole::Trades,
+                };
+                (role, inputs_dir.join(&f.file))
+            })
+            .collect();
+        Ok((files, Vec::new()))
+    }
+
+    fn request_for(&self, record: &TraceRecord) -> anyhow::Result<TraceRequest> {
+        let inputs_dir = self.trace_dir(&record.trace_id).join("inputs");
+        let (tape_files, gap_spans) = self.tape_request_for(record)?;
         let orders = if record.order_source == "strategy" {
             OrderSourceSpec::Strategy
         } else {
@@ -364,39 +390,38 @@ impl TraceRuntime {
         }
     }
 
-    fn cached_tape(&self, record: &TraceRecord) -> anyhow::Result<Arc<CachedTape>> {
-        {
-            let cache = self.cache.lock().unwrap();
-            if let Some((id, tape)) = cache.as_ref()
-                && id == &record.trace_id
-            {
-                return Ok(tape.clone());
-            }
-        }
-        let req = self.request_for(record)?;
-        let mut trades_paths: Vec<&Path> = Vec::new();
-        let mut books_paths: Vec<&Path> = Vec::new();
-        for (role, path) in &req.tape_files {
-            match role {
-                TapeRole::Trades => trades_paths.push(path),
-                TapeRole::Orderbook => books_paths.push(path),
-            }
-        }
-        let (by_stem, _) = load_trades_files(&trades_paths)?;
-        let mut prints: Vec<(u64, f64, f64, bool)> = by_stem
-            .into_values()
-            .flatten()
-            .map(|r| (r.time_ms, r.px, r.sz, r.is_buy))
+    pub fn tape(
+        self: &Arc<Self>,
+        record: &TraceRecord,
+        budget: Duration,
+    ) -> Result<Arc<CachedTape>, LoadError> {
+        let (files, _) = self
+            .tape_request_for(record)
+            .map_err(|e| LoadError::Failed(format!("{e:#}")))?;
+        let trades_files: Vec<PathBuf> = files
+            .iter()
+            .filter(|(role, _)| *role == TapeRole::Trades)
+            .map(|(_, p)| p.clone())
             .collect();
-        prints.sort_by_key(|p| p.0);
-        let books = if books_paths.is_empty() {
-            Vec::new()
-        } else {
-            load_books_files(&books_paths)?.0
-        };
-        let tape = Arc::new(CachedTape { prints, books });
-        *self.cache.lock().unwrap() = Some((record.trace_id.clone(), tape.clone()));
-        Ok(tape)
+        let books_files: Vec<PathBuf> = files
+            .iter()
+            .filter(|(role, _)| *role == TapeRole::Orderbook)
+            .map(|(_, p)| p.clone())
+            .collect();
+        let key = record.trace_id.clone();
+        let live = record.tape_source == "live";
+        let base = self.tapes.get(&key);
+        if let Some(cached) = &base
+            && cached.trades_files == trades_files
+            && cached.books_files == books_files
+        {
+            return Ok(cached.clone());
+        }
+        self.tapes.remove(&key);
+        let base = base.filter(|cached| live && cached.extends(&trades_files, &books_files));
+        self.tapes.get_or_load(&key, budget, move || {
+            build_tape(base, trades_files, books_files, !live).map_err(|e| format!("{e:#}"))
+        })
     }
 
     fn live_record(&self) -> Option<serde_json::Value> {
@@ -409,6 +434,89 @@ impl TraceRuntime {
             "tape_source": "live",
             "symbol_stem": stem,
         }))
+    }
+}
+
+fn build_tape(
+    base: Option<Arc<CachedTape>>,
+    trades_files: Vec<PathBuf>,
+    books_files: Vec<PathBuf>,
+    with_depth: bool,
+) -> anyhow::Result<CachedTape> {
+    let (mut prints, mut books, mut depth, mut seen, trades_from, books_from) = match &base {
+        Some(cached) => (
+            cached.prints.clone(),
+            cached.books.clone(),
+            cached.depth.clone(),
+            std::mem::take(&mut *cached.seen.lock().unwrap()),
+            cached.trades_files.len(),
+            cached.books_files.len(),
+        ),
+        None => (Vec::new(), Vec::new(), Vec::new(), HashSet::new(), 0, 0),
+    };
+    let new_trades: Vec<&Path> = trades_files[trades_from..]
+        .iter()
+        .map(PathBuf::as_path)
+        .collect();
+    let new_books: Vec<&Path> = books_files[books_from..]
+        .iter()
+        .map(PathBuf::as_path)
+        .collect();
+    if !new_trades.is_empty() {
+        prints.extend(load_prints_files(&new_trades, &mut seen)?);
+        prints.sort_by_key(|p| p.0);
+    }
+    if !new_books.is_empty() {
+        let (ticks, rows) = load_depth_files(&new_books, with_depth)?;
+        books.extend(ticks);
+        books.sort_by_key(|t| t.ts_ms);
+        books.dedup_by_key(|t| t.ts_ms);
+        depth.extend(rows);
+        depth.sort_by_key(|r| r.ts_ms);
+        depth.dedup_by_key(|r| r.ts_ms);
+    }
+    Ok(CachedTape {
+        trades_files,
+        books_files,
+        prints,
+        books,
+        depth,
+        seen: Mutex::new(seen),
+    })
+}
+
+pub enum TapeHttpError {
+    Status(StatusCode),
+    Loading,
+}
+
+impl From<StatusCode> for TapeHttpError {
+    fn from(status: StatusCode) -> Self {
+        Self::Status(status)
+    }
+}
+
+impl IntoResponse for TapeHttpError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Status(status) => status.into_response(),
+            Self::Loading => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::RETRY_AFTER, TAPE_RETRY_AFTER_S)],
+                Json(serde_json::json!({"schema": "tracer.tapeloading.v1", "loading": true})),
+            )
+                .into_response(),
+        }
+    }
+}
+
+fn tape_http_error(error: LoadError) -> TapeHttpError {
+    match error {
+        LoadError::Loading => TapeHttpError::Loading,
+        LoadError::Failed(reason) => {
+            eprintln!("tape load failed: {reason}");
+            TapeHttpError::Status(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }
 
@@ -786,13 +894,24 @@ pub async fn list_traces(
         .list_records()
         .into_iter()
         .filter(|r| is_service(&caller) || r.user_id.as_deref() == Some(caller.as_str()))
-        .map(|r| serde_json::to_value(&r).unwrap_or_default())
+        .map(|r| listed_record(&r))
         .collect();
     Ok(Json(serde_json::json!({
         "schema": "tracer.traces.v1",
         "live": rt.live_record(),
         "traces": traces,
     })))
+}
+
+fn listed_record(record: &TraceRecord) -> serde_json::Value {
+    let mut value = serde_json::to_value(record).unwrap_or_default();
+    if let Some(preflight) = value.get_mut("preflight").and_then(|p| p.as_object_mut())
+        && let Some(files) = preflight.remove("files")
+    {
+        let count = files.as_array().map_or(0, Vec::len);
+        preflight.insert("files_n".to_owned(), serde_json::json!(count));
+    }
+    value
 }
 
 pub async fn get_trace(
@@ -936,12 +1055,12 @@ pub async fn trace_book(
     AxumPath(id): AxumPath<String>,
     Query(q): Query<BookQuery>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, TapeHttpError> {
     let rt = runtime(&s)?;
     let record = owned_record_or_live(&rt, &id, &headers)?;
     let tape = rt
-        .cached_tape(&record)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .tape(&record, Duration::from_millis(TAPE_LOAD_WAIT_MS))
+        .map_err(tape_http_error)?;
     let points = q.points.unwrap_or(1024).min(4096);
     let series = book_series(&tape.books, q.t0, q.t1, points);
     Ok(Json(serde_json::json!({
@@ -963,35 +1082,23 @@ pub async fn trace_depth(
     AxumPath(id): AxumPath<String>,
     Query(q): Query<DepthQuery>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, TapeHttpError> {
     let rt = runtime(&s)?;
     let max_rows = q.max.unwrap_or(DEPTH_ROWS_DEFAULT).clamp(1, DEPTH_ROWS_CAP);
-    let rows: Vec<DepthRow> = if id == "live" {
-        let root = rt.books_binding.as_deref().ok_or(StatusCode::NOT_FOUND)?;
-        let dir = tracer_engine::market_engine::datatype_dir(root, "orderbooks")
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .ok_or(StatusCode::NOT_FOUND)?;
-        let path = latest_parquet_in(&dir).ok_or(StatusCode::NOT_FOUND)?;
+    let rows: Vec<DepthRow> = if id == LIVE_ID {
+        let path = live_role_parquet(&rt, TapeRole::Orderbook)?;
         let rows =
             load_depth_rows(&[&path], None, None).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         rows.last().cloned().into_iter().collect()
     } else {
         let record = read_owned(&rt, &id, &headers)?;
-        let req = rt
-            .request_for(&record)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let paths: Vec<&Path> = req
-            .tape_files
-            .iter()
-            .filter(|(role, _)| *role == TapeRole::Orderbook)
-            .map(|(_, p)| p.as_path())
-            .collect();
-        if paths.is_empty() {
-            return Err(StatusCode::NOT_FOUND);
+        let tape = rt
+            .tape(&record, Duration::from_millis(TAPE_LOAD_WAIT_MS))
+            .map_err(tape_http_error)?;
+        if tape.books_files.is_empty() {
+            return Err(StatusCode::NOT_FOUND.into());
         }
-        let rows =
-            load_depth_rows(&paths, q.from, q.to).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        decimate_depth(rows, max_rows)
+        decimate_depth(depth_window(&tape.depth, q.from, q.to).to_vec(), max_rows)
     };
     Ok(Json(serde_json::json!({
         "schema": "tracer.tracedepth.v1",
@@ -1011,12 +1118,12 @@ pub async fn trace_prints(
     AxumPath(id): AxumPath<String>,
     Query(q): Query<PrintsQuery>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, TapeHttpError> {
     let rt = runtime(&s)?;
     let record = owned_record_or_live(&rt, &id, &headers)?;
     let tape = rt
-        .cached_tape(&record)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .tape(&record, Duration::from_millis(TAPE_LOAD_WAIT_MS))
+        .map_err(tape_http_error)?;
     let limit = q.limit.unwrap_or(100).min(1000);
     let offset = q.cursor.unwrap_or(0);
     let total = tape.prints.len();
@@ -1051,14 +1158,7 @@ pub struct SchemaQuery {
 }
 
 fn latest_parquet_in(dir: &Path) -> Option<PathBuf> {
-    let mut names: Vec<PathBuf> = std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "parquet"))
-        .collect();
-    names.sort();
-    names.pop()
+    tape_files_sorted(dir).pop().map(|(_, path)| path)
 }
 
 /// Newest parquet under the running daemon's binding dir for `role`.

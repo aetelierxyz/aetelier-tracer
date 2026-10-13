@@ -1,4 +1,5 @@
 mod api;
+mod tape_cache;
 mod traces;
 
 use std::path::PathBuf;
