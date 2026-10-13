@@ -18,7 +18,10 @@ use tracer_engine::trace::{
     load_depth_rows, load_live_tape_files, load_prints_files, parquet_schema_fields, prepare,
 };
 
+use tracing::{error, info, warn};
+
 use crate::api::{AppState, EventsQuery, paged_events};
+use crate::metrics::Metrics;
 use crate::tape_cache::{LoadError, TapeCache};
 
 pub const TRACE_SCHEMA: &str = "tracer.trace.v1";
@@ -95,6 +98,7 @@ pub struct TraceRuntime {
     pub symbol_stem: Option<String>,
     pub max_traces_per_user: usize,
     pub tape_retention_ms: u64,
+    pub metrics: Arc<Metrics>,
     tx: mpsc::Sender<String>,
     tapes: Arc<TapeCache<CachedTape>>,
     deleted: Mutex<HashSet<String>>,
@@ -112,6 +116,7 @@ impl TraceRuntime {
         symbol_stem: Option<String>,
         max_traces_per_user: usize,
         tape_retention_ms: u64,
+        metrics: Arc<Metrics>,
     ) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(&dir)?;
         let (tx, rx) = mpsc::channel::<String>();
@@ -125,6 +130,7 @@ impl TraceRuntime {
             symbol_stem,
             max_traces_per_user,
             tape_retention_ms,
+            metrics,
             tx,
             tapes: TapeCache::new(TAPE_CACHE_ENTRIES),
             deleted: Mutex::new(HashSet::new()),
@@ -139,7 +145,8 @@ impl TraceRuntime {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(DEFAULT_SWEEP_INTERVAL_MS));
                 for id in sweeper.sweep_tapes(wall_ms()) {
-                    eprintln!("trace {id}: tape evicted");
+                    info!(trace = %id, "tape evicted");
+                    sweeper.metrics.inc("tracer_tape_evictions_total", &[]);
                 }
             }
         });
@@ -153,7 +160,10 @@ impl TraceRuntime {
         std::thread::spawn(move || {
             while let Ok(trace_id) = rx.recv() {
                 if let Err(e) = worker.run_one(&trace_id) {
-                    eprintln!("trace {trace_id}: {e:#}");
+                    error!(trace = %trace_id, error = %format!("{e:#}"), "trace failed");
+                    worker
+                        .metrics
+                        .inc("tracer_trace_jobs_total", &[("status", "failed")]);
                     let _ = worker.update_record(&trace_id, |r| {
                         r.status = "failed".into();
                         r.terminal_ms = Some(wall_ms());
@@ -351,16 +361,22 @@ impl TraceRuntime {
         let base_params = TracerParams::load(&self.params_path)?;
         let req = self.request_for(&record)?;
         let out_dir = self.trace_dir(trace_id);
+        info!(trace = %trace_id, order_source = %record.order_source, tape_source = %record.tape_source, "trace running");
         match prepare(&req, &base_params)? {
-            Err(report) => self.update_record(trace_id, |r| {
-                r.status = "failed".into();
-                r.terminal_ms = Some(wall_ms());
-                r.error = Some(format!(
-                    "strict validation failed at run time: {} errors",
-                    report.row_errors.len()
-                ));
-                r.preflight = serde_json::to_value(&report).unwrap_or_default();
-            }),
+            Err(report) => {
+                warn!(trace = %trace_id, errors = report.row_errors.len(), "trace rejected at run time");
+                self.metrics
+                    .inc("tracer_trace_jobs_total", &[("status", "failed")]);
+                self.update_record(trace_id, |r| {
+                    r.status = "failed".into();
+                    r.terminal_ms = Some(wall_ms());
+                    r.error = Some(format!(
+                        "strict validation failed at run time: {} errors",
+                        report.row_errors.len()
+                    ));
+                    r.preflight = serde_json::to_value(&report).unwrap_or_default();
+                })
+            }
             Ok(mut prepared) => {
                 prepared.trace_id = trace_id.to_string();
                 let effective = serde_json::json!({
@@ -380,6 +396,9 @@ impl TraceRuntime {
                     self.purge_dir(trace_id);
                     return Ok(());
                 }
+                info!(trace = %trace_id, "trace complete");
+                self.metrics
+                    .inc("tracer_trace_jobs_total", &[("status", "complete")]);
                 self.update_record(trace_id, |r| {
                     r.status = "complete".into();
                     r.terminal_ms = Some(wall_ms());
@@ -419,9 +438,48 @@ impl TraceRuntime {
         }
         self.tapes.remove(&key);
         let base = base.filter(|cached| live && cached.extends(&trades_files, &books_files));
-        self.tapes.get_or_load(&key, budget, move || {
-            build_tape(base, trades_files, books_files, !live).map_err(|e| format!("{e:#}"))
-        })
+        let metrics = self.metrics.clone();
+        let tapes = self.tapes.clone();
+        let log_key = key.clone();
+        let outcome = self.tapes.get_or_load(&key, budget, move || {
+            let incremental = base.is_some();
+            info!(
+                trace = %log_key,
+                trades_files = trades_files.len(),
+                books_files = books_files.len(),
+                incremental,
+                "tape load started"
+            );
+            let started = std::time::Instant::now();
+            let result = build_tape(base, trades_files, books_files, !live);
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            match &result {
+                Ok(tape) => {
+                    info!(
+                        trace = %log_key,
+                        elapsed_ms,
+                        prints = tape.prints.len(),
+                        books = tape.books.len(),
+                        depth_rows = tape.depth.len(),
+                        "tape loaded"
+                    );
+                    metrics.inc("tracer_tape_loads_total", &[("result", "ok")]);
+                }
+                Err(e) => {
+                    error!(trace = %log_key, elapsed_ms, error = %format!("{e:#}"), "tape load failed");
+                    metrics.inc("tracer_tape_loads_total", &[("result", "error")]);
+                }
+            }
+            metrics.add("tracer_tape_load_ms_sum", &[], elapsed_ms);
+            metrics.set("tracer_tape_cache_entries", &[], tapes.len() as f64);
+            result.map_err(|e| format!("{e:#}"))
+        });
+        if matches!(outcome, Err(LoadError::Loading)) {
+            self.metrics.inc("tracer_tape_load_waits_total", &[]);
+        }
+        self.metrics
+            .set("tracer_tape_cache_entries", &[], self.tapes.len() as f64);
+        outcome
     }
 
     fn live_record(&self) -> Option<serde_json::Value> {
@@ -513,10 +571,7 @@ impl IntoResponse for TapeHttpError {
 fn tape_http_error(error: LoadError) -> TapeHttpError {
     match error {
         LoadError::Loading => TapeHttpError::Loading,
-        LoadError::Failed(reason) => {
-            eprintln!("tape load failed: {reason}");
-            TapeHttpError::Status(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+        LoadError::Failed(_) => TapeHttpError::Status(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 

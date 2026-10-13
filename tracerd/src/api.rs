@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use axum::extract::{Query, State};
+use axum::extract::{MatchedPath, Query, Request, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -25,11 +26,34 @@ pub struct LedgerLive {
     pub paper_equity: Vec<(u64, f64)>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Readiness {
+    pub ready: bool,
+    pub reason: String,
+}
+
+impl Readiness {
+    pub fn ready() -> Self {
+        Self {
+            ready: true,
+            reason: String::new(),
+        }
+    }
+
+    pub fn not_ready(reason: impl Into<String>) -> Self {
+        Self {
+            ready: false,
+            reason: reason.into(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub status: Arc<RwLock<serde_json::Value>>,
     pub ledger_live: Arc<RwLock<LedgerLive>>,
-    pub ready: Arc<RwLock<bool>>,
+    pub ready: Arc<RwLock<Readiness>>,
+    pub metrics: Arc<crate::metrics::Metrics>,
     pub ledger_dir: PathBuf,
     pub artifacts_dir: Option<PathBuf>,
     pub trades_binding: Option<PathBuf>,
@@ -91,6 +115,7 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> axum::Router {
     axum::Router::new()
         .route("/health", get(health))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics_text))
         .route("/api/tracer/status", get(status))
         .route("/api/tracer/events", get(events))
         .route("/api/tracer/gaps", get(gaps))
@@ -100,7 +125,48 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> axum::Router {
         .route("/api/tracer/replay/fillrates", get(replay_fillrates))
         .merge(traces)
         .layer(cors)
+        .layer(axum::middleware::from_fn_with_state(
+            state.metrics.clone(),
+            record_http,
+        ))
         .with_state(state)
+}
+
+async fn record_http(
+    State(metrics): State<Arc<crate::metrics::Metrics>>,
+    matched: Option<MatchedPath>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let route = matched
+        .map(|path| path.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched".to_owned());
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    let status = response.status().as_u16().to_string();
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    metrics.inc(
+        "tracer_http_requests_total",
+        &[("route", &route), ("status", &status)],
+    );
+    metrics.add(
+        "tracer_http_request_ms_sum",
+        &[("route", &route)],
+        elapsed_ms,
+    );
+    metrics.inc("tracer_http_request_ms_count", &[("route", &route)]);
+    response
+}
+
+async fn metrics_text(State(s): State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            crate::metrics::CONTENT_TYPE,
+        )],
+        s.metrics.render(),
+    )
 }
 
 fn cors_layer(origins: &[String]) -> tower_http::cors::CorsLayer {
@@ -142,10 +208,14 @@ async fn health() -> &'static str {
 }
 
 async fn readyz(State(s): State<AppState>) -> impl IntoResponse {
-    if *s.ready.read().unwrap() {
-        (StatusCode::OK, "ready")
+    let readiness = s.ready.read().unwrap().clone();
+    if readiness.ready {
+        (StatusCode::OK, "ready".to_owned())
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("not ready: {}", readiness.reason),
+        )
     }
 }
 
