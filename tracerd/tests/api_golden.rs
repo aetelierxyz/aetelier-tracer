@@ -11,6 +11,9 @@ use tracer_engine::ledger::{
 #[path = "../src/api.rs"]
 #[allow(dead_code)]
 mod api;
+#[path = "../src/metrics.rs"]
+#[allow(dead_code)]
+mod metrics;
 #[path = "../src/tape_cache.rs"]
 #[allow(dead_code)]
 mod tape_cache;
@@ -269,7 +272,8 @@ fn state(dir: &Path) -> AppState {
                 (FIXED_NOW_MS - 3_600_000, 1.85),
             ],
         })),
-        ready: Arc::new(RwLock::new(true)),
+        ready: Arc::new(RwLock::new(api::Readiness::ready())),
+        metrics: metrics::Metrics::shared(),
         ledger_dir: dir.to_path_buf(),
         artifacts_dir: None,
         trades_binding: Some(dir.join("binding")),

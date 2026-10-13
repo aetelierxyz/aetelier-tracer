@@ -1,4 +1,5 @@
 mod api;
+mod metrics;
 mod tape_cache;
 mod traces;
 
@@ -6,11 +7,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use clap::{Parser, Subcommand};
+use tracing::{error, info};
 
-use api::{AppState, LedgerLive, origins_from_env, router, wall_now_ms};
+use api::{AppState, LedgerLive, Readiness, origins_from_env, router, wall_now_ms};
+use metrics::Metrics;
 use tracer_engine::corrected::{
     DEFAULT_CROSS_WINDOW_MS, DEFAULT_GRACE_MS, emit_events, evaluate, write_artifacts,
 };
+use tracer_engine::engine::EngineStatus;
 use tracer_engine::engine::{DEFAULT_IDLE_AFTER_MS, LiveConfig, LiveEngine};
 use tracer_engine::ledger::LedgerWriter;
 use tracer_engine::nyse::regime;
@@ -144,7 +148,7 @@ async fn serve_api(state: AppState, port: u16) -> anyhow::Result<()> {
     let origins = origins_from_env();
     let app = router(state, &origins);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
-    println!("tracerd api listening on :{port}");
+    info!(port, "api listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -171,6 +175,7 @@ async fn run_live(
     let params = TracerParams::load(&params_path)?;
     let stem = symbol.replace(':', "_");
     let _ = kafka_brokers;
+    let metrics = Metrics::shared();
     let traces_rt = traces_dir
         .map(|dir| {
             traces::TraceRuntime::start(
@@ -183,6 +188,7 @@ async fn run_live(
                 Some(stem.clone()),
                 max_traces_per_user,
                 tape_retention_ms,
+                metrics.clone(),
             )
         })
         .transpose()?;
@@ -203,8 +209,9 @@ async fn run_live(
     let state = AppState {
         status: Arc::new(RwLock::new(serde_json::json!({"mode": "starting"}))),
         ledger_live: Arc::new(RwLock::new(LedgerLive::default())),
-        ready: Arc::new(RwLock::new(false)),
-        ledger_dir,
+        ready: Arc::new(RwLock::new(Readiness::not_ready("first tick pending"))),
+        metrics: metrics.clone(),
+        ledger_dir: ledger_dir.clone(),
         artifacts_dir,
         trades_binding: Some(trades_binding.clone()),
         books_binding: books_binding.clone(),
@@ -214,12 +221,32 @@ async fn run_live(
     };
     let publish = state.clone();
     std::thread::spawn(move || {
+        let mut consecutive_errors: u64 = 0;
+        let mut ticks: u64 = 0;
         loop {
             let wall = wall_now_ms();
-            if let Err(e) = engine.tick(wall) {
-                eprintln!("tick error: {e:#}");
+            let started = std::time::Instant::now();
+            let outcome = engine.tick(wall);
+            let tick_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            ticks += 1;
+            match &outcome {
+                Ok(()) => consecutive_errors = 0,
+                Err(e) => {
+                    consecutive_errors += 1;
+                    error!(error = %format!("{e:#}"), consecutive = consecutive_errors, "tick failed");
+                }
             }
+            let readiness = readiness_after_tick(outcome.as_ref().err(), consecutive_errors);
+            record_tick(&metrics, &readiness, consecutive_errors, tick_ms);
             let status = engine.status(wall_now_ms());
+            record_engine_status(&metrics, &status);
+            if ticks % LEDGER_SIZE_EVERY_TICKS == 1 {
+                metrics.set(
+                    "tracer_ledger_bytes",
+                    &[],
+                    metrics::dir_bytes(&ledger_dir) as f64,
+                );
+            }
             *publish.status.write().unwrap() =
                 serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
             *publish.ledger_live.write().unwrap() = LedgerLive {
@@ -237,11 +264,98 @@ async fn run_live(
                 paper_fees_usd: status.paper_fees_usd,
                 paper_equity: engine.paper_points.clone(),
             };
-            *publish.ready.write().unwrap() = true;
+            *publish.ready.write().unwrap() = readiness;
             std::thread::sleep(std::time::Duration::from_millis(poll_ms));
         }
     });
     serve_api(state, port).await
+}
+
+const LEDGER_SIZE_EVERY_TICKS: u64 = 15;
+
+fn readiness_after_tick(error: Option<&anyhow::Error>, consecutive_errors: u64) -> Readiness {
+    match error {
+        None => Readiness::ready(),
+        Some(e) => Readiness::not_ready(format!(
+            "tick failed {consecutive_errors} time(s) in a row: {e:#}"
+        )),
+    }
+}
+
+fn record_tick(metrics: &Metrics, readiness: &Readiness, consecutive_errors: u64, tick_ms: u64) {
+    let result = if readiness.ready { "ok" } else { "error" };
+    metrics.inc("tracer_tick_total", &[("result", result)]);
+    metrics.set(
+        "tracer_tick_consecutive_errors",
+        &[],
+        consecutive_errors as f64,
+    );
+    metrics.set("tracer_tick_last_duration_ms", &[], tick_ms as f64);
+    metrics.set_flag("tracer_ready", &[], readiness.ready);
+}
+
+fn record_engine_status(metrics: &Metrics, status: &EngineStatus) {
+    let streams = [
+        ("trades", Some(&status.trades)),
+        ("books", status.books.as_ref()),
+    ];
+    for (name, stream) in streams {
+        let Some(stream) = stream else {
+            continue;
+        };
+        let labels = [("stream", name)];
+        metrics.set(
+            "tracer_stream_watermark_ms",
+            &labels,
+            stream.watermark_ms as f64,
+        );
+        metrics.set(
+            "tracer_stream_advance_age_ms",
+            &labels,
+            stream.advance_age_ms as f64,
+        );
+        metrics.set(
+            "tracer_stream_files_read",
+            &labels,
+            stream.files_read as f64,
+        );
+        metrics.set_flag("tracer_stream_stalled", &labels, stream.stalled);
+    }
+    metrics.set(
+        "tracer_merged_watermark_ms",
+        &[],
+        status.merged_watermark_ms as f64,
+    );
+    metrics.set(
+        "tracer_verdict_trail_ms",
+        &[],
+        status.verdict_trail_ms as f64,
+    );
+    metrics.set("tracer_open_trades", &[], status.open_trades as f64);
+    metrics.set("tracer_events_written", &[], status.events_written as f64);
+    metrics.set(
+        "tracer_corrected_n_kept",
+        &[],
+        status.corrected_n_kept as f64,
+    );
+    metrics.set("tracer_paper_n", &[], status.paper_n as f64);
+    metrics.set_flag("tracer_idle", &[], status.idle);
+    metrics.set_flag("tracer_binding_pending", &[], status.binding_pending);
+    metrics.set_flag("tracer_calendar_expired", &[], status.calendar_expired);
+}
+
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let json = std::env::var("TRACER_LOG_FORMAT").is_ok_and(|value| value == "json");
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
+    if json {
+        builder.json().init();
+    } else {
+        builder.init();
+    }
 }
 
 fn run_replay(
@@ -384,6 +498,7 @@ fn export_golden(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_logging();
     match Cli::parse().command {
         Command::Run {
             symbol,
@@ -432,6 +547,7 @@ async fn main() -> anyhow::Result<()> {
             tape_retention_ms,
             params,
         } => {
+            let metrics = Metrics::shared();
             let traces_rt = traces_dir
                 .map(|dir| {
                     traces::TraceRuntime::start(
@@ -444,9 +560,16 @@ async fn main() -> anyhow::Result<()> {
                         None,
                         max_traces_per_user,
                         tape_retention_ms,
+                        metrics.clone(),
                     )
                 })
                 .transpose()?;
+            metrics.set(
+                "tracer_ledger_bytes",
+                &[],
+                metrics::dir_bytes(&ledger_dir) as f64,
+            );
+            metrics.set_flag("tracer_ready", &[], true);
             let state = AppState {
                 status: Arc::new(RwLock::new(serde_json::json!({
                     "schema": "tracer.status.v1",
@@ -454,7 +577,8 @@ async fn main() -> anyhow::Result<()> {
                     "engine_version": tracer_engine::ENGINE_VERSION,
                 }))),
                 ledger_live: Arc::new(RwLock::new(LedgerLive::default())),
-                ready: Arc::new(RwLock::new(true)),
+                ready: Arc::new(RwLock::new(Readiness::ready())),
+                metrics,
                 ledger_dir,
                 artifacts_dir: artifacts,
                 trades_binding: None,
@@ -516,8 +640,101 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use clap::CommandFactory;
 
+    use super::*;
+    use tracer_engine::engine::StreamStatus;
+
     #[test]
     fn cli_definition_is_consistent() {
         super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn readiness_follows_the_last_tick_outcome() {
+        let failure = anyhow::anyhow!("binding dir vanished");
+
+        assert_eq!(readiness_after_tick(None, 0), Readiness::ready());
+        let not_ready = readiness_after_tick(Some(&failure), 3);
+        assert!(!not_ready.ready);
+        assert_eq!(
+            not_ready.reason,
+            "tick failed 3 time(s) in a row: binding dir vanished"
+        );
+        assert_eq!(readiness_after_tick(None, 0), Readiness::ready());
+    }
+
+    #[test]
+    fn record_tick_counts_results_and_mirrors_readiness() {
+        let metrics = Metrics::shared();
+
+        record_tick(&metrics, &Readiness::ready(), 0, 12);
+        record_tick(&metrics, &Readiness::not_ready("x"), 1, 40);
+        record_tick(&metrics, &Readiness::not_ready("x"), 2, 41);
+
+        assert_eq!(metrics.counter("tracer_tick_total", &[("result", "ok")]), 1);
+        assert_eq!(
+            metrics.counter("tracer_tick_total", &[("result", "error")]),
+            2
+        );
+        assert_eq!(
+            metrics.gauge("tracer_tick_consecutive_errors", &[]),
+            Some(2.0)
+        );
+        assert_eq!(
+            metrics.gauge("tracer_tick_last_duration_ms", &[]),
+            Some(41.0)
+        );
+        assert_eq!(metrics.gauge("tracer_ready", &[]), Some(0.0));
+    }
+
+    #[test]
+    fn record_engine_status_exports_each_stream_and_the_engine_flags() {
+        let metrics = Metrics::shared();
+        let status = EngineStatus {
+            trades: StreamStatus {
+                watermark_ms: 1_000,
+                files_read: 7,
+                advance_age_ms: 2_500,
+                stalled: true,
+                ..StreamStatus::default()
+            },
+            books: None,
+            merged_watermark_ms: 900,
+            verdict_trail_ms: 100,
+            open_trades: 2,
+            events_written: 55,
+            idle: false,
+            binding_pending: true,
+            ..EngineStatus::default()
+        };
+
+        record_engine_status(&metrics, &status);
+
+        let trades = [("stream", "trades")];
+        assert_eq!(
+            metrics.gauge("tracer_stream_watermark_ms", &trades),
+            Some(1_000.0)
+        );
+        assert_eq!(
+            metrics.gauge("tracer_stream_files_read", &trades),
+            Some(7.0)
+        );
+        assert_eq!(
+            metrics.gauge("tracer_stream_advance_age_ms", &trades),
+            Some(2_500.0)
+        );
+        assert_eq!(metrics.gauge("tracer_stream_stalled", &trades), Some(1.0));
+        assert_eq!(
+            metrics.gauge("tracer_stream_stalled", &[("stream", "books")]),
+            None
+        );
+        assert_eq!(
+            metrics.gauge("tracer_merged_watermark_ms", &[]),
+            Some(900.0)
+        );
+        assert_eq!(metrics.gauge("tracer_verdict_trail_ms", &[]), Some(100.0));
+        assert_eq!(metrics.gauge("tracer_open_trades", &[]), Some(2.0));
+        assert_eq!(metrics.gauge("tracer_events_written", &[]), Some(55.0));
+        assert_eq!(metrics.gauge("tracer_idle", &[]), Some(0.0));
+        assert_eq!(metrics.gauge("tracer_binding_pending", &[]), Some(1.0));
     }
 }

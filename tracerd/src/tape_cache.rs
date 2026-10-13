@@ -45,6 +45,10 @@ impl<T: Send + Sync + 'static> TapeCache<T> {
         Some(value)
     }
 
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().entries.len()
+    }
+
     pub fn remove(&self, key: &str) {
         let mut inner = self.inner.lock().unwrap();
         inner.entries.retain(|(k, _)| k != key);

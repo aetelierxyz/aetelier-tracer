@@ -8,6 +8,9 @@ use tower::ServiceExt;
 #[path = "../src/api.rs"]
 #[allow(dead_code)]
 mod api;
+#[path = "../src/metrics.rs"]
+#[allow(dead_code)]
+mod metrics;
 #[path = "../src/tape_cache.rs"]
 #[allow(dead_code)]
 mod tape_cache;
@@ -116,6 +119,7 @@ fn world_with_quota(name: &str, quota: usize) -> World {
     std::fs::create_dir_all(&ob_dir).unwrap();
     let ob_parquet = write_ob_parquet(&snaps, &ob_dir, "sync").unwrap();
 
+    let metrics = metrics::Metrics::shared();
     let rt = traces::TraceRuntime::start(
         dir.join("traces"),
         repo_root().join("params/tracer_params.v1.json"),
@@ -126,6 +130,7 @@ fn world_with_quota(name: &str, quota: usize) -> World {
         None,
         quota,
         traces::DEFAULT_TAPE_RETENTION_MS,
+        metrics.clone(),
     )
     .unwrap();
     let ledger_dir = dir.join("live_ledger");
@@ -133,7 +138,8 @@ fn world_with_quota(name: &str, quota: usize) -> World {
     let state = AppState {
         status: Arc::new(RwLock::new(serde_json::json!({"mode": "serve"}))),
         ledger_live: Arc::new(RwLock::new(LedgerLive::default())),
-        ready: Arc::new(RwLock::new(true)),
+        ready: Arc::new(RwLock::new(api::Readiness::ready())),
+        metrics,
         ledger_dir,
         artifacts_dir: None,
         trades_binding: None,
@@ -634,6 +640,7 @@ async fn the_live_record_ignores_ownership_but_needs_a_caller() {
         Some("xyz_TSLA".into()),
         traces::DEFAULT_MAX_TRACES_PER_USER,
         traces::DEFAULT_TAPE_RETENTION_MS,
+        w.state.metrics.clone(),
     )
     .unwrap();
     w.state.traces = Some(rt);
@@ -1016,6 +1023,7 @@ async fn a_live_tape_trace_serves_its_schema_from_the_binding_dirs() {
         Some("xyz_TSLA".into()),
         traces::DEFAULT_MAX_TRACES_PER_USER,
         traces::DEFAULT_TAPE_RETENTION_MS,
+        w.state.metrics.clone(),
     )
     .unwrap();
 
@@ -1086,6 +1094,7 @@ fn live_world(name: &str, day_dir: bool) -> (World, PathBuf, PathBuf) {
         Some("xyz_TSLA".into()),
         traces::DEFAULT_MAX_TRACES_PER_USER,
         traces::DEFAULT_TAPE_RETENTION_MS,
+        w.state.metrics.clone(),
     )
     .unwrap();
     w.state.traces = Some(rt);
@@ -1369,4 +1378,46 @@ async fn live_prints_grow_when_a_new_tape_file_appears() {
     let after = after.unwrap();
     assert_eq!(after["total"].as_u64().unwrap(), before + 3);
     assert_eq!(after["prints"][0]["px"], 391.0);
+}
+
+async fn get_text(w: &World, uri: &str, user: Option<&str>) -> (axum::http::StatusCode, String) {
+    let mut req = axum::http::Request::builder().method("GET").uri(uri);
+    if let Some(u) = user {
+        req = req.header("x-aetelier-user", u);
+    }
+    let req = req.body(axum::body::Body::empty()).unwrap();
+    let resp = app(w).oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn metrics_count_trace_jobs_tape_loads_and_cache_entries() {
+    let w = world("metrics_traces");
+    let (t_min, t_max) = w.span;
+    let a = upload_deep_trace(&w, "deep_a", &[t_min, t_max]).await;
+    let (status, _) = get_json(&w, &format!("/api/tracer/traces/{a}/book"), Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let (status, _) = get_json(&w, &format!("/api/tracer/traces/{a}/prints"), Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    let (status, body) = get_text(&w, "/metrics", None).await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    for line in [
+        "tracer_trace_jobs_total{status=\"complete\"} 1",
+        "tracer_tape_loads_total{result=\"ok\"} 1",
+        "tracer_tape_cache_entries 1",
+        "tracer_http_requests_total{route=\"/api/tracer/traces/{id}/book\",status=\"200\"} 1",
+    ] {
+        assert!(
+            body.lines().any(|l| l == line),
+            "missing {line:?} in\n{body}"
+        );
+    }
+    assert!(
+        !body.contains("tracer_trace_jobs_total{status=\"failed\"}"),
+        "{body}"
+    );
 }
