@@ -11,6 +11,9 @@ use tracer_engine::ledger::{
 #[path = "../src/api.rs"]
 #[allow(dead_code)]
 mod api;
+#[path = "../src/tape_cache.rs"]
+#[allow(dead_code)]
+mod tape_cache;
 #[path = "../src/traces.rs"]
 #[allow(dead_code)]
 mod traces;

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use rust_decimal::prelude::ToPrimitive;
@@ -1047,6 +1047,106 @@ pub fn load_live_tape_files(
     Ok(out)
 }
 
+pub type Print = (u64, f64, f64, bool);
+
+pub fn load_prints_files(
+    paths: &[&Path],
+    seen: &mut HashSet<String>,
+) -> anyhow::Result<Vec<Print>> {
+    let mut merged: Vec<(u64, String, f64, f64, bool)> = Vec::new();
+    for path in paths {
+        expect_schema(path, TapeRole::Trades)?;
+        let trades =
+            read_trades_parquet(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        for t in trades {
+            if !seen.insert(t.id.clone()) {
+                continue;
+            }
+            let (Some(px), Some(sz)) = (t.price.to_f64(), t.amount.to_f64()) else {
+                continue;
+            };
+            merged.push((
+                t.source_trade_ts_us / 1_000,
+                t.id,
+                px,
+                sz,
+                matches!(t.side, TradeSide::Buy),
+            ));
+        }
+    }
+    merged.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    Ok(merged
+        .into_iter()
+        .map(|(ts_ms, _, px, sz, is_buy)| (ts_ms, px, sz, is_buy))
+        .collect())
+}
+
+pub fn load_depth_files(
+    paths: &[&Path],
+    with_depth: bool,
+) -> anyhow::Result<(Vec<BookTick>, Vec<DepthRow>)> {
+    let mut ticks: Vec<BookTick> = Vec::new();
+    let mut rows: Vec<DepthRow> = Vec::new();
+    for path in paths {
+        expect_schema(path, TapeRole::Orderbook)?;
+        let data = read_ob_parquet(path, OrderbookTarget::Snapshot)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let OrderbookTargetData::Snapshot(books) = data else {
+            anyhow::bail!("{}: not an orderbook snapshot parquet", path.display());
+        };
+        for ob in &books {
+            let ts_ms = ob.effective_ts_us() / 1_000;
+            ticks.push(BookTick {
+                ts_ms,
+                bid_px: ob.bids.last_key_value().and_then(|(px, _)| px.to_f64()),
+                ask_px: ob.asks.first_key_value().and_then(|(px, _)| px.to_f64()),
+            });
+            if with_depth {
+                rows.push(depth_row(ts_ms, ob));
+            }
+        }
+    }
+    ticks.sort_by_key(|t| t.ts_ms);
+    ticks.dedup_by_key(|t| t.ts_ms);
+    rows.sort_by_key(|r| r.ts_ms);
+    rows.dedup_by_key(|r| r.ts_ms);
+    Ok((ticks, rows))
+}
+
+fn depth_row(ts_ms: u64, ob: &aetelier_types::orderbooks::core::Orderbook) -> DepthRow {
+    let bids: Vec<(f64, f64)> = ob
+        .bids
+        .iter()
+        .rev()
+        .take(DEPTH_LEVELS)
+        .filter_map(|(px, level)| Some((px.to_f64()?, level.volume.to_f64()?)))
+        .collect();
+    let asks: Vec<(f64, f64)> = ob
+        .asks
+        .iter()
+        .take(DEPTH_LEVELS)
+        .filter_map(|(px, level)| Some((px.to_f64()?, level.volume.to_f64()?)))
+        .collect();
+    let mid = match (bids.first(), asks.first()) {
+        (Some((b, _)), Some((a, _))) => Some((b + a) / 2.0),
+        _ => None,
+    };
+    DepthRow {
+        ts_ms,
+        bids,
+        asks,
+        mid,
+    }
+}
+
+pub fn depth_window(rows: &[DepthRow], t0: Option<u64>, t1: Option<u64>) -> &[DepthRow] {
+    let lo = t0.unwrap_or(0);
+    let hi = t1.unwrap_or(u64::MAX);
+    let start = rows.partition_point(|r| r.ts_ms < lo);
+    let end = rows.partition_point(|r| r.ts_ms <= hi);
+    &rows[start..end.max(start)]
+}
+
 pub const DEPTH_LEVELS: usize = 10;
 pub const DEPTH_ROWS_DEFAULT: usize = 2_000;
 pub const DEPTH_ROWS_CAP: usize = 20_000;
@@ -1073,34 +1173,12 @@ pub fn load_depth_rows(
         let OrderbookTargetData::Snapshot(books) = data else {
             anyhow::bail!("{}: not an orderbook snapshot parquet", path.display());
         };
-        for ob in books {
+        for ob in &books {
             let ts_ms = ob.effective_ts_us() / 1_000;
             if ts_ms < lo || ts_ms > hi {
                 continue;
             }
-            let bids: Vec<(f64, f64)> = ob
-                .bids
-                .iter()
-                .rev()
-                .take(DEPTH_LEVELS)
-                .filter_map(|(px, level)| Some((px.to_f64()?, level.volume.to_f64()?)))
-                .collect();
-            let asks: Vec<(f64, f64)> = ob
-                .asks
-                .iter()
-                .take(DEPTH_LEVELS)
-                .filter_map(|(px, level)| Some((px.to_f64()?, level.volume.to_f64()?)))
-                .collect();
-            let mid = match (bids.first(), asks.first()) {
-                (Some((b, _)), Some((a, _))) => Some((b + a) / 2.0),
-                _ => None,
-            };
-            rows.push(DepthRow {
-                ts_ms,
-                bids,
-                asks,
-                mid,
-            });
+            rows.push(depth_row(ts_ms, ob));
         }
     }
     rows.sort_by_key(|r| r.ts_ms);
@@ -1186,5 +1264,20 @@ mod depth_tests {
     #[test]
     fn decimate_empty_is_empty() {
         assert!(decimate_depth(Vec::new(), 10).is_empty());
+    }
+
+    #[test]
+    fn depth_window_is_inclusive_on_both_ends_and_empty_outside() {
+        let rows: Vec<DepthRow> = (0..10).map(|i| row(i * 100)).collect();
+
+        let inner = depth_window(&rows, Some(200), Some(400));
+        assert_eq!(inner.len(), 3);
+        assert_eq!(inner[0].ts_ms, 200);
+        assert_eq!(inner[2].ts_ms, 400);
+        assert_eq!(depth_window(&rows, None, None).len(), 10);
+        assert_eq!(depth_window(&rows, Some(250), Some(260)).len(), 0);
+        assert_eq!(depth_window(&rows, Some(5_000), None).len(), 0);
+        assert_eq!(depth_window(&rows, None, Some(0)).len(), 1);
+        assert!(depth_window(&[], Some(1), Some(2)).is_empty());
     }
 }

@@ -10,7 +10,6 @@ publish = false
 
 [workspace.dependencies]
 aetelier-io = { path = "../aetelier-sdk/aetelier-io", features = ["parquet"] }
-aetelier-proto = { path = "../aetelier-proto" }
 aetelier-types = { path = "../aetelier-sdk/aetelier-types" }
 anyhow = "1"
 arrow-schema = "57.2"
