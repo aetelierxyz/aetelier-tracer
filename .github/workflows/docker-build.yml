@@ -2,7 +2,7 @@ name: docker-build
 
 on:
   pull_request:
-    branches: [main, staging]
+    branches: [main]
   push:
     branches: [main]
     tags: ['v*']
@@ -14,38 +14,16 @@ concurrency:
 
 permissions:
   contents: read
-  packages: write
 
 env:
-  IMAGE: ghcr.io/iteralabs/aetelier-tracer
+  IMAGE: ghcr.io/aetelierxyz/aetelier-tracer
 
 jobs:
-  lint:
-    name: docker-naming lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: repo
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: IteraLabs/aetelier-infra
-          path: infra
-          token: ${{ secrets.INTER_AETELIER_READ_PAT }}
-          persist-credentials: false
-      - run: bash infra/scripts/lint-docker-naming.sh repo
-
   build:
     name: build (amd64)
-    runs-on: [self-hosted, linux-amd64]
+    if: github.repository == 'aetelierxyz/aetelier-tracer'
+    runs-on: ubuntu-24.04
     steps:
-      - name: isolate docker config
-        run: |
-          set -euo pipefail
-          echo "DOCKER_CONFIG=$RUNNER_TEMP/.docker" >> "$GITHUB_ENV"
-          mkdir -p "$RUNNER_TEMP/.docker"
-          printf '{}' > "$RUNNER_TEMP/.docker/config.json"
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -56,23 +34,22 @@ jobs:
 
   publish:
     name: publish (amd64 to ghcr)
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    if: github.repository == 'aetelierxyz/aetelier-tracer' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: [build]
-    runs-on: [self-hosted, linux-amd64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - name: isolate docker config
-        run: |
-          set -euo pipefail
-          echo "DOCKER_CONFIG=$RUNNER_TEMP/.docker" >> "$GITHUB_ENV"
-          mkdir -p "$RUNNER_TEMP/.docker"
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: write ghcr auth
+      - name: ghcr login
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          AUTH=$(printf '%s:%s' "${{ github.actor }}" "${{ secrets.GITHUB_TOKEN }}" | base64 | tr -d '\n')
-          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$AUTH" > "$DOCKER_CONFIG/config.json"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
       - name: build + push the commit sha, and the version tag on a tag push
         run: |
           set -euo pipefail
@@ -84,3 +61,6 @@ jobs:
               docker push "$IMAGE:${GITHUB_REF_NAME}-amd64"
               ;;
           esac
+      - name: ghcr logout
+        if: always()
+        run: docker logout ghcr.io

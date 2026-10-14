@@ -1000,14 +1000,10 @@ async fn depth_route_truncates_levels_windows_and_decimates() {
     assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
 }
 
-/// A trace that ran on the LIVE tape uploads no parquet, so its record has no
-/// input to describe. Its schema must come from the daemon's binding dirs
-/// instead of 404ing.
 #[tokio::test]
 async fn a_live_tape_trace_serves_its_schema_from_the_binding_dirs() {
     let mut w = world("live_schema_fallback");
 
-    // Collector layout: <binding>/<exchange>/<market_type>/<datatype>/*.parquet
     let books_binding = w.dir.join("bnd_books");
     let trades_binding = w.dir.join("bnd_trades");
     let books_dir = books_binding.join("hyperliquid/perpetual/orderbooks");
@@ -1031,8 +1027,6 @@ async fn a_live_tape_trace_serves_its_schema_from_the_binding_dirs() {
     )
     .unwrap();
 
-    // A completed live-tape trace: signals input only, no parquet. Written as
-    // the on-disk record so the handler's own read path is exercised.
     let trace_dir = w.dir.join("traces_live").join("tr_livetape0001");
     std::fs::create_dir_all(&trace_dir).unwrap();
     std::fs::write(

@@ -1548,7 +1548,6 @@ fn latest_parquet_in(dir: &Path) -> Option<PathBuf> {
     tape_files_sorted(dir).pop().map(|(_, path)| path)
 }
 
-/// Newest parquet under the running daemon's binding dir for `role`.
 fn live_role_parquet(rt: &TraceRuntime, role: TapeRole) -> Result<PathBuf, StatusCode> {
     let (binding, datatype) = match role {
         TapeRole::Orderbook => (rt.books_binding.as_deref(), "orderbooks"),
@@ -1579,10 +1578,6 @@ pub async fn trace_schema(
         let record = read_owned(&rt, &id, &headers)?;
         match record.inputs.iter().find(|f| f.role == role.label()) {
             Some(file) => rt.dir.join(&id).join("inputs").join(&file.file),
-            // A trace that ran on the LIVE tape uploaded no parquet, so it has
-            // no input to describe: its tape was — and still is — the daemon's
-            // binding dirs. Describe those. Any other trace genuinely lacks
-            // this role and keeps its 404.
             None if record.tape_source == "live" => live_role_parquet(&rt, role)?,
             None => return Err(StatusCode::NOT_FOUND),
         }

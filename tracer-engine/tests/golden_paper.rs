@@ -1,3 +1,5 @@
+mod golden_pin;
+
 use std::path::{Path, PathBuf};
 
 use tracer_engine::nyse::regime;
@@ -103,21 +105,20 @@ fn assert_matches(trades: &[ExecutedTrade], golden: &[GoldenRow]) {
 
 #[test]
 fn replay_reproduces_14433_paper_trades() {
-    let Ok(fills_dir) = std::env::var("TRACER_FILLS_DIR") else {
-        eprintln!("TRACER_FILLS_DIR unset; full golden gate skipped");
+    let Some(inputs) = golden_pin::golden_inputs("full golden gate") else {
         return;
     };
     let params = load_params();
-    let trades = paper_trades(Path::new(&fills_dir), &params).unwrap();
+    let trades = paper_trades(&inputs.fills_dir, &params).unwrap();
     assert_eq!(trades.len(), 14_433);
-    let golden = read_golden(&repo_root().join("fixtures/paper_trades_golden.csv"));
+    let golden = read_golden(&inputs.golden_csv);
     assert_matches(&trades, &golden);
 }
 
 #[test]
-fn corrected_paper_block_matches_performance_md_to_published_precision() {
+fn paper_block_matches_the_published_study_to_its_precision() {
     let Ok(fills_dir) = std::env::var("TRACER_FILLS_DIR") else {
-        eprintln!("TRACER_FILLS_DIR unset; performance.md gate skipped");
+        eprintln!("TRACER_FILLS_DIR unset; published study gate skipped");
         return;
     };
     let params = load_params();
