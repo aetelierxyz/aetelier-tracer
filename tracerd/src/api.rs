@@ -313,7 +313,7 @@ fn encode_cursor(file: &str, line: usize) -> String {
     B64.encode(format!("{file}|{line}"))
 }
 
-fn deduped_events(ledger_dir: &PathBuf) -> Vec<(String, usize, Event)> {
+pub fn deduped_events(ledger_dir: &PathBuf) -> Vec<(String, usize, Event)> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut all: Vec<(String, usize, Event)> = Vec::new();
     for path in ledger_files_sorted(ledger_dir) {
