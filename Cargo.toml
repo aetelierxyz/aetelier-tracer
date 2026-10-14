@@ -9,16 +9,13 @@ rust-version = "1.99.0"
 publish = false
 
 [workspace.dependencies]
-aetelier-io = { path = "../aetelier-sdk/aetelier-io", features = ["parquet"] }
-aetelier-types = { path = "../aetelier-sdk/aetelier-types" }
+aetelier-io = { git = "https://github.com/IteraLabs/aetelier-sdk", rev = "681a344e895f2b7bfa44cbbb032be9c535ba35e7", features = ["parquet"] }
+aetelier-types = { git = "https://github.com/IteraLabs/aetelier-sdk", rev = "681a344e895f2b7bfa44cbbb032be9c535ba35e7" }
 anyhow = "1"
 arrow-schema = "57.2"
 axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
 parquet = "57.2"
-prost = "0.13"
-prost-types = "0.13"
-rdkafka = { version = "0.36", features = ["cmake-build"] }
 sha2 = "0.10"
 chrono = "0.4"
 chrono-tz = "0.10"

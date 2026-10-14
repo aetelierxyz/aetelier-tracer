@@ -274,9 +274,9 @@ fn check_size(path: &Path, role: TapeRole, errors: &mut Vec<RowError>) -> bool {
     }
 }
 
-pub type PrintsByStem = BTreeMap<String, Vec<FillRow>>;
+pub type TradesByStem = BTreeMap<String, Vec<FillRow>>;
 
-pub fn load_trades_files(paths: &[&Path]) -> anyhow::Result<(PrintsByStem, Vec<TapeFileSummary>)> {
+pub fn load_trades_files(paths: &[&Path]) -> anyhow::Result<(TradesByStem, Vec<TapeFileSummary>)> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut merged: Vec<(u64, String, f64, f64, bool, String)> = Vec::new();
     let mut summaries: Vec<TapeFileSummary> = Vec::new();
@@ -385,9 +385,9 @@ fn range_of<T, F: Fn(&T) -> u64>(items: &[T], ts: F) -> Option<(u64, u64)> {
     Some((ts(items.first()?), ts(items.last()?)))
 }
 
-fn last_px_at_or_before(prints: &[FillRow], ts_ms: u64) -> Option<f64> {
-    let idx = prints.partition_point(|r| r.time_ms <= ts_ms);
-    (idx > 0).then(|| prints[idx - 1].px)
+fn last_px_at_or_before(trades: &[FillRow], ts_ms: u64) -> Option<f64> {
+    let idx = trades.partition_point(|r| r.time_ms <= ts_ms);
+    (idx > 0).then(|| trades[idx - 1].px)
 }
 
 pub struct SymbolCoverage {
@@ -395,14 +395,14 @@ pub struct SymbolCoverage {
 }
 
 fn coverage_by_stem(
-    prints_by_stem: &BTreeMap<String, Vec<FillRow>>,
+    trades_by_stem: &BTreeMap<String, Vec<FillRow>>,
     ob_span: Option<(u64, u64)>,
 ) -> BTreeMap<String, SymbolCoverage> {
-    prints_by_stem
+    trades_by_stem
         .iter()
-        .filter_map(|(stem, prints)| {
-            let min_ts = prints.first()?.time_ms;
-            let max_ts = prints.last()?.time_ms;
+        .filter_map(|(stem, trades)| {
+            let min_ts = trades.first()?.time_ms;
+            let max_ts = trades.last()?.time_ms;
             let start = ob_span.map_or(min_ts, |(s, _)| s.max(min_ts));
             let end = ob_span.map_or(max_ts, |(_, e)| e.min(max_ts));
             Some((
@@ -422,7 +422,7 @@ fn coverage_by_stem(
 pub fn parse_signals_strict(
     text: &str,
     coverage: &BTreeMap<String, SymbolCoverage>,
-    prints_by_stem: &BTreeMap<String, Vec<FillRow>>,
+    trades_by_stem: &BTreeMap<String, Vec<FillRow>>,
     bar_last_px: &BTreeMap<(String, u64), f64>,
     hold_ms: u64,
     gap_spans: &[GapSpan],
@@ -622,7 +622,7 @@ pub fn parse_signals_strict(
                 .get(&(symbol.clone(), t0))
                 .copied()
                 .or_else(|| {
-                    prints_by_stem
+                    trades_by_stem
                         .get(&symbol)
                         .and_then(|p| last_px_at_or_before(p, t0))
                 })
@@ -660,7 +660,7 @@ pub fn parse_signals_strict(
 pub fn effective_params(
     base: &TracerParams,
     overrides: Option<&TraceOverrides>,
-    prints_by_stem: &BTreeMap<String, Vec<FillRow>>,
+    trades_by_stem: &BTreeMap<String, Vec<FillRow>>,
     input_sha256: BTreeMap<String, String>,
 ) -> anyhow::Result<TracerParams> {
     let mut p = base.clone();
@@ -674,7 +674,7 @@ pub fn effective_params(
             p.hold_ms = h;
         }
     }
-    for (stem, prints) in prints_by_stem {
+    for (stem, trades) in trades_by_stem {
         match p.symbols.iter_mut().find(|s| &s.stem == stem) {
             Some(sym) => {
                 if let Some(ov) = overrides {
@@ -700,7 +700,7 @@ pub fn effective_params(
                 };
                 p.symbols.push(SymbolParams {
                     stem: stem.clone(),
-                    bar_threshold_usd: auto_threshold(prints, p.tau_secs).0,
+                    bar_threshold_usd: auto_threshold(trades, p.tau_secs).0,
                     maker_fee_leg_bps: maker,
                     taker_fee_leg_bps: taker,
                 });
@@ -737,7 +737,7 @@ pub fn prepare(
 ) -> anyhow::Result<Result<TracePrepared, PreflightReport>> {
     let mut errors: Vec<RowError> = Vec::new();
     let mut files: Vec<TapeFileSummary> = Vec::new();
-    let mut prints_by_stem: BTreeMap<String, Vec<FillRow>> = BTreeMap::new();
+    let mut trades_by_stem: BTreeMap<String, Vec<FillRow>> = BTreeMap::new();
     let mut books: Vec<BookTick> = Vec::new();
     let mut input_sha256: BTreeMap<String, String> = BTreeMap::new();
 
@@ -757,7 +757,7 @@ pub fn prepare(
             for s in &summaries {
                 input_sha256.insert(format!("trades/{}", s.file), s.sha256.clone());
             }
-            prints_by_stem = by_stem;
+            trades_by_stem = by_stem;
             files.extend(summaries);
         }
         Err(e) => errors.push(file_error("trades", format!("{e:#}"))),
@@ -777,7 +777,7 @@ pub fn prepare(
         }
     }
 
-    if prints_by_stem.is_empty() && errors.is_empty() {
+    if trades_by_stem.is_empty() && errors.is_empty() {
         errors.push(RowError {
             row: 0,
             field: "tape".into(),
@@ -785,7 +785,7 @@ pub fn prepare(
         });
     }
     if let Some(ob) = &ob_stem {
-        for stem in prints_by_stem.keys() {
+        for stem in trades_by_stem.keys() {
             if ob != stem {
                 errors.push(RowError {
                     row: 0,
@@ -796,12 +796,12 @@ pub fn prepare(
         }
     }
     let trades_range = {
-        let lo = prints_by_stem
+        let lo = trades_by_stem
             .values()
             .filter_map(|p| p.first())
             .map(|r| r.time_ms)
             .min();
-        let hi = prints_by_stem
+        let hi = trades_by_stem
             .values()
             .filter_map(|p| p.last())
             .map(|r| r.time_ms)
@@ -843,13 +843,13 @@ pub fn prepare(
         return Ok(Err(report));
     }
 
-    let coverage = coverage_by_stem(&prints_by_stem, ob_range);
+    let coverage = coverage_by_stem(&trades_by_stem, ob_range);
 
     let into_data = |map: BTreeMap<String, Vec<FillRow>>| -> Vec<SymbolData> {
         map.into_iter()
-            .map(|(stem, prints)| SymbolData {
+            .map(|(stem, trades)| SymbolData {
                 stem,
-                prints,
+                trades,
                 bars: Vec::new(),
             })
             .collect()
@@ -877,13 +877,13 @@ pub fn prepare(
             let params = effective_params(
                 base_params,
                 req.overrides.as_ref(),
-                &prints_by_stem,
+                &trades_by_stem,
                 input_sha256,
             )?;
             let mut bar_last_px: BTreeMap<(String, u64), f64> = BTreeMap::new();
-            for (stem, prints) in &prints_by_stem {
+            for (stem, trades) in &trades_by_stem {
                 let sym = params.symbol(stem)?;
-                let mut bars = build_bars(prints, sym.bar_threshold_usd);
+                let mut bars = build_bars(trades, sym.bar_threshold_usd);
                 quantize_bars(&mut bars);
                 for t in run_symbol(
                     stem,
@@ -902,7 +902,7 @@ pub fn prepare(
             let (trades, n_rows, mut errs) = parse_signals_strict(
                 &text,
                 &coverage,
-                &prints_by_stem,
+                &trades_by_stem,
                 &bar_last_px,
                 params.hold_ms,
                 &req.gap_spans,
@@ -920,19 +920,19 @@ pub fn prepare(
                 });
                 return Ok(Err(report));
             }
-            (trades, params, into_data(prints_by_stem))
+            (trades, params, into_data(trades_by_stem))
         }
         OrderSourceSpec::Strategy => {
             let params = effective_params(
                 base_params,
                 req.overrides.as_ref(),
-                &prints_by_stem,
+                &trades_by_stem,
                 input_sha256,
             )?;
-            let mut data = into_data(prints_by_stem);
+            let mut data = into_data(trades_by_stem);
             for d in &mut data {
                 let sym = params.symbol(&d.stem)?;
-                let mut bars = build_bars(&d.prints, sym.bar_threshold_usd);
+                let mut bars = build_bars(&d.trades, sym.bar_threshold_usd);
                 quantize_bars(&mut bars);
                 if bars.len() < MIN_BARS_PER_SYMBOL {
                     report.row_errors.push(RowError {
@@ -1047,12 +1047,12 @@ pub fn load_live_tape_files(
     Ok(out)
 }
 
-pub type Print = (u64, f64, f64, bool);
+pub type TradePoint = (u64, f64, f64, bool);
 
-pub fn load_prints_files(
+pub fn load_trade_rows(
     paths: &[&Path],
     seen: &mut HashSet<String>,
-) -> anyhow::Result<Vec<Print>> {
+) -> anyhow::Result<Vec<TradePoint>> {
     let mut merged: Vec<(u64, String, f64, f64, bool)> = Vec::new();
     for path in paths {
         expect_schema(path, TapeRole::Trades)?;

@@ -1,7 +1,7 @@
 {
   "events": [
     {
-      "cross_kind": "opposite_print",
+      "cross_kind": "opposite_trade",
       "cross_px": 329.9,
       "decile": 1,
       "engine_version": "0.1.0",
@@ -188,7 +188,7 @@
       "decile": 1,
       "engine_version": "0.1.0",
       "event_id": "xyz_TSLA|1787594780000|S|2",
-      "evidence_n_prints": 17,
+      "evidence_n_trades": 17,
       "evidence_opp_notional_usd": 12345.67,
       "evidence_opp_vwap": 330.41,
       "gap_flags": [],

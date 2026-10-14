@@ -104,8 +104,12 @@ pub struct Event {
     pub evidence_opp_notional_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_opp_vwap: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub evidence_n_prints: Option<u64>,
+    #[serde(
+        default,
+        alias = "evidence_n_prints",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub evidence_n_trades: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bar_buy_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,7 +230,7 @@ mod tests {
             taker_fee_usd: None,
             evidence_opp_notional_usd: None,
             evidence_opp_vwap: None,
-            evidence_n_prints: None,
+            evidence_n_trades: None,
             bar_buy_usd: None,
             bar_sell_usd: None,
             bar_n: None,

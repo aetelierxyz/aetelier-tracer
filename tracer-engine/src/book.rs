@@ -7,7 +7,7 @@ use aetelier_io::orderbooks::ob_parquet::read_ob_parquet;
 use aetelier_types::orderbooks::{OrderbookTarget, OrderbookTargetData};
 
 use crate::bars::FillRow;
-use crate::market_engine::{Print, StreamTail, datatype_dir};
+use crate::market_engine::{StreamTail, TapeTrade, datatype_dir};
 use crate::verdict::{Fill, MakerSide};
 
 pub const BOOK_STALENESS_CAP_MS: u64 = 5_000;
@@ -177,7 +177,7 @@ fn opposite_at_or_through(maker_side: MakerSide, px: f64, posted: f64, is_buy: b
 }
 
 pub fn scan_queue(
-    prints: &[Print],
+    trades: &[TapeTrade],
     maker_side: MakerSide,
     posted_px: f64,
     t_post_ms: u64,
@@ -185,8 +185,8 @@ pub fn scan_queue(
     depth_ahead_usd: f64,
 ) -> QueueScan {
     let mut scan = QueueScan::default();
-    let start = prints.partition_point(|p| p.ts_ms <= t_post_ms);
-    for p in &prints[start..] {
+    let start = trades.partition_point(|p| p.ts_ms <= t_post_ms);
+    for p in &trades[start..] {
         if p.ts_ms > window_end_ms {
             break;
         }
@@ -209,11 +209,11 @@ pub fn scan_queue(
 pub struct OppositeEvidence {
     pub notional_usd: f64,
     pub vwap: Option<f64>,
-    pub n_prints: u64,
+    pub n_trades: u64,
 }
 
 pub fn opposite_evidence(
-    prints: &[FillRow],
+    trades: &[FillRow],
     maker_side: MakerSide,
     posted_px: f64,
     start_ms: u64,
@@ -222,8 +222,8 @@ pub fn opposite_evidence(
     let mut ev = OppositeEvidence::default();
     let mut sz_sum = 0.0;
     let mut px_x_sz = 0.0;
-    let start = prints.partition_point(|p| p.time_ms <= start_ms);
-    for p in &prints[start..] {
+    let start = trades.partition_point(|p| p.time_ms <= start_ms);
+    for p in &trades[start..] {
         if p.time_ms > end_ms {
             break;
         }
@@ -231,7 +231,7 @@ pub fn opposite_evidence(
             continue;
         }
         ev.notional_usd += p.px * p.sz;
-        ev.n_prints += 1;
+        ev.n_trades += 1;
         sz_sum += p.sz;
         px_x_sz += p.px * p.sz;
     }
@@ -241,8 +241,8 @@ pub fn opposite_evidence(
     ev
 }
 
-pub fn prints_as_fillrows(prints: &[Print]) -> Vec<FillRow> {
-    prints
+pub fn trades_as_fillrows(trades: &[TapeTrade]) -> Vec<FillRow> {
+    trades
         .iter()
         .map(|p| FillRow {
             time_ms: p.ts_ms,
@@ -257,8 +257,8 @@ pub fn prints_as_fillrows(prints: &[Print]) -> Vec<FillRow> {
 mod tests {
     use super::*;
 
-    fn print(ts: u64, px: f64, sz: f64, is_buy: bool) -> Print {
-        Print {
+    fn tape_trade(ts: u64, px: f64, sz: f64, is_buy: bool) -> TapeTrade {
+        TapeTrade {
             ts_ms: ts,
             px,
             sz,
@@ -281,30 +281,30 @@ mod tests {
         let ahead = depth_ahead_usd(&s, MakerSide::Buy, 100.0);
         assert!((ahead - (100.0 * 5.0 + 100.5 * 2.0)).abs() < 1e-9);
 
-        let prints = vec![
-            print(1_000, 100.0, 5.0, false),
-            print(2_000, 100.0, 2.01, false),
-            print(3_000, 99.9, 1.0, false),
+        let trades = vec![
+            tape_trade(1_000, 100.0, 5.0, false),
+            tape_trade(2_000, 100.0, 2.01, false),
+            tape_trade(3_000, 99.9, 1.0, false),
         ];
         let equality_not_cleared =
-            scan_queue(&prints[..2], MakerSide::Buy, 100.0, 0, 10_000, ahead);
+            scan_queue(&trades[..2], MakerSide::Buy, 100.0, 0, 10_000, ahead);
         assert!(equality_not_cleared.cleared.is_none());
         assert!((equality_not_cleared.cum_opp_usd - ahead).abs() < 1e-9);
-        let scan = scan_queue(&prints, MakerSide::Buy, 100.0, 0, 10_000, ahead);
+        let scan = scan_queue(&trades, MakerSide::Buy, 100.0, 0, 10_000, ahead);
         assert_eq!(scan.cleared.unwrap().ts_ms, 3_000);
 
-        let strict = scan_queue(&prints, MakerSide::Buy, 100.0, 0, 10_000, 500.0);
+        let strict = scan_queue(&trades, MakerSide::Buy, 100.0, 0, 10_000, 500.0);
         assert_eq!(strict.cleared.unwrap().ts_ms, 2_000);
     }
 
     #[test]
     fn queue_ignores_same_side_and_outside_prices() {
-        let prints = vec![
-            print(1_000, 100.0, 100.0, true),
-            print(2_000, 100.2, 100.0, false),
-            print(3_000, 99.5, 1.0, false),
+        let trades = vec![
+            tape_trade(1_000, 100.0, 100.0, true),
+            tape_trade(2_000, 100.2, 100.0, false),
+            tape_trade(3_000, 99.5, 1.0, false),
         ];
-        let scan = scan_queue(&prints, MakerSide::Buy, 100.0, 0, 10_000, 50.0);
+        let scan = scan_queue(&trades, MakerSide::Buy, 100.0, 0, 10_000, 50.0);
         assert_eq!(scan.cleared.unwrap().ts_ms, 3_000);
         assert!((scan.cum_opp_usd - 99.5).abs() < 1e-9);
     }

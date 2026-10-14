@@ -23,33 +23,12 @@ jobs:
   gates:
     name: fmt + check + clippy + tests (x86_64-unknown-linux-gnu)
     runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: aetelier-tracer
     steps:
       - uses: actions/checkout@v5
-        with:
-          path: aetelier-tracer
-
-      - uses: actions/checkout@v5
-        with:
-          repository: IteraLabs/aetelier-sdk
-          path: aetelier-sdk
-
-      - name: install build deps (protoc + librdkafka C deps)
-        run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
-            protobuf-compiler \
-            libprotobuf-dev \
-            libcurl4-openssl-dev \
-            libsasl2-dev \
-            libzstd-dev
 
       - name: install rust toolchain
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: aetelier-tracer
 
       - name: cargo fmt (blocking, workspace members only)
         run: |
@@ -70,33 +49,13 @@ jobs:
   msrv:
     name: MSRV (1.99.0)
     runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: aetelier-tracer
     steps:
       - uses: actions/checkout@v5
-        with:
-          path: aetelier-tracer
-
-      - uses: actions/checkout@v5
-        with:
-          repository: IteraLabs/aetelier-sdk
-          path: aetelier-sdk
-
-      - name: install build deps (protoc + librdkafka C deps)
-        run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
-            protobuf-compiler \
-            libprotobuf-dev \
-            libcurl4-openssl-dev \
-            libsasl2-dev \
-            libzstd-dev
 
       - name: install rust toolchain
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: aetelier-tracer
           key: msrv
 
       - name: cargo check on the declared rust-version
@@ -105,18 +64,8 @@ jobs:
   deny:
     name: cargo deny (advisories + bans + licenses + sources)
     runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: aetelier-tracer
     steps:
       - uses: actions/checkout@v5
-        with:
-          path: aetelier-tracer
-
-      - uses: actions/checkout@v5
-        with:
-          repository: IteraLabs/aetelier-sdk
-          path: aetelier-sdk
 
       - name: install rust toolchain
         run: rustup toolchain install --no-self-update

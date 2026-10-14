@@ -2,16 +2,16 @@ use std::path::{Path, PathBuf};
 
 use crate::bars::{Bar, FillRow};
 use crate::book::{
-    BookTailer, DepthAtPost, depth_at_post, opposite_evidence, prints_as_fillrows, scan_queue,
+    BookTailer, DepthAtPost, depth_at_post, opposite_evidence, scan_queue, trades_as_fillrows,
 };
 use crate::deciles::decile_of;
 use crate::ledger::{
     EVENT_SCHEMA, Event, EventKind, LedgerWriter, Leg, Mode, PostState, Verdict, event_id, trade_id,
 };
-use crate::market_engine::{GapSpan, Print, TradeTailer, gap_overlaps, read_gap_spans};
+use crate::market_engine::{GapSpan, TapeTrade, TradeTailer, gap_overlaps, read_gap_spans};
 use crate::nyse::{calendar_expired, regime};
 use crate::params::TracerParams;
-use crate::verdict::{MakerSide, first_opposite_print, scan_maker};
+use crate::verdict::{MakerSide, first_opposite_trade, scan_maker};
 
 pub const WATERMARK_SLACK_MS: u64 = 2_000;
 pub const DEFAULT_IDLE_AFTER_MS: u64 = 30_000;
@@ -61,7 +61,7 @@ struct BarBuilder {
 }
 
 impl BarBuilder {
-    fn push(&mut self, p: &Print) -> Option<Bar> {
+    fn push(&mut self, p: &TapeTrade) -> Option<Bar> {
         let usd = p.px * p.sz;
         let bar = self.cur.get_or_insert(Bar {
             open_ms: p.ts_ms,
@@ -184,10 +184,10 @@ pub struct LiveEngine {
     taker_fee_leg_bps: f64,
     trades_root: PathBuf,
     books_root: Option<PathBuf>,
-    trades: TradeTailer,
-    books: Option<BookTailer>,
+    trades_tail: TradeTailer,
+    books_tail: Option<BookTailer>,
     gaps: Vec<GapSpan>,
-    prints: Vec<Print>,
+    trades: Vec<TapeTrade>,
     bars: BarBuilder,
     signal: SignalState,
     recent_bars: Vec<Bar>,
@@ -221,10 +221,10 @@ impl LiveEngine {
             None => None,
         };
         Ok(Self {
-            trades: TradeTailer::new(trades_binding)?,
-            books,
+            trades_tail: TradeTailer::new(trades_binding)?,
+            books_tail: books,
             gaps: Vec::new(),
-            prints: Vec::new(),
+            trades: Vec::new(),
             bars: BarBuilder {
                 threshold_usd: sym.bar_threshold_usd,
                 cur: None,
@@ -262,9 +262,9 @@ impl LiveEngine {
     }
 
     pub fn merged_watermark_ms(&self) -> u64 {
-        match &self.books {
-            Some(b) => self.trades.tail.watermark_ms.min(b.tail.watermark_ms),
-            None => self.trades.tail.watermark_ms,
+        match &self.books_tail {
+            Some(b) => self.trades_tail.tail.watermark_ms.min(b.tail.watermark_ms),
+            None => self.trades_tail.tail.watermark_ms,
         }
     }
 
@@ -285,10 +285,13 @@ impl LiveEngine {
     }
 
     pub fn status(&self, wall_ms: u64) -> EngineStatus {
-        let trades =
-            self.stream_status(&self.trades.tail, self.trades_last_advance_wall_ms, wall_ms);
+        let trades = self.stream_status(
+            &self.trades_tail.tail,
+            self.trades_last_advance_wall_ms,
+            wall_ms,
+        );
         let books = self
-            .books
+            .books_tail
             .as_ref()
             .map(|b| self.stream_status(&b.tail, self.books_last_advance_wall_ms, wall_ms));
         EngineStatus {
@@ -305,11 +308,11 @@ impl LiveEngine {
             verdict_trail_ms: trades
                 .watermark_ms
                 .saturating_sub(self.merged_watermark_ms()),
-            calendar_expired: self.trades.tail.watermark_ms > 0
-                && calendar_expired(self.trades.tail.watermark_ms),
+            calendar_expired: self.trades_tail.tail.watermark_ms > 0
+                && calendar_expired(self.trades_tail.tail.watermark_ms),
             open_trades: self.open.len(),
             counters: EngineCounters {
-                duplicates_dropped: self.trades.duplicates_dropped,
+                duplicates_dropped: self.trades_tail.duplicates_dropped,
                 ..self.counters
             },
             corrected_n_kept: self.corrected_points.len(),
@@ -321,8 +324,8 @@ impl LiveEngine {
             first_post_ts_ms: self.first_post_ts_ms,
             events_written: self.ledger.events_written,
             ready: self.ready,
-            binding_pending: self.trades.pending()
-                || self.books.as_ref().is_some_and(|b| b.pending()),
+            binding_pending: self.trades_tail.pending()
+                || self.books_tail.as_ref().is_some_and(|b| b.pending()),
             maker_fee_leg_bps: self.maker_fee_leg_bps,
             taker_fee_leg_bps: self.taker_fee_leg_bps,
             notional_usd: self.params.notional_usd,
@@ -387,7 +390,7 @@ impl LiveEngine {
             taker_fee_usd: None,
             evidence_opp_notional_usd: None,
             evidence_opp_vwap: None,
-            evidence_n_prints: None,
+            evidence_n_trades: None,
             bar_buy_usd: None,
             bar_sell_usd: None,
             bar_n: None,
@@ -418,7 +421,7 @@ impl LiveEngine {
         let mut e = self.base_event(t, t.seq, EventKind::Evidence, leg, window_end_ms);
         e.evidence_opp_notional_usd = Some(ev.notional_usd);
         e.evidence_opp_vwap = ev.vwap;
-        e.evidence_n_prints = Some(ev.n_prints);
+        e.evidence_n_trades = Some(ev.n_trades);
         e
     }
 
@@ -427,7 +430,7 @@ impl LiveEngine {
         let maker_side = MakerSide::entry_for_signal_side(side);
         let tid = trade_id(&self.cfg.symbol_stem, bar.close_ms, side);
         let depth = if self.cfg.queue_verdicts {
-            let d = depth_at_post(self.books.as_ref(), maker_side, bar.vwap, bar.close_ms);
+            let d = depth_at_post(self.books_tail.as_ref(), maker_side, bar.vwap, bar.close_ms);
             if d.depth_ahead_usd.is_none() {
                 self.counters.book_degraded += 1;
             }
@@ -484,7 +487,7 @@ impl LiveEngine {
     }
 
     fn finalize_entries(&mut self, wm: u64) -> anyhow::Result<()> {
-        let fillrows = prints_as_fillrows(&self.prints);
+        let fillrows = trades_as_fillrows(&self.trades);
         let mut still_open = Vec::new();
         for mut t in std::mem::take(&mut self.open) {
             let LegPhase::Entry { window_end_ms } = t.phase else {
@@ -538,7 +541,7 @@ impl LiveEngine {
             );
             let queue = match (self.cfg.queue_verdicts, t.depth.depth_ahead_usd) {
                 (true, Some(depth)) => Some(scan_queue(
-                    &self.prints,
+                    &self.trades,
                     maker_side,
                     t.posted_px,
                     t.t_post_ms,
@@ -644,7 +647,7 @@ impl LiveEngine {
     }
 
     fn finalize_exits(&mut self, wm: u64) -> anyhow::Result<()> {
-        let fillrows = prints_as_fillrows(&self.prints);
+        let fillrows = trades_as_fillrows(&self.trades);
         let mut still_open = Vec::new();
         for mut t in std::mem::take(&mut self.open) {
             let LegPhase::Exit {
@@ -683,7 +686,7 @@ impl LiveEngine {
                 self.counters.exit_maker += 1;
                 let fee = self.params.notional_usd * self.maker_fee_leg_bps / 1e4;
                 (Some(posted_px), f.ts_ms, fee, None)
-            } else if let Some(f) = first_opposite_print(
+            } else if let Some(f) = first_opposite_trade(
                 &fillrows,
                 maker_side,
                 grace_end_ms,
@@ -714,7 +717,7 @@ impl LiveEngine {
             if let Some(f) = cross {
                 let mut e = self.base_event(&t, t.seq, EventKind::TakerCross, Leg::Exit, f.ts_ms);
                 e.cross_px = Some(f.px);
-                e.cross_kind = Some("opposite_print".into());
+                e.cross_kind = Some("opposite_trade".into());
                 e.taker_fee_usd = Some(exit_fee);
                 self.ledger.append(&e)?;
                 t.seq += 1;
@@ -744,16 +747,16 @@ impl LiveEngine {
 
     pub fn tick(&mut self, wall_ms: u64) -> anyhow::Result<()> {
         let wm_before = self.merged_watermark_ms();
-        let trades_wm_before = self.trades.tail.watermark_ms;
-        let books_wm_before = self.books.as_ref().map(|b| b.tail.watermark_ms);
-        let new_prints = self.trades.poll()?;
-        if let Some(b) = self.books.as_mut() {
+        let trades_wm_before = self.trades_tail.tail.watermark_ms;
+        let books_wm_before = self.books_tail.as_ref().map(|b| b.tail.watermark_ms);
+        let new_trades = self.trades_tail.poll()?;
+        if let Some(b) = self.books_tail.as_mut() {
             b.poll()?;
         }
-        if self.trades.tail.watermark_ms > trades_wm_before || !self.ready {
+        if self.trades_tail.tail.watermark_ms > trades_wm_before || !self.ready {
             self.trades_last_advance_wall_ms = wall_ms;
         }
-        if let Some(b) = self.books.as_ref()
+        if let Some(b) = self.books_tail.as_ref()
             && (Some(b.tail.watermark_ms) > books_wm_before || !self.ready)
         {
             self.books_last_advance_wall_ms = wall_ms;
@@ -764,7 +767,7 @@ impl LiveEngine {
             gaps.extend(read_gap_spans(root, Some(&stem))?);
         }
         self.gaps = gaps;
-        for p in &new_prints {
+        for p in &new_trades {
             if let Some(bar) = self.bars.push(p) {
                 let score = self.signal.update(&bar, self.params.tau_secs);
                 let d = decile_of(&self.params.decile_thresholds, score);
@@ -776,8 +779,8 @@ impl LiveEngine {
                 self.recent_bars.push(bar);
             }
         }
-        self.prints.extend(new_prints);
-        self.prints
+        self.trades.extend(new_trades);
+        self.trades
             .sort_by(|a, b| (a.ts_ms, &a.id).cmp(&(b.ts_ms, &b.id)));
         let wm = self.merged_watermark_ms();
         if wm > wm_before || !self.ready {
@@ -790,9 +793,9 @@ impl LiveEngine {
             + self.cfg.cross_window_ms
             + 10 * WATERMARK_SLACK_MS;
         let cutoff = wm.saturating_sub(retention_ms);
-        self.prints.retain(|p| p.ts_ms >= cutoff);
-        self.trades.prune_ids(cutoff);
-        if let Some(b) = self.books.as_mut() {
+        self.trades.retain(|p| p.ts_ms >= cutoff);
+        self.trades_tail.prune_ids(cutoff);
+        if let Some(b) = self.books_tail.as_mut() {
             b.prune(cutoff);
         }
         self.recent_bars.retain(|b| b.close_ms >= cutoff);
@@ -1123,7 +1126,7 @@ mod tests {
             &ledger,
         )
         .unwrap();
-        eng.books
+        eng.books_tail
             .as_mut()
             .unwrap()
             .inject_snapshot(crate::book::BookSnapshot {
@@ -1131,7 +1134,7 @@ mod tests {
                 bids: vec![(99.0, 10.0), (100.0, 5.0), (100.5, 2.0)],
                 asks: vec![(101.0, 3.0), (102.0, 7.0)],
             });
-        eng.books.as_mut().unwrap().tail.watermark_ms = 73_000;
+        eng.books_tail.as_mut().unwrap().tail.watermark_ms = 73_000;
         eng.tick(1_000).unwrap();
         assert_eq!(eng.counters.posted, 1);
         assert_eq!(eng.counters.entry_filled_queue_only, 1);
@@ -1173,7 +1176,7 @@ mod tests {
             events.iter().filter(|e| e["kind"] == "EVIDENCE").collect();
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0]["leg"], "entry");
-        assert_eq!(ev[0]["evidence_n_prints"], 1);
+        assert_eq!(ev[0]["evidence_n_trades"], 1);
         assert!((ev[0]["evidence_opp_notional_usd"].as_f64().unwrap() - 99.0).abs() < 1e-9);
         assert!((ev[0]["evidence_opp_vwap"].as_f64().unwrap() - 99.0).abs() < 1e-9);
         std::fs::remove_dir_all(binding.parent().unwrap()).unwrap();
@@ -1196,7 +1199,7 @@ mod tests {
         let ev: Vec<&serde_json::Value> =
             events.iter().filter(|e| e["kind"] == "EVIDENCE").collect();
         assert_eq!(ev.len(), 1);
-        assert_eq!(ev[0]["evidence_n_prints"], 0);
+        assert_eq!(ev[0]["evidence_n_trades"], 0);
         assert!(ev[0].get("evidence_opp_vwap").is_none());
         std::fs::remove_dir_all(binding.parent().unwrap()).unwrap();
     }

@@ -1,0 +1,32 @@
+name: parity
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  full-gates:
+    name: full parity gates over the private study export
+    runs-on: [self-hosted, linux-amd64]
+    container:
+      image: rust:1.99-bookworm
+      volumes:
+        - ${{ vars.TRACER_FILLS_DIR }}:/fills:ro
+    env:
+      TRACER_FILLS_DIR: /fills
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: the export must be mounted
+        run: |
+          set -euo pipefail
+          if [ ! -d /fills ] || [ -z "$(ls -A /fills)" ]; then
+            echo "::error::TRACER_FILLS_DIR repository variable unset or the directory is empty"
+            exit 1
+          fi
+
+      - name: golden and signals parity gates, full study
+        run: cargo test --locked --workspace
