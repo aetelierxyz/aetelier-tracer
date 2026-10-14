@@ -1,0 +1,46 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  binary:
+    name: linux-x86_64 binary + GitHub release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: tag must equal the crate version
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "tracer-engine"))')"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match tracer-engine version ${version}"
+            exit 1
+          fi
+
+      - name: install rust toolchain
+        run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build tracerd
+        run: cargo build --release --locked -p tracerd --bin tracerd
+
+      - name: package the binary and the notes
+        run: |
+          set -euo pipefail
+          asset="tracerd-${GITHUB_REF_NAME}-linux-x86_64"
+          cp target/release/tracerd "$asset"
+          sha256sum "$asset" > "${asset}.sha256"
+          git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > notes.md
+          printf '\nImage: ghcr.io/iteralabs/aetelier-tracer:%s-amd64\n' "${GITHUB_REF_NAME}" >> notes.md
+          echo "ASSET=${asset}" >> "$GITHUB_ENV"
+
+      - name: create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --verify-tag --title "${GITHUB_REF_NAME}" --notes-file notes.md "${ASSET}" "${ASSET}.sha256"

@@ -8,7 +8,7 @@ pub const MIN_BARS_PER_SYMBOL: usize = 200;
 
 pub struct SymbolData {
     pub stem: String,
-    pub prints: Vec<FillRow>,
+    pub trades: Vec<FillRow>,
     pub bars: Vec<Bar>,
 }
 
@@ -21,16 +21,16 @@ pub fn load_symbol_data(
     symbols.sort_by(|a, b| a.stem.cmp(&b.stem));
     for sym in &symbols {
         let path = fills_dir.join(format!("{}.csv", sym.stem));
-        let prints = read_fills_csv(&path)?;
-        anyhow::ensure!(!prints.is_empty(), "{}: no fills", path.display());
-        let mut bars = build_bars(&prints, sym.bar_threshold_usd);
+        let trades = read_fills_csv(&path)?;
+        anyhow::ensure!(!trades.is_empty(), "{}: no fills", path.display());
+        let mut bars = build_bars(&trades, sym.bar_threshold_usd);
         quantize_bars(&mut bars);
         if bars.len() < MIN_BARS_PER_SYMBOL {
             continue;
         }
         out.push(SymbolData {
             stem: sym.stem.clone(),
-            prints,
+            trades,
             bars,
         });
     }

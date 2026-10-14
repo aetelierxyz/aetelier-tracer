@@ -82,7 +82,7 @@ fn event(
         taker_fee_usd: None,
         evidence_opp_notional_usd: None,
         evidence_opp_vwap: None,
-        evidence_n_prints: None,
+        evidence_n_trades: None,
         bar_buy_usd: None,
         bar_sell_usd: None,
         bar_n: None,
@@ -162,7 +162,7 @@ fn build_fixture_ledger(dir: &Path) {
         "RTH",
     );
     e.cross_px = Some(329.9);
-    e.cross_kind = Some("opposite_print".into());
+    e.cross_kind = Some("opposite_trade".into());
     e.taker_fee_usd = Some(0.1044);
     w.append(&e).unwrap();
 
@@ -221,7 +221,7 @@ fn build_fixture_ledger(dir: &Path) {
     );
     e.evidence_opp_notional_usd = Some(12_345.67);
     e.evidence_opp_vwap = Some(330.41);
-    e.evidence_n_prints = Some(17);
+    e.evidence_n_trades = Some(17);
     w.append(&e).unwrap();
 
     w.flush().unwrap();
@@ -280,6 +280,9 @@ fn state(dir: &Path) -> AppState {
         books_binding: None,
         symbol_stem: Some("xyz_TSLA".into()),
         traces: None,
+        params_path: Some(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../params/tracer_params.v1.json"),
+        ),
         now_ms: fixed_now,
     }
 }
@@ -399,7 +402,7 @@ async fn api_responses_match_committed_goldens() {
     assert_eq!(code, 200);
     let rows = ev["events"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["evidence_n_prints"], 17);
+    assert_eq!(rows[0]["evidence_n_trades"], 17);
     assert_eq!(rows[0]["evidence_opp_notional_usd"], 12_345.67);
 
     let tid = rows[0]["trade_id"].as_str().unwrap().to_string();

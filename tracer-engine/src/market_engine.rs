@@ -7,7 +7,7 @@ use aetelier_io::trades::trades_parquet::read_trades_parquet;
 use aetelier_types::trades::TradeSide;
 
 #[derive(Clone, Debug)]
-pub struct Print {
+pub struct TapeTrade {
     pub ts_ms: u64,
     pub px: f64,
     pub sz: f64,
@@ -175,7 +175,7 @@ impl TradeTailer {
         !self.resolved
     }
 
-    pub fn poll(&mut self) -> anyhow::Result<Vec<Print>> {
+    pub fn poll(&mut self) -> anyhow::Result<Vec<TapeTrade>> {
         let mut out = Vec::new();
         if !self.try_resolve()? {
             return Ok(out);
@@ -193,7 +193,7 @@ impl TradeTailer {
                 let (Some(px), Some(sz)) = (t.price.to_f64(), t.amount.to_f64()) else {
                     continue;
                 };
-                out.push(Print {
+                out.push(TapeTrade {
                     ts_ms,
                     px,
                     sz,
@@ -385,8 +385,8 @@ mod tests {
             &dir.join("a.parquet"),
         )
         .unwrap();
-        let prints = tailer.poll().unwrap();
-        assert_eq!(prints.len(), 1);
+        let trades = tailer.poll().unwrap();
+        assert_eq!(trades.len(), 1);
         assert!(!tailer.pending());
         assert_eq!(tailer.tail.watermark_ms, 1_000);
         std::fs::remove_dir_all(&root).unwrap();

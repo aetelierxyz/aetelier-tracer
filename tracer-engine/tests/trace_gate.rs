@@ -416,9 +416,9 @@ fn row_error_permutations_produce_a_complete_report() {
 #[test]
 fn shared_span_is_the_pair_intersection_and_empty_span_rejects() {
     let w = mini_world("span");
-    let prints = read_fills_csv(&w.dir.join("fills").join("xyz_TSLA.csv")).unwrap();
-    let t_min = prints.first().unwrap().time_ms;
-    let t_max = prints.last().unwrap().time_ms;
+    let trades = read_fills_csv(&w.dir.join("fills").join("xyz_TSLA.csv")).unwrap();
+    let t_min = trades.first().unwrap().time_ms;
+    let t_max = trades.last().unwrap().time_ms;
 
     let ob_dir = w.dir.join("ob_overlap");
     std::fs::create_dir_all(&ob_dir).unwrap();
@@ -448,7 +448,7 @@ fn shared_span_is_the_pair_intersection_and_empty_span_rejects() {
                 .unwrap();
             assert_eq!(trades_file.min_ts_ms, t_min);
             assert_eq!(trades_file.max_ts_ms, t_max);
-            assert_eq!(trades_file.events, prints.len());
+            assert_eq!(trades_file.events, trades.len());
         }
         Err(r) => panic!("expected clean prepare, got {:?}", r.row_errors),
     }
@@ -485,13 +485,13 @@ fn tape_symbol_mismatch_and_schema_mismatch_reject() {
     let w = mini_world("schema");
     let ob_dir = w.dir.join("ob_other");
     std::fs::create_dir_all(&ob_dir).unwrap();
-    let prints = read_fills_csv(&w.dir.join("fills").join("xyz_TSLA.csv")).unwrap();
+    let trades = read_fills_csv(&w.dir.join("fills").join("xyz_TSLA.csv")).unwrap();
     let ob_path = write_ob_file(
         &ob_dir,
         "xyz:AAPL",
         &[
-            prints.first().unwrap().time_ms,
-            prints.last().unwrap().time_ms,
+            trades.first().unwrap().time_ms,
+            trades.last().unwrap().time_ms,
         ],
     );
     let req = TraceRequest {

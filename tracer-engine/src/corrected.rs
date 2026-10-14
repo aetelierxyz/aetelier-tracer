@@ -11,7 +11,7 @@ use crate::params::TracerParams;
 use crate::replay::SymbolData;
 use crate::stats::{StatsBlock, block};
 use crate::verdict::{
-    DELTAS_MS, Fill, MARKOUT_WINDOWS_MS, MakerScan, MakerSide, first_opposite_print, markout_bps,
+    DELTAS_MS, Fill, MARKOUT_WINDOWS_MS, MakerScan, MakerSide, first_opposite_trade, markout_bps,
     scan_maker,
 };
 
@@ -44,20 +44,20 @@ pub fn evaluate(
     grace_ms: u64,
     cross_window_ms: u64,
 ) -> anyhow::Result<Vec<TradeVerdicts>> {
-    let prints: BTreeMap<&str, &[crate::bars::FillRow]> = data
+    let tape: BTreeMap<&str, &[crate::bars::FillRow]> = data
         .iter()
-        .map(|d| (d.stem.as_str(), d.prints.as_slice()))
+        .map(|d| (d.stem.as_str(), d.trades.as_slice()))
         .collect();
     let mut out = Vec::with_capacity(trades.len());
     for t in trades {
-        let prints = *prints
+        let rows = *tape
             .get(t.symbol.as_str())
-            .ok_or_else(|| anyhow::anyhow!("{}: no prints loaded", t.symbol))?;
+            .ok_or_else(|| anyhow::anyhow!("{}: no rows loaded", t.symbol))?;
         let entry_side = MakerSide::entry_for_signal_side(t.side);
         let window_end = t.t_entry_ms + params.hold_ms;
         let entry: [MakerScan; 3] = DELTAS_MS.map(|delta| {
             scan_maker(
-                prints,
+                rows,
                 entry_side,
                 t.entry_px,
                 t.t_entry_ms,
@@ -68,7 +68,7 @@ pub fn evaluate(
         });
 
         let entry_evidence =
-            opposite_evidence(prints, entry_side, t.entry_px, t.t_entry_ms, window_end);
+            opposite_evidence(rows, entry_side, t.entry_px, t.t_entry_ms, window_end);
         let mut exit = None;
         let mut exit_outcome = None;
         let mut markout = [None, None];
@@ -79,25 +79,17 @@ pub fn evaluate(
                 ts_ms: entry_fill.ts_ms,
                 px: t.entry_px,
             };
-            markout = MARKOUT_WINDOWS_MS.map(|w| markout_bps(prints, posted_fill, w, t.side));
+            markout = MARKOUT_WINDOWS_MS.map(|w| markout_bps(rows, posted_fill, w, t.side));
             let exit_side = MakerSide::exit_for_signal_side(t.side);
             let grace_end = t.t_exit_ms + grace_ms;
-            let scan = scan_maker(
-                prints,
-                exit_side,
-                t.exit_px,
-                t.t_exit_ms,
-                0,
-                grace_end,
-                None,
-            );
+            let scan = scan_maker(rows, exit_side, t.exit_px, t.t_exit_ms, 0, grace_end, None);
             let outcome = if let Some(f) = scan.through {
                 ExitOutcome::Maker(Fill {
                     ts_ms: f.ts_ms,
                     px: t.exit_px,
                 })
             } else if let Some(f) =
-                first_opposite_print(prints, exit_side, grace_end, grace_end + cross_window_ms)
+                first_opposite_trade(rows, exit_side, grace_end, grace_end + cross_window_ms)
             {
                 ExitOutcome::TakerCross(f)
             } else {
@@ -115,7 +107,7 @@ pub fn evaluate(
                 ExitOutcome::Unpriced => None,
             };
             exit_evidence = Some(opposite_evidence(
-                prints,
+                rows,
                 exit_side,
                 t.exit_px,
                 t.t_exit_ms,
@@ -642,7 +634,7 @@ pub fn emit_events_stamped(
             taker_fee_usd: None,
             evidence_opp_notional_usd: None,
             evidence_opp_vwap: None,
-            evidence_n_prints: None,
+            evidence_n_trades: None,
             bar_buy_usd: None,
             bar_sell_usd: None,
             bar_n: None,
@@ -659,7 +651,7 @@ pub fn emit_events_stamped(
             );
             e.evidence_opp_notional_usd = Some(ev.notional_usd);
             e.evidence_opp_vwap = ev.vwap;
-            e.evidence_n_prints = Some(ev.n_prints);
+            e.evidence_n_trades = Some(ev.n_trades);
             e
         };
 
@@ -805,7 +797,7 @@ pub fn emit_events_stamped(
                     grace_end,
                 );
                 e.cross_px = Some(f.px);
-                e.cross_kind = Some("opposite_print".into());
+                e.cross_kind = Some("opposite_trade".into());
                 e.taker_fee_usd = Some(params.notional_usd * sym.taker_fee_leg_bps / 1e4);
                 writer.append(&e)?;
                 seq += 1;
@@ -831,7 +823,7 @@ mod tests {
     use crate::bars::FillRow;
     use crate::replay::SymbolData;
 
-    fn print(ts: u64, px: f64, is_buy: bool) -> FillRow {
+    fn tape_trade(ts: u64, px: f64, is_buy: bool) -> FillRow {
         FillRow {
             time_ms: ts,
             px,
@@ -864,14 +856,14 @@ mod tests {
                 .join("../params/tracer_params.v1.json"),
         )
         .unwrap();
-        let prints = vec![
-            print(1_060_000, 99.9, false),
-            print(1_100_000, 100.5, true),
-            print(2_000_000, 101.2, true),
-            print(10_050_000, 100.0, false),
-            print(20_100_000, 100.2, true),
-            print(21_210_000, 99.4, false),
-            print(30_050_000, 99.0, false),
+        let rows = vec![
+            tape_trade(1_060_000, 99.9, false),
+            tape_trade(1_100_000, 100.5, true),
+            tape_trade(2_000_000, 101.2, true),
+            tape_trade(10_050_000, 100.0, false),
+            tape_trade(20_100_000, 100.2, true),
+            tape_trade(21_210_000, 99.4, false),
+            tape_trade(30_050_000, 99.0, false),
         ];
         let trades = vec![
             trade(1_000_000, 1, 100.0, 101.0),
@@ -881,7 +873,7 @@ mod tests {
         ];
         let data = vec![SymbolData {
             stem: "xyz_TSLA".into(),
-            prints,
+            trades: rows,
             bars: vec![],
         }];
         (trades, data, params)
@@ -976,7 +968,7 @@ mod tests {
                 let e: serde_json::Value = serde_json::from_str(line).unwrap();
                 if e["kind"] == "EVIDENCE" {
                     assert!(e["evidence_opp_notional_usd"].is_number());
-                    assert!(e["evidence_n_prints"].is_number());
+                    assert!(e["evidence_n_trades"].is_number());
                     *evidence_by_leg
                         .entry((
                             e["trade_id"].as_str().unwrap().to_string(),

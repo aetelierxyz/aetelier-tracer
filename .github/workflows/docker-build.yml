@@ -5,6 +5,7 @@ on:
     branches: [main, staging]
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
 
 concurrency:
@@ -47,24 +48,15 @@ jobs:
           printf '{}' > "$RUNNER_TEMP/.docker/config.json"
       - uses: actions/checkout@v4
         with:
-          path: aetelier-tracer
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: IteraLabs/aetelier-sdk
-          path: aetelier-sdk
           persist-credentials: false
       - name: docker build (native amd64)
         run: |
           set -euo pipefail
-          printf '%s\n' '**/target/' '**/.git/' '**/datasets/' '**/results/' '**/out/' > .dockerignore
-          docker build \
-            -t "$IMAGE:${GITHUB_SHA::12}-amd64" \
-            -f aetelier-tracer/Dockerfile .
+          docker build -t "$IMAGE:${GITHUB_SHA::12}-amd64" .
 
   publish:
     name: publish (amd64 to ghcr)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: [build]
     runs-on: [self-hosted, linux-amd64]
     steps:
@@ -75,23 +67,20 @@ jobs:
           mkdir -p "$RUNNER_TEMP/.docker"
       - uses: actions/checkout@v4
         with:
-          path: aetelier-tracer
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: IteraLabs/aetelier-sdk
-          path: aetelier-sdk
           persist-credentials: false
       - name: write ghcr auth
         run: |
           set -euo pipefail
           AUTH=$(printf '%s:%s' "${{ github.actor }}" "${{ secrets.GITHUB_TOKEN }}" | base64 | tr -d '\n')
           printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$AUTH" > "$DOCKER_CONFIG/config.json"
-      - name: build + push main sha as amd64
+      - name: build + push the commit sha, and the version tag on a tag push
         run: |
           set -euo pipefail
-          printf '%s\n' '**/target/' '**/.git/' '**/datasets/' '**/results/' '**/out/' > .dockerignore
-          docker build \
-            -t "$IMAGE:${GITHUB_SHA::12}-amd64" \
-            -f aetelier-tracer/Dockerfile .
+          docker build -t "$IMAGE:${GITHUB_SHA::12}-amd64" .
           docker push "$IMAGE:${GITHUB_SHA::12}-amd64"
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              docker tag "$IMAGE:${GITHUB_SHA::12}-amd64" "$IMAGE:${GITHUB_REF_NAME}-amd64"
+              docker push "$IMAGE:${GITHUB_REF_NAME}-amd64"
+              ;;
+          esac

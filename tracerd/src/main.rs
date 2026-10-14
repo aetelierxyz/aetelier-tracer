@@ -217,6 +217,7 @@ async fn run_live(
         books_binding: books_binding.clone(),
         symbol_stem: Some(stem),
         traces: traces_rt,
+        params_path: Some(params_path),
         now_ms: wall_now_ms,
     };
     let publish = state.clone();
@@ -585,6 +586,7 @@ async fn main() -> anyhow::Result<()> {
                 books_binding: None,
                 symbol_stem: None,
                 traces: traces_rt,
+                params_path: Some(params),
                 now_ms: wall_now_ms,
             };
             serve_api(state, port).await

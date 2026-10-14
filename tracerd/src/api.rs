@@ -60,6 +60,7 @@ pub struct AppState {
     pub books_binding: Option<PathBuf>,
     pub symbol_stem: Option<String>,
     pub traces: Option<Arc<crate::traces::TraceRuntime>>,
+    pub params_path: Option<PathBuf>,
     pub now_ms: fn() -> u64,
 }
 
@@ -96,20 +97,24 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> axum::Router {
             get(crate::traces::trace_events),
         )
         .route(
-            "/api/tracer/traces/{id}/book",
-            get(crate::traces::trace_book),
+            "/api/tracer/traces/{id}/orderbook",
+            get(crate::traces::trace_orderbook),
         )
         .route(
             "/api/tracer/traces/{id}/depth",
             get(crate::traces::trace_depth),
         )
         .route(
-            "/api/tracer/traces/{id}/prints",
-            get(crate::traces::trace_prints),
+            "/api/tracer/traces/{id}/trades",
+            get(crate::traces::trace_trades),
         )
         .route(
             "/api/tracer/traces/{id}/schema",
             get(crate::traces::trace_schema),
+        )
+        .route(
+            "/api/tracer/traces/{id}/artifacts",
+            get(crate::traces::trace_artifacts),
         )
         .layer(axum::extract::DefaultBodyLimit::max(TRACE_UPLOAD_BODY_CAP));
     axum::Router::new()
@@ -117,6 +122,7 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> axum::Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_text))
         .route("/api/tracer/status", get(status))
+        .route("/api/tracer/params", get(params))
         .route("/api/tracer/events", get(events))
         .route("/api/tracer/gaps", get(gaps))
         .route("/api/tracer/fillrates", get(fillrates))
@@ -221,6 +227,14 @@ async fn readyz(State(s): State<AppState>) -> impl IntoResponse {
 
 async fn status(State(s): State<AppState>) -> Json<serde_json::Value> {
     Json(s.status.read().unwrap().clone())
+}
+
+async fn params(State(s): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let path = s.params_path.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let text = std::fs::read_to_string(path).map_err(|_| StatusCode::NOT_FOUND)?;
+    serde_json::from_str(&text)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn ledger_files_sorted(dir: &PathBuf) -> Vec<PathBuf> {

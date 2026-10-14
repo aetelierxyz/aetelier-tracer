@@ -32,6 +32,7 @@ fn state(name: &str) -> AppState {
         books_binding: None,
         symbol_stem: None,
         traces: None,
+        params_path: None,
         now_ms: wall_now_ms,
     }
 }

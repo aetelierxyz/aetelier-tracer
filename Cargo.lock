@@ -11,6 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "aetelier-io"
 version = "0.1.1"
+source = "git+https://github.com/IteraLabs/aetelier-sdk?rev=681a344e895f2b7bfa44cbbb032be9c535ba35e7#681a344e895f2b7bfa44cbbb032be9c535ba35e7"
 dependencies = [
  "aetelier-types",
  "arrow",
@@ -32,6 +33,7 @@ dependencies = [
 [[package]]
 name = "aetelier-types"
 version = "0.1.1"
+source = "git+https://github.com/IteraLabs/aetelier-sdk?rev=681a344e895f2b7bfa44cbbb032be9c535ba35e7#681a344e895f2b7bfa44cbbb032be9c535ba35e7"
 dependencies = [
  "chrono",
  "rand 0.9.5",

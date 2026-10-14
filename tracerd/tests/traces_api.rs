@@ -146,6 +146,7 @@ fn world_with_quota(name: &str, quota: usize) -> World {
         books_binding: None,
         symbol_stem: None,
         traces: Some(rt),
+        params_path: Some(repo_root().join("params/tracer_params.v1.json")),
         now_ms: wall_now_ms,
     };
     World {
@@ -301,31 +302,31 @@ async fn strategy_upload_trace_lifecycle_and_artifact_routes() {
 
     let (status, book) = get_json(
         &w,
-        &format!("/api/tracer/traces/{trace_id}/book"),
+        &format!("/api/tracer/traces/{trace_id}/orderbook"),
         Some(OWNER),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
     let book = book.unwrap();
-    assert_eq!(book["schema"], "tracer.tracebook.v1");
+    assert_eq!(book["schema"], "tracer.traceorderbook.v1");
     assert_eq!(book["points"].as_array().unwrap().len(), 3);
     assert_eq!(book["points"][0]["bid_px"], 390.0);
 
-    let (status, prints) = get_json(
+    let (status, trades) = get_json(
         &w,
-        &format!("/api/tracer/traces/{trace_id}/prints?limit=5"),
+        &format!("/api/tracer/traces/{trace_id}/trades?limit=5"),
         Some(OWNER),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
-    let prints = prints.unwrap();
-    assert_eq!(prints["prints"].as_array().unwrap().len(), 5);
+    let trades = trades.unwrap();
+    assert_eq!(trades["trades"].as_array().unwrap().len(), 5);
     assert_eq!(
-        prints["prints"][0]["ts_ms"].as_u64().unwrap(),
+        trades["trades"][0]["ts_ms"].as_u64().unwrap(),
         w.span.1,
-        "prints must page newest-first"
+        "trades must page newest-first"
     );
-    assert!(prints["older_cursor"].as_u64().is_some());
+    assert!(trades["older_cursor"].as_u64().is_some());
 
     for source in ["orderbook", "trades"] {
         let (status, schema) = get_json(
@@ -503,9 +504,9 @@ fn trace_routes(id: &str) -> Vec<String> {
         format!("/api/tracer/traces/{id}/ledger"),
         format!("/api/tracer/traces/{id}/fillrates"),
         format!("/api/tracer/traces/{id}/events?limit=1"),
-        format!("/api/tracer/traces/{id}/book"),
+        format!("/api/tracer/traces/{id}/orderbook"),
         format!("/api/tracer/traces/{id}/depth"),
-        format!("/api/tracer/traces/{id}/prints?limit=1"),
+        format!("/api/tracer/traces/{id}/trades?limit=1"),
         format!("/api/tracer/traces/{id}/schema?source=trades"),
     ]
 }
@@ -651,7 +652,7 @@ async fn the_live_record_ignores_ownership_but_needs_a_caller() {
         assert_eq!(status, axum::http::StatusCode::OK, "{user:?}");
         assert_eq!(body.unwrap()["trace_id"], "live");
         for route in [
-            "/api/tracer/traces/live/prints?limit=1",
+            "/api/tracer/traces/live/trades?limit=1",
             "/api/tracer/traces/live/schema?source=trades",
         ] {
             let (status, _) = get_json(&w, route, user).await;
@@ -1221,10 +1222,10 @@ async fn live_depth_and_schema_find_parquet_under_day_directories() {
         assert_eq!(schema.unwrap()["fields"][0]["name"], first_field);
     }
 
-    let (status, prints) =
-        get_json(&w, "/api/tracer/traces/live/prints?limit=5", Some(OWNER)).await;
+    let (status, trades) =
+        get_json(&w, "/api/tracer/traces/live/trades?limit=5", Some(OWNER)).await;
     assert_eq!(status, axum::http::StatusCode::OK);
-    assert!(prints.unwrap()["total"].as_u64().unwrap() > 0);
+    assert!(trades.unwrap()["total"].as_u64().unwrap() > 0);
 }
 
 #[tokio::test]
@@ -1232,7 +1233,7 @@ async fn an_evicted_live_tape_signals_trace_still_serves_its_tape() {
     let (w, _, _) = live_world("live_evicted_signals", false);
     write_live_signals_record(&w, "tr_liveevict001", true);
 
-    for route in ["book", "prints", "depth"] {
+    for route in ["orderbook", "trades", "depth"] {
         let (status, body) = get_json(
             &w,
             &format!("/api/tracer/traces/tr_liveevict001/{route}"),
@@ -1241,12 +1242,12 @@ async fn an_evicted_live_tape_signals_trace_still_serves_its_tape() {
         .await;
         assert_eq!(status, axum::http::StatusCode::OK, "{route}: {body:?}");
     }
-    let (_, prints) = get_json(&w, "/api/tracer/traces/tr_liveevict001/prints", Some(OWNER)).await;
-    assert!(prints.unwrap()["total"].as_u64().unwrap() > 0);
+    let (_, trades) = get_json(&w, "/api/tracer/traces/tr_liveevict001/trades", Some(OWNER)).await;
+    assert!(trades.unwrap()["total"].as_u64().unwrap() > 0);
 }
 
 #[tokio::test]
-async fn depth_and_prints_are_served_from_the_cache_after_the_first_read() {
+async fn depth_and_trades_are_served_from_the_cache_after_the_first_read() {
     let w = world("cache_survives_file_loss");
     let (t_min, t_max) = w.span;
     let ts_list: Vec<u64> = (0..5).map(|i| t_min + i * (t_max - t_min) / 4).collect();
@@ -1277,14 +1278,14 @@ async fn depth_and_prints_are_served_from_the_cache_after_the_first_read() {
     assert_eq!(rows.last().unwrap()["ts_ms"].as_u64().unwrap(), ts_list[3]);
     assert!(rows.len() <= 3);
 
-    let (status, prints) = get_json(
+    let (status, trades) = get_json(
         &w,
-        &format!("/api/tracer/traces/{trace_id}/prints"),
+        &format!("/api/tracer/traces/{trace_id}/trades"),
         Some(OWNER),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
-    assert!(prints.unwrap()["total"].as_u64().unwrap() > 0);
+    assert!(trades.unwrap()["total"].as_u64().unwrap() > 0);
 }
 
 #[tokio::test]
@@ -1350,9 +1351,9 @@ async fn the_list_omits_preflight_files_and_reports_their_count() {
 }
 
 #[tokio::test]
-async fn live_prints_grow_when_a_new_tape_file_appears() {
+async fn live_trades_grow_when_a_new_tape_file_appears() {
     let (w, trades_dir, _) = live_world("live_incremental", true);
-    let (status, before) = get_json(&w, "/api/tracer/traces/live/prints", Some(OWNER)).await;
+    let (status, before) = get_json(&w, "/api/tracer/traces/live/trades", Some(OWNER)).await;
     assert_eq!(status, axum::http::StatusCode::OK);
     let before = before.unwrap()["total"].as_u64().unwrap();
 
@@ -1373,11 +1374,11 @@ async fn live_prints_grow_when_a_new_tape_file_appears() {
         .collect();
     write_trades_parquet(&extra, &trades_dir.join("trades_sync_2.parquet")).unwrap();
 
-    let (status, after) = get_json(&w, "/api/tracer/traces/live/prints?limit=1", Some(OWNER)).await;
+    let (status, after) = get_json(&w, "/api/tracer/traces/live/trades?limit=1", Some(OWNER)).await;
     assert_eq!(status, axum::http::StatusCode::OK);
     let after = after.unwrap();
     assert_eq!(after["total"].as_u64().unwrap(), before + 3);
-    assert_eq!(after["prints"][0]["px"], 391.0);
+    assert_eq!(after["trades"][0]["px"], 391.0);
 }
 
 async fn get_text(w: &World, uri: &str, user: Option<&str>) -> (axum::http::StatusCode, String) {
@@ -1397,9 +1398,14 @@ async fn metrics_count_trace_jobs_tape_loads_and_cache_entries() {
     let w = world("metrics_traces");
     let (t_min, t_max) = w.span;
     let a = upload_deep_trace(&w, "deep_a", &[t_min, t_max]).await;
-    let (status, _) = get_json(&w, &format!("/api/tracer/traces/{a}/book"), Some(OWNER)).await;
+    let (status, _) = get_json(
+        &w,
+        &format!("/api/tracer/traces/{a}/orderbook"),
+        Some(OWNER),
+    )
+    .await;
     assert_eq!(status, axum::http::StatusCode::OK);
-    let (status, _) = get_json(&w, &format!("/api/tracer/traces/{a}/prints"), Some(OWNER)).await;
+    let (status, _) = get_json(&w, &format!("/api/tracer/traces/{a}/trades"), Some(OWNER)).await;
     assert_eq!(status, axum::http::StatusCode::OK);
 
     let (status, body) = get_text(&w, "/metrics", None).await;
@@ -1409,7 +1415,7 @@ async fn metrics_count_trace_jobs_tape_loads_and_cache_entries() {
         "tracer_trace_jobs_total{status=\"complete\"} 1",
         "tracer_tape_loads_total{result=\"ok\"} 1",
         "tracer_tape_cache_entries 1",
-        "tracer_http_requests_total{route=\"/api/tracer/traces/{id}/book\",status=\"200\"} 1",
+        "tracer_http_requests_total{route=\"/api/tracer/traces/{id}/orderbook\",status=\"200\"} 1",
     ] {
         assert!(
             body.lines().any(|l| l == line),
@@ -1420,4 +1426,179 @@ async fn metrics_count_trace_jobs_tape_loads_and_cache_entries() {
         !body.contains("tracer_trace_jobs_total{status=\"failed\"}"),
         "{body}"
     );
+}
+
+#[tokio::test]
+async fn the_list_pages_newest_first_with_an_opaque_cursor() {
+    let w = world("list_paging");
+    let (t_min, t_max) = w.span;
+    let mut ids = Vec::new();
+    for n in 2..5 {
+        let ts: Vec<u64> = (0..n)
+            .map(|i| t_min + i * (t_max - t_min) / (n - 1))
+            .collect();
+        ids.push(upload_deep_trace(&w, &format!("deep_{n}"), &ts).await);
+    }
+    assert_eq!(
+        ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        3
+    );
+
+    let (status, all) = get_json(&w, "/api/tracer/traces", Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let all = all.unwrap();
+    assert_eq!(all["total"], 3);
+    assert_eq!(all["traces"].as_array().unwrap().len(), 3);
+    assert!(all["older_cursor"].is_null());
+    let order: Vec<String> = all["traces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["trace_id"].as_str().unwrap().to_owned())
+        .collect();
+    let created: Vec<u64> = all["traces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["created_ms"].as_u64().unwrap())
+        .collect();
+    assert!(
+        created.windows(2).all(|pair| pair[0] >= pair[1]),
+        "{created:?}"
+    );
+
+    let (status, first) = get_json(&w, "/api/tracer/traces?limit=2", Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let first = first.unwrap();
+    assert_eq!(first["total"], 3);
+    let page1: Vec<&str> = first["traces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["trace_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(page1, [order[0].as_str(), order[1].as_str()]);
+    let cursor = first["older_cursor"].as_str().unwrap().to_owned();
+
+    let (status, second) = get_json(
+        &w,
+        &format!("/api/tracer/traces?limit=2&cursor={cursor}"),
+        Some(OWNER),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let second = second.unwrap();
+    let page2: Vec<&str> = second["traces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["trace_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(page2, [order[2].as_str()]);
+    assert!(second["older_cursor"].is_null());
+
+    let (status, _) = get_json(&w, "/api/tracer/traces?cursor=not-a-cursor", Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    let (status, capped) = get_json(&w, "/api/tracer/traces?limit=0", Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(capped.unwrap()["traces"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn params_route_serves_the_frozen_parameters_file() {
+    let w = world("params_route");
+
+    let (status, params) = get_json(&w, "/api/tracer/params", Some(OWNER)).await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let params = params.unwrap();
+    let file: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("params/tracer_params.v1.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(params, file);
+    assert_eq!(params["params_version"], 1);
+}
+
+#[tokio::test]
+async fn artifacts_list_and_download_byte_exact_files() {
+    let w = world("artifacts");
+    let (t_min, t_max) = w.span;
+    let a = upload_deep_trace(&w, "deep_a", &[t_min, t_max]).await;
+
+    let (status, listing) = get_json(
+        &w,
+        &format!("/api/tracer/traces/{a}/artifacts"),
+        Some(OWNER),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let listing = listing.unwrap();
+    assert_eq!(listing["schema"], "tracer.traceartifacts.v1");
+    assert_eq!(listing["status"], "complete");
+    let names: Vec<String> = listing["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        &names[..3],
+        ["trace.json", "corrected_ledger.json", "fillrates.json"]
+    );
+    assert!(
+        names[3..]
+            .iter()
+            .all(|n| n.starts_with("ledger/events_") && n.ends_with(".jsonl")),
+        "{names:?}"
+    );
+    assert!(names.len() >= 4, "{names:?}");
+
+    for artifact in listing["artifacts"].as_array().unwrap() {
+        let name = artifact["name"].as_str().unwrap();
+        let (status, body) = get_text(
+            &w,
+            &format!("/api/tracer/traces/{a}/artifacts?name={name}"),
+            Some(OWNER),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{name}");
+        let on_disk = std::fs::read(w.dir.join("traces").join(&a).join(name)).unwrap();
+        assert_eq!(body.as_bytes(), on_disk.as_slice(), "{name}");
+        assert_eq!(
+            artifact["bytes"].as_u64().unwrap() as usize,
+            on_disk.len(),
+            "{name}"
+        );
+        assert_eq!(
+            artifact["sha256"],
+            format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&on_disk)),
+            "{name}"
+        );
+    }
+
+    for name in [
+        "../trace.json",
+        "ledger/../trace.json",
+        "inputs/x",
+        "missing.json",
+        "",
+    ] {
+        let (status, _) = get_text(
+            &w,
+            &format!("/api/tracer/traces/{a}/artifacts?name={name}"),
+            Some(OWNER),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{name:?}");
+    }
+    let (status, _) = get_json(&w, "/api/tracer/traces/live/artifacts", Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+    let (status, _) = get_json(
+        &w,
+        &format!("/api/tracer/traces/{a}/artifacts"),
+        Some("user-b"),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
 }

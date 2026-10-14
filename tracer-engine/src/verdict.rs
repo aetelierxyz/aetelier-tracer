@@ -38,10 +38,10 @@ fn eps(px: f64) -> f64 {
     1e-9 * px.abs()
 }
 
-fn opposite_aggressor(maker_side: MakerSide, print_is_buy: bool) -> bool {
+fn opposite_aggressor(maker_side: MakerSide, trade_is_buy: bool) -> bool {
     match maker_side {
-        MakerSide::Buy => !print_is_buy,
-        MakerSide::Sell => print_is_buy,
+        MakerSide::Buy => !trade_is_buy,
+        MakerSide::Sell => trade_is_buy,
     }
 }
 
@@ -76,21 +76,21 @@ pub struct MakerScan {
     pub through: Option<Fill>,
 }
 
-fn idx_after(prints: &[FillRow], ts_ms: u64) -> usize {
-    prints.partition_point(|r| r.time_ms <= ts_ms)
+fn idx_after(trades: &[FillRow], ts_ms: u64) -> usize {
+    trades.partition_point(|r| r.time_ms <= ts_ms)
 }
 
-fn last_px_at_or_before(prints: &[FillRow], ts_ms: u64) -> Option<f64> {
-    let idx = idx_after(prints, ts_ms);
+fn last_px_at_or_before(trades: &[FillRow], ts_ms: u64) -> Option<f64> {
+    let idx = idx_after(trades, ts_ms);
     if idx == 0 {
         None
     } else {
-        Some(prints[idx - 1].px)
+        Some(trades[idx - 1].px)
     }
 }
 
 pub fn scan_maker(
-    prints: &[FillRow],
+    trades: &[FillRow],
     maker_side: MakerSide,
     posted_px: f64,
     t_post_ms: u64,
@@ -100,15 +100,15 @@ pub fn scan_maker(
 ) -> MakerScan {
     let t_start = t_post_ms + delta_ms;
     let last_px = if delta_ms == 0 {
-        post_last_px.or_else(|| last_px_at_or_before(prints, t_start))
+        post_last_px.or_else(|| last_px_at_or_before(trades, t_start))
     } else {
-        last_px_at_or_before(prints, t_start).or(post_last_px)
+        last_px_at_or_before(trades, t_start).or(post_last_px)
     };
     let mut scan = MakerScan {
         already_through: last_px.is_some_and(|px| already_through(maker_side, px, posted_px)),
         ..MakerScan::default()
     };
-    for r in &prints[idx_after(prints, t_start)..] {
+    for r in &trades[idx_after(trades, t_start)..] {
         if r.time_ms > window_end_ms {
             break;
         }
@@ -132,13 +132,13 @@ pub fn scan_maker(
     scan
 }
 
-pub fn first_opposite_print(
-    prints: &[FillRow],
+pub fn first_opposite_trade(
+    trades: &[FillRow],
     maker_side: MakerSide,
     after_ms: u64,
     until_ms: u64,
 ) -> Option<Fill> {
-    prints[idx_after(prints, after_ms)..]
+    trades[idx_after(trades, after_ms)..]
         .iter()
         .take_while(|r| r.time_ms <= until_ms)
         .find(|r| opposite_aggressor(maker_side, r.is_buy))
@@ -149,16 +149,16 @@ pub fn first_opposite_print(
 }
 
 pub fn markout_bps(
-    prints: &[FillRow],
+    trades: &[FillRow],
     fill: Fill,
     window_ms: u64,
     position_dir: i8,
 ) -> Option<f64> {
-    let idx = idx_after(prints, fill.ts_ms + window_ms);
+    let idx = idx_after(trades, fill.ts_ms + window_ms);
     if idx == 0 {
         return None;
     }
-    let r = &prints[idx - 1];
+    let r = &trades[idx - 1];
     if r.time_ms <= fill.ts_ms {
         return None;
     }
@@ -169,7 +169,7 @@ pub fn markout_bps(
 mod tests {
     use super::*;
 
-    fn print(ts: u64, px: f64, is_buy: bool) -> FillRow {
+    fn tape_trade(ts: u64, px: f64, is_buy: bool) -> FillRow {
         FillRow {
             time_ms: ts,
             px,
@@ -180,29 +180,32 @@ mod tests {
 
     #[test]
     fn maker_buy_touch_and_through_boundaries() {
-        let prints = vec![
-            print(1_000, 100.10, false),
-            print(2_000, 100.00, false),
-            print(3_000, 99.99, false),
+        let trades = vec![
+            tape_trade(1_000, 100.10, false),
+            tape_trade(2_000, 100.00, false),
+            tape_trade(3_000, 99.99, false),
         ];
-        let s = scan_maker(&prints, MakerSide::Buy, 100.0, 0, 0, 10_000, Some(100.10));
+        let s = scan_maker(&trades, MakerSide::Buy, 100.0, 0, 0, 10_000, Some(100.10));
         assert!(!s.already_through);
         assert_eq!(s.touch.unwrap().ts_ms, 2_000);
         assert_eq!(s.through.unwrap().ts_ms, 3_000);
     }
 
     #[test]
-    fn same_side_prints_never_fill() {
-        let prints = vec![print(1_000, 99.0, true), print(2_000, 98.0, true)];
-        let s = scan_maker(&prints, MakerSide::Buy, 100.0, 0, 0, 10_000, Some(101.0));
+    fn same_side_trades_never_fill() {
+        let trades = vec![tape_trade(1_000, 99.0, true), tape_trade(2_000, 98.0, true)];
+        let s = scan_maker(&trades, MakerSide::Buy, 100.0, 0, 0, 10_000, Some(101.0));
         assert!(s.touch.is_none());
         assert!(s.through.is_none());
     }
 
     #[test]
     fn maker_sell_orientation_mirrors() {
-        let prints = vec![print(1_000, 100.00, true), print(2_000, 100.01, true)];
-        let s = scan_maker(&prints, MakerSide::Sell, 100.0, 0, 0, 10_000, Some(99.9));
+        let trades = vec![
+            tape_trade(1_000, 100.00, true),
+            tape_trade(2_000, 100.01, true),
+        ];
+        let s = scan_maker(&trades, MakerSide::Sell, 100.0, 0, 0, 10_000, Some(99.9));
         assert_eq!(s.touch.unwrap().ts_ms, 1_000);
         assert_eq!(s.through.unwrap().ts_ms, 2_000);
         assert!(!s.already_through);
@@ -212,34 +215,34 @@ mod tests {
     fn epsilon_tie_counts_as_touch_not_through() {
         let posted = 330.39;
         let tie = posted + 1e-12;
-        let prints = vec![print(1_000, tie, false)];
-        let s = scan_maker(&prints, MakerSide::Buy, posted, 0, 0, 10_000, Some(331.0));
+        let trades = vec![tape_trade(1_000, tie, false)];
+        let s = scan_maker(&trades, MakerSide::Buy, posted, 0, 0, 10_000, Some(331.0));
         assert!(s.touch.is_some());
         assert!(s.through.is_none());
     }
 
     #[test]
     fn already_through_uses_post_last_px_at_delta_zero_and_reevaluates_at_delta() {
-        let prints = vec![print(100, 99.0, false), print(400, 101.0, false)];
-        let s0 = scan_maker(&prints, MakerSide::Buy, 100.0, 0, 0, 10_000, Some(99.5));
+        let trades = vec![tape_trade(100, 99.0, false), tape_trade(400, 101.0, false)];
+        let s0 = scan_maker(&trades, MakerSide::Buy, 100.0, 0, 0, 10_000, Some(99.5));
         assert!(s0.already_through);
-        let s250 = scan_maker(&prints, MakerSide::Buy, 100.0, 0, 250, 10_000, Some(99.5));
+        let s250 = scan_maker(&trades, MakerSide::Buy, 100.0, 0, 250, 10_000, Some(99.5));
         assert!(s250.already_through);
-        let s1000 = scan_maker(&prints, MakerSide::Buy, 100.0, 0, 1_000, 10_000, Some(99.5));
+        let s1000 = scan_maker(&trades, MakerSide::Buy, 100.0, 0, 1_000, 10_000, Some(99.5));
         assert!(!s1000.already_through);
     }
 
     #[test]
     fn window_bounds_are_exclusive_start_inclusive_end() {
-        let prints = vec![
-            print(0, 99.0, false),
-            print(10_000, 99.0, false),
-            print(10_001, 99.0, false),
+        let trades = vec![
+            tape_trade(0, 99.0, false),
+            tape_trade(10_000, 99.0, false),
+            tape_trade(10_001, 99.0, false),
         ];
-        let s = scan_maker(&prints, MakerSide::Buy, 100.0, 0, 0, 10_000, Some(101.0));
+        let s = scan_maker(&trades, MakerSide::Buy, 100.0, 0, 0, 10_000, Some(101.0));
         assert_eq!(s.through.unwrap().ts_ms, 10_000);
         let none = scan_maker(
-            &prints,
+            &trades,
             MakerSide::Buy,
             100.0,
             10_001,
@@ -252,27 +255,30 @@ mod tests {
 
     #[test]
     fn taker_cross_finds_first_opposite_within_window() {
-        let prints = vec![
-            print(1_000, 100.0, false),
-            print(2_000, 99.5, true),
-            print(3_000, 99.4, true),
+        let trades = vec![
+            tape_trade(1_000, 100.0, false),
+            tape_trade(2_000, 99.5, true),
+            tape_trade(3_000, 99.4, true),
         ];
-        let f = first_opposite_print(&prints, MakerSide::Sell, 1_000, 60_000).unwrap();
+        let f = first_opposite_trade(&trades, MakerSide::Sell, 1_000, 60_000).unwrap();
         assert_eq!(f.ts_ms, 2_000);
-        assert!(first_opposite_print(&prints, MakerSide::Sell, 3_000, 60_000).is_none());
+        assert!(first_opposite_trade(&trades, MakerSide::Sell, 3_000, 60_000).is_none());
     }
 
     #[test]
-    fn markout_signs_by_position_direction_and_needs_a_later_print() {
-        let prints = vec![print(1_000, 100.0, false), print(50_000, 101.0, true)];
+    fn markout_signs_by_position_direction_and_needs_a_later_trade() {
+        let trades = vec![
+            tape_trade(1_000, 100.0, false),
+            tape_trade(50_000, 101.0, true),
+        ];
         let fill = Fill {
             ts_ms: 1_000,
             px: 100.0,
         };
-        let m = markout_bps(&prints, fill, 60_000, 1).unwrap();
+        let m = markout_bps(&trades, fill, 60_000, 1).unwrap();
         assert!((m - 100.0).abs() < 1e-9);
-        let m_short = markout_bps(&prints, fill, 60_000, -1).unwrap();
+        let m_short = markout_bps(&trades, fill, 60_000, -1).unwrap();
         assert!((m_short + 100.0).abs() < 1e-9);
-        assert!(markout_bps(&prints[..1], fill, 60_000, 1).is_none());
+        assert!(markout_bps(&trades[..1], fill, 60_000, 1).is_none());
     }
 }

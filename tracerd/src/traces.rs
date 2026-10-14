@@ -6,6 +6,8 @@ use std::time::Duration;
 use axum::extract::{Multipart, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use sha2::Digest;
 
 use tracer_engine::market_engine::read_gap_spans;
@@ -13,9 +15,9 @@ use tracer_engine::market_engine::{GapSpan, tape_files_sorted};
 use tracer_engine::params::TracerParams;
 use tracer_engine::trace::{
     BookTick, DEPTH_ROWS_CAP, DEPTH_ROWS_DEFAULT, DepthRow, MAX_SIGNALS_BYTES, OrderSourceSpec,
-    PreflightReport, Print, RowError, SchemaFieldOut, TapeRole, TraceOverrides, TraceRequest,
-    TraceSummary, book_series, decimate_depth, depth_window, execute, load_depth_files,
-    load_depth_rows, load_live_tape_files, load_prints_files, parquet_schema_fields, prepare,
+    PreflightReport, RowError, SchemaFieldOut, TapeRole, TraceOverrides, TraceRequest,
+    TraceSummary, TradePoint, book_series, decimate_depth, depth_window, execute, load_depth_files,
+    load_depth_rows, load_live_tape_files, load_trade_rows, parquet_schema_fields, prepare,
 };
 
 use tracing::{error, info, warn};
@@ -36,6 +38,8 @@ pub const DEFAULT_SWEEP_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
 pub const TAPE_CACHE_ENTRIES: usize = 4;
 pub const TAPE_LOAD_WAIT_MS: u64 = 20_000;
 pub const TAPE_RETRY_AFTER_S: &str = "2";
+pub const LIST_LIMIT_DEFAULT: usize = 100;
+pub const LIST_LIMIT_MAX: usize = 500;
 
 pub type TapeFiles = Vec<(TapeRole, PathBuf)>;
 
@@ -76,7 +80,7 @@ pub struct TraceRecord {
 pub struct CachedTape {
     pub trades_files: Vec<PathBuf>,
     pub books_files: Vec<PathBuf>,
-    pub prints: Vec<Print>,
+    pub trades: Vec<TradePoint>,
     pub books: Vec<BookTick>,
     pub depth: Vec<DepthRow>,
     seen: Mutex<HashSet<String>>,
@@ -289,7 +293,7 @@ impl TraceRuntime {
             .filter(|e| e.path().is_dir())
             .filter_map(|e| self.read_record(&e.file_name().to_string_lossy()))
             .collect();
-        out.sort_by_key(|r| std::cmp::Reverse(r.created_ms));
+        out.sort_by(|a, b| (b.created_ms, &b.trace_id).cmp(&(a.created_ms, &a.trace_id)));
         out
     }
 
@@ -458,7 +462,7 @@ impl TraceRuntime {
                     info!(
                         trace = %log_key,
                         elapsed_ms,
-                        prints = tape.prints.len(),
+                        trades = tape.trades.len(),
                         books = tape.books.len(),
                         depth_rows = tape.depth.len(),
                         "tape loaded"
@@ -501,9 +505,9 @@ fn build_tape(
     books_files: Vec<PathBuf>,
     with_depth: bool,
 ) -> anyhow::Result<CachedTape> {
-    let (mut prints, mut books, mut depth, mut seen, trades_from, books_from) = match &base {
+    let (mut trades, mut books, mut depth, mut seen, trades_from, books_from) = match &base {
         Some(cached) => (
-            cached.prints.clone(),
+            cached.trades.clone(),
             cached.books.clone(),
             cached.depth.clone(),
             std::mem::take(&mut *cached.seen.lock().unwrap()),
@@ -521,8 +525,8 @@ fn build_tape(
         .map(PathBuf::as_path)
         .collect();
     if !new_trades.is_empty() {
-        prints.extend(load_prints_files(&new_trades, &mut seen)?);
-        prints.sort_by_key(|p| p.0);
+        trades.extend(load_trade_rows(&new_trades, &mut seen)?);
+        trades.sort_by_key(|p| p.0);
     }
     if !new_books.is_empty() {
         let (ticks, rows) = load_depth_files(&new_books, with_depth)?;
@@ -536,7 +540,7 @@ fn build_tape(
     Ok(CachedTape {
         trades_files,
         books_files,
-        prints,
+        trades,
         books,
         depth,
         seen: Mutex::new(seen),
@@ -939,23 +943,167 @@ pub async fn create_trace(
     ))
 }
 
+#[derive(serde::Deserialize)]
+pub struct TraceListQuery {
+    limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+fn list_cursor(record: &TraceRecord) -> String {
+    B64.encode(format!("{}|{}", record.created_ms, record.trace_id))
+}
+
+fn parse_list_cursor(text: &str) -> Result<(u64, String), StatusCode> {
+    let raw = B64.decode(text).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let decoded = String::from_utf8(raw).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (created, id) = decoded.split_once('|').ok_or(StatusCode::BAD_REQUEST)?;
+    let created: u64 = created.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    if !is_trace_id(id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok((created, id.to_owned()))
+}
+
 pub async fn list_traces(
     State(s): State<AppState>,
+    Query(q): Query<TraceListQuery>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let rt = runtime(&s)?;
     let caller = caller_of(&headers)?;
-    let traces: Vec<serde_json::Value> = rt
+    let limit = q
+        .limit
+        .unwrap_or(LIST_LIMIT_DEFAULT)
+        .clamp(1, LIST_LIMIT_MAX);
+    let after = q.cursor.as_deref().map(parse_list_cursor).transpose()?;
+    let visible: Vec<TraceRecord> = rt
         .list_records()
         .into_iter()
         .filter(|r| is_service(&caller) || r.user_id.as_deref() == Some(caller.as_str()))
-        .map(|r| listed_record(&r))
         .collect();
+    let total = visible.len();
+    let page: Vec<&TraceRecord> = visible
+        .iter()
+        .filter(|r| match &after {
+            Some((created, id)) => (r.created_ms, &r.trace_id) < (*created, id),
+            None => true,
+        })
+        .take(limit)
+        .collect();
+    let exhausted = page.len() < limit
+        || page.last().is_some_and(|last| {
+            visible
+                .iter()
+                .all(|r| (r.created_ms, &r.trace_id) >= (last.created_ms, &last.trace_id))
+        });
+    let older_cursor = if exhausted {
+        None
+    } else {
+        page.last().map(|last| list_cursor(last))
+    };
+    let traces: Vec<serde_json::Value> = page.into_iter().map(listed_record).collect();
     Ok(Json(serde_json::json!({
         "schema": "tracer.traces.v1",
         "live": rt.live_record(),
+        "total": total,
         "traces": traces,
+        "older_cursor": older_cursor,
     })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct ArtifactsQuery {
+    name: Option<String>,
+}
+
+fn artifact_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = ["trace.json", "corrected_ledger.json", "fillrates.json"]
+        .into_iter()
+        .filter(|name| dir.join(name).is_file())
+        .map(str::to_owned)
+        .collect();
+    let mut ledger: Vec<String> = std::fs::read_dir(dir.join("ledger"))
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("events_") && name.ends_with(".jsonl"))
+                .map(|name| format!("ledger/{name}"))
+                .collect()
+        })
+        .unwrap_or_default();
+    ledger.sort();
+    names.extend(ledger);
+    names
+}
+
+fn artifact_content_type(name: &str) -> &'static str {
+    if name.ends_with(".jsonl") {
+        "application/x-ndjson"
+    } else {
+        "application/json"
+    }
+}
+
+pub async fn trace_artifacts(
+    State(s): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<ArtifactsQuery>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, StatusCode> {
+    let rt = runtime(&s)?;
+    let record = read_owned(&rt, &id, &headers)?;
+    let dir = rt.dir.join(&record.trace_id);
+    let names = artifact_names(&dir);
+    match q.name {
+        None => {
+            let artifacts: Vec<serde_json::Value> = names
+                .iter()
+                .filter_map(|name| {
+                    let bytes = std::fs::read(dir.join(name)).ok()?;
+                    Some(serde_json::json!({
+                        "name": name,
+                        "bytes": bytes.len(),
+                        "sha256": format!("{:x}", sha2::Sha256::digest(&bytes)),
+                    }))
+                })
+                .collect();
+            Ok(Json(serde_json::json!({
+                "schema": "tracer.traceartifacts.v1",
+                "trace_id": record.trace_id,
+                "status": record.status,
+                "artifacts": artifacts,
+            }))
+            .into_response())
+        }
+        Some(name) => {
+            if !names.contains(&name) {
+                return Err(StatusCode::NOT_FOUND);
+            }
+            let bytes = std::fs::read(dir.join(&name)).map_err(|_| StatusCode::NOT_FOUND)?;
+            let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+            let file_name = name.rsplit('/').next().unwrap_or(&name).to_owned();
+            Ok((
+                StatusCode::OK,
+                [
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        artifact_content_type(&name).to_owned(),
+                    ),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        format!("attachment; filename=\"{file_name}\""),
+                    ),
+                    (
+                        axum::http::HeaderName::from_static("x-aetelier-sha256"),
+                        digest,
+                    ),
+                ],
+                bytes,
+            )
+                .into_response())
+        }
+    }
 }
 
 fn listed_record(record: &TraceRecord) -> serde_json::Value {
@@ -1056,7 +1204,7 @@ pub async fn trace_events(
 }
 
 #[derive(serde::Deserialize)]
-pub struct BookQuery {
+pub struct OrderbookQuery {
     t0: Option<u64>,
     t1: Option<u64>,
     points: Option<usize>,
@@ -1105,10 +1253,10 @@ fn owned_record_or_live(
     Ok(record)
 }
 
-pub async fn trace_book(
+pub async fn trace_orderbook(
     State(s): State<AppState>,
     AxumPath(id): AxumPath<String>,
-    Query(q): Query<BookQuery>,
+    Query(q): Query<OrderbookQuery>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, TapeHttpError> {
     let rt = runtime(&s)?;
@@ -1119,7 +1267,7 @@ pub async fn trace_book(
     let points = q.points.unwrap_or(1024).min(4096);
     let series = book_series(&tape.books, q.t0, q.t1, points);
     Ok(Json(serde_json::json!({
-        "schema": "tracer.tracebook.v1",
+        "schema": "tracer.traceorderbook.v1",
         "trace_id": id,
         "points": series,
     })))
@@ -1163,15 +1311,15 @@ pub async fn trace_depth(
 }
 
 #[derive(serde::Deserialize)]
-pub struct PrintsQuery {
+pub struct TradesQuery {
     cursor: Option<usize>,
     limit: Option<usize>,
 }
 
-pub async fn trace_prints(
+pub async fn trace_trades(
     State(s): State<AppState>,
     AxumPath(id): AxumPath<String>,
-    Query(q): Query<PrintsQuery>,
+    Query(q): Query<TradesQuery>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, TapeHttpError> {
     let rt = runtime(&s)?;
@@ -1181,9 +1329,9 @@ pub async fn trace_prints(
         .map_err(tape_http_error)?;
     let limit = q.limit.unwrap_or(100).min(1000);
     let offset = q.cursor.unwrap_or(0);
-    let total = tape.prints.len();
+    let total = tape.trades.len();
     let page: Vec<serde_json::Value> = tape
-        .prints
+        .trades
         .iter()
         .rev()
         .skip(offset)
@@ -1199,10 +1347,10 @@ pub async fn trace_prints(
         .collect();
     let next = offset + page.len();
     Ok(Json(serde_json::json!({
-        "schema": "tracer.traceprints.v1",
+        "schema": "tracer.tracetrades.v1",
         "trace_id": id,
         "total": total,
-        "prints": page,
+        "trades": page,
         "older_cursor": if next < total { Some(next) } else { None },
     })))
 }
