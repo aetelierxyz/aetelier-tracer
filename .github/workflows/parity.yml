@@ -8,11 +8,13 @@ permissions:
 
 jobs:
   host-mounts:
-    name: the export and the frozen replay must exist on the runner host
+    name: the export, the frozen replay and the golden ledger must exist on the runner host
+    if: github.repository == 'IteraLabs/aetelier-tracer'
     runs-on: [self-hosted, linux-amd64]
     env:
       FILLS_DIR: ${{ vars.TRACER_FILLS_DIR }}
       REPLAY_DIR: ${{ vars.TRACER_REPLAY_DIR }}
+      GOLDEN_DIR: ${{ vars.TRACER_GOLDEN_DIR }}
     defaults:
       run:
         shell: bash
@@ -20,7 +22,7 @@ jobs:
       - name: repository variables name absolute host directories holding the inputs
         run: |
           set -euo pipefail
-          for var in FILLS_DIR REPLAY_DIR; do
+          for var in FILLS_DIR REPLAY_DIR GOLDEN_DIR; do
             dir="${!var}"
             if [ -z "$dir" ]; then
               echo "::error::repository variable TRACER_$var is unset"
@@ -45,9 +47,14 @@ jobs:
               exit 1
             fi
           done
+          if [ ! -s "$GOLDEN_DIR/paper_trades_golden.csv" ]; then
+            echo "::error::TRACER_GOLDEN_DIR=$GOLDEN_DIR has no non-empty paper_trades_golden.csv on the runner host"
+            exit 1
+          fi
 
   full-gates:
     name: full parity gates over the private study export
+    if: github.repository == 'IteraLabs/aetelier-tracer'
     needs: host-mounts
     runs-on: [self-hosted, linux-amd64]
     container:
@@ -55,9 +62,11 @@ jobs:
       volumes:
         - ${{ vars.TRACER_FILLS_DIR }}:/fills:ro
         - ${{ vars.TRACER_REPLAY_DIR }}:/replay:ro
+        - ${{ vars.TRACER_GOLDEN_DIR }}:/golden:ro
     env:
       TRACER_FILLS_DIR: /fills
       TRACER_REPLAY_DIR: /replay
+      TRACER_GOLDEN_DIR: /golden
       CARGO_TERM_COLOR: always
     defaults:
       run:
@@ -73,5 +82,17 @@ jobs:
             exit 1
           fi
 
+      - name: the golden ledger must match fixtures/golden.sha256
+        run: |
+          set -euo pipefail
+          if ! (cd /golden && sha256sum --strict -c "$GITHUB_WORKSPACE/fixtures/golden.sha256"); then
+            echo "::error::/golden (TRACER_GOLDEN_DIR) does not match fixtures/golden.sha256"
+            exit 1
+          fi
+
       - name: golden and signals parity gates, full study
         run: cargo test --locked --workspace --no-fail-fast
+
+      - name: hand the workspace back to the runner user
+        if: always()
+        run: chown -R "$(stat -c '%u:%g' "$RUNNER_WORKSPACE")" "$GITHUB_WORKSPACE"

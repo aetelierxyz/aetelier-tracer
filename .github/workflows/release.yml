@@ -10,6 +10,7 @@ permissions:
 jobs:
   binary:
     name: linux-x86_64 binary + GitHub release
+    if: github.repository == 'aetelierxyz/aetelier-tracer'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -36,8 +37,9 @@ jobs:
           asset="tracerd-${GITHUB_REF_NAME}-linux-x86_64"
           cp target/release/tracerd "$asset"
           sha256sum "$asset" > "${asset}.sha256"
+          git fetch --force origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
           git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > notes.md
-          printf '\nImage: ghcr.io/iteralabs/aetelier-tracer:%s-amd64\n' "${GITHUB_REF_NAME}" >> notes.md
+          printf '\nImage: ghcr.io/aetelierxyz/aetelier-tracer:%s-amd64\n' "${GITHUB_REF_NAME}" >> notes.md
           echo "ASSET=${asset}" >> "$GITHUB_ENV"
 
       - name: create the GitHub release

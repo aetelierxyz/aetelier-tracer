@@ -1,9 +1,12 @@
 # aetelier-tracer
 
-Fill-probability truth instrument for the flow-after-hours signal: measures whether posted maker orders would actually have filled, recomputes the paper ledger with unfilled signals dropped, and serves the posted → observed → filled/expired lifecycle. Never places orders.
+Fill-probability measurement engine. Replays paper trading signals against recorded venue trade and order-book tapes, classifies each posted maker order as filled through, filled touch or unfilled, and recomputes the paper ledger with unfilled entries dropped. It never places orders.
 
-- `tracer-engine/` — library: ported signal core, verdicts, event ledger, replay, corrected stats.
-- `tracerd/` — binary: `run | replay | serve | export-golden`.
-- `params/tracer_params.v1.json` — frozen study parameters; refits are new artifact versions, never in-place.
-- `fixtures/` — `paper_trades_golden.csv` (the paper's 14,433 trades, replay parity gate) and `mini_fills_xyz_TSLA.csv` (1-day CI fixture, 2026-07-15 UTC).
+- `tracer-engine/`: signal core, verdicts, event ledger, replay, corrected statistics.
+- `tracerd/`: binary with `run`, `replay`, `serve`, `export-golden` and `evaluate`.
+- `params/tracer_params.v1.json`: frozen study parameters.
+- `fixtures/`: one-day `mini_fills_xyz_TSLA.csv` and API fixtures for the test suite.
 
+Build and test: `cargo test --locked --workspace` (Rust 1.99.0, pinned in `rust-toolchain.toml`). The full parity gates run only when `TRACER_FILLS_DIR`, `TRACER_REPLAY_DIR` and `TRACER_GOLDEN_DIR` point at the private study export, frozen replay and golden ledger.
+
+License: Apache-2.0.

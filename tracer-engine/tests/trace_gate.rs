@@ -1,3 +1,5 @@
+mod golden_pin;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -149,14 +151,31 @@ fn strip_provenance(v: &mut serde_json::Value) {
     }
 }
 
-fn frozen_replay_dir() -> Option<PathBuf> {
-    let dir = std::env::var_os("TRACER_REPLAY_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| repo_root().join("out/replay"));
-    ["corrected_ledger.json", "fillrates.json"]
+const FROZEN_REPLAY_FILES: [&str; 2] = ["corrected_ledger.json", "fillrates.json"];
+
+fn holds_frozen_replay(dir: &Path) -> bool {
+    FROZEN_REPLAY_FILES
         .iter()
         .all(|name| dir.join(name).is_file())
-        .then_some(dir)
+}
+
+fn frozen_replay_dir() -> Option<PathBuf> {
+    match std::env::var_os("TRACER_REPLAY_DIR").filter(|v| !v.is_empty()) {
+        Some(set) => {
+            let dir = PathBuf::from(set);
+            assert!(
+                holds_frozen_replay(&dir),
+                "TRACER_REPLAY_DIR={} lacks {}",
+                dir.display(),
+                FROZEN_REPLAY_FILES.join(" or ")
+            );
+            Some(dir)
+        }
+        None => {
+            let dir = repo_root().join("out/replay");
+            holds_frozen_replay(&dir).then_some(dir)
+        }
+    }
 }
 
 fn assert_frozen_replay_pinned(dir: &Path) {
@@ -703,13 +722,13 @@ fn a_fully_duplicated_live_trades_file_is_skipped_not_rejected() {
 
 #[test]
 fn full_golden_signals_trace_reproduces_frozen_replay_artifacts() {
-    let Ok(fills_dir) = std::env::var("TRACER_FILLS_DIR") else {
-        eprintln!("TRACER_FILLS_DIR unset; full signals parity gate skipped");
+    let Some(inputs) = golden_pin::golden_inputs("full signals parity gate") else {
         return;
     };
+    let fills_dir = inputs.fills_dir;
     let Some(frozen_replay) = frozen_replay_dir() else {
         eprintln!(
-            "frozen replay absent under TRACER_REPLAY_DIR or out/replay; full signals parity gate skipped"
+            "TRACER_REPLAY_DIR unset and out/replay absent; full signals parity gate skipped"
         );
         return;
     };
@@ -729,7 +748,7 @@ fn full_golden_signals_trace_reproduces_frozen_replay_artifacts() {
     }
     let req = TraceRequest {
         tape_files,
-        orders: OrderSourceSpec::Signals(repo_root().join("fixtures/paper_trades_golden.csv")),
+        orders: OrderSourceSpec::Signals(inputs.golden_csv),
         overrides: None,
         grace_ms: DEFAULT_GRACE_MS,
         cross_window_ms: DEFAULT_CROSS_WINDOW_MS,

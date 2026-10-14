@@ -6,7 +6,7 @@ RUN cargo build --release --locked -p tracerd --bin tracerd
 
 FROM debian:bookworm-slim
 ARG TARGETARCH
-LABEL org.opencontainers.image.source="https://github.com/IteraLabs/aetelier-tracer" \
+LABEL org.opencontainers.image.source="https://github.com/aetelierxyz/aetelier-tracer" \
       org.opencontainers.image.title="aetelier-tracer" \
       org.opencontainers.image.description="Tracer fill-probability instrument: tracerd live daemon, replay engine, REST API" \
       org.opencontainers.image.licenses="Apache-2.0" \
