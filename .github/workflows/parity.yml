@@ -32,4 +32,4 @@ jobs:
           fi
 
       - name: golden and signals parity gates, full study
-        run: cargo test --locked --workspace
+        run: cargo test --locked --workspace --no-fail-fast
