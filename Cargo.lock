@@ -2157,6 +2157,7 @@ dependencies = [
  "arrow-schema",
  "chrono",
  "chrono-tz",
+ "libm",
  "parquet",
  "rust_decimal",
  "serde",

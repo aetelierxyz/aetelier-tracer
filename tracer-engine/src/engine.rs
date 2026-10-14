@@ -37,7 +37,7 @@ impl SignalState {
         let decay = match self.last_ms {
             Some(prev) if bar.close_ms > prev => {
                 let dt = (bar.close_ms - prev) as f64 / 1000.0;
-                (-dt / tau_secs).exp()
+                libm::exp(-dt / tau_secs)
             }
             _ => 1.0,
         };
@@ -1224,5 +1224,39 @@ mod tests {
         assert!(!stalled.session.is_empty());
         assert_eq!(stalled.counters.entry_expired_unfilled, 0);
         std::fs::remove_dir_all(binding.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn live_signal_state_score_bits_are_fixed_and_match_replay() {
+        let pair_bar = |close_ms: u64, buy_usd: f64, sell_usd: f64| Bar {
+            open_ms: close_ms,
+            close_ms,
+            n: 1,
+            buy_usd,
+            sell_usd,
+            vwap: 100.0,
+            last_px: 100.0,
+        };
+        for (gap_ms, want) in [
+            (637u64, 0xbf75be237eaf2f3fu64),
+            (3015, 0xbf99b8fb80cabc90),
+            (29995, 0xbfcf583616a38a20),
+            (59996, 0xbfdd92e5e2d7fc6d),
+            (300023, 0xbfef9262d5ded2f7),
+            (554178, 0xbfeffe675b892a58),
+        ] {
+            let bars = [pair_bar(0, 1.0, 0.0), pair_bar(gap_ms, 0.0, 1.0)];
+            let mut state = SignalState {
+                buy: 0.0,
+                sell: 0.0,
+                last_ms: None,
+                prev_extreme: false,
+            };
+            state.update(&bars[0], 60.0);
+            let live = state.update(&bars[1], 60.0);
+            let replay = crate::signal::ewma_imbalance(&bars, 60.0)[1].score;
+            assert_eq!(live.to_bits(), want, "gap {gap_ms} ms live {live:?}");
+            assert_eq!(live.to_bits(), replay.to_bits(), "gap {gap_ms} ms");
+        }
     }
 }

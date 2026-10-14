@@ -12,7 +12,14 @@ fn sd(v: &[f64]) -> f64 {
         return f64::NAN;
     }
     let m = mean(v);
-    (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (v.len() - 1) as f64).sqrt()
+    (v.iter()
+        .map(|x| {
+            let d = x - m;
+            d * d
+        })
+        .sum::<f64>()
+        / (v.len() - 1) as f64)
+        .sqrt()
 }
 
 fn pct(v: &mut [f64], q: f64) -> f64 {
@@ -86,7 +93,13 @@ pub fn block(trades: &[&ExecutedTrade]) -> Option<StatsBlock> {
     let m = mean(&pnls);
     let s = sd(&pnls);
     let downside = {
-        let sq_below: f64 = pnls.iter().map(|p| p.min(0.0).powi(2)).sum();
+        let sq_below: f64 = pnls
+            .iter()
+            .map(|p| {
+                let q = p.min(0.0);
+                q * q
+            })
+            .sum();
         (sq_below / pnls.len() as f64).sqrt()
     };
     let mut sortable = pnls.clone();

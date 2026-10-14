@@ -14,7 +14,7 @@ pub fn ewma_imbalance(bars: &[Bar], tau_secs: f64) -> Vec<SignalBar> {
         let decay = match last_ms {
             Some(prev) if b.close_ms > prev => {
                 let dt = (b.close_ms - prev) as f64 / 1000.0;
-                (-dt / tau_secs).exp()
+                libm::exp(-dt / tau_secs)
             }
             _ => 1.0,
         };

@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use sha2::{Digest, Sha256};
+
 use aetelier_io::orderbooks::ob_parquet::write_ob_parquet;
 use aetelier_io::trades::trades_parquet::write_trades_parquet;
 use aetelier_types::orderbooks::core::{Orderbook, f64_to_decimal};
@@ -145,6 +147,39 @@ fn strip_provenance(v: &mut serde_json::Value) {
         obj.remove("trace_id");
         obj.remove("input_sha256");
     }
+}
+
+fn frozen_replay_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("TRACER_REPLAY_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root().join("out/replay"));
+    ["corrected_ledger.json", "fillrates.json"]
+        .iter()
+        .all(|name| dir.join(name).is_file())
+        .then_some(dir)
+}
+
+fn assert_frozen_replay_pinned(dir: &Path) {
+    let pins = std::fs::read_to_string(repo_root().join("fixtures/frozen_replay.sha256")).unwrap();
+    let mut pinned = Vec::new();
+    for line in pins.lines() {
+        let (want, name) = line
+            .split_once("  ")
+            .expect("frozen_replay.sha256 line must be '<sha256>  <file>'");
+        let got = format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(dir.join(name)).unwrap())
+        );
+        assert_eq!(
+            got,
+            want,
+            "{} does not match its pin in fixtures/frozen_replay.sha256",
+            dir.join(name).display()
+        );
+        pinned.push(name);
+    }
+    pinned.sort_unstable();
+    assert_eq!(pinned, ["corrected_ledger.json", "fillrates.json"]);
 }
 
 fn artifact_norm(path: &Path) -> serde_json::Value {
@@ -672,6 +707,13 @@ fn full_golden_signals_trace_reproduces_frozen_replay_artifacts() {
         eprintln!("TRACER_FILLS_DIR unset; full signals parity gate skipped");
         return;
     };
+    let Some(frozen_replay) = frozen_replay_dir() else {
+        eprintln!(
+            "frozen replay absent under TRACER_REPLAY_DIR or out/replay; full signals parity gate skipped"
+        );
+        return;
+    };
+    assert_frozen_replay_pinned(&frozen_replay);
     let params = load_params();
     let dir = temp_dir("full_signals");
     let mut tape_files: Vec<(TapeRole, PathBuf)> = Vec::new();
@@ -713,7 +755,7 @@ fn full_golden_signals_trace_reproduces_frozen_replay_artifacts() {
     for name in ["corrected_ledger.json", "fillrates.json"] {
         assert_eq!(
             artifact_norm(&trace_out.join(name)),
-            artifact_norm(&repo_root().join("out/replay").join(name)),
+            artifact_norm(&frozen_replay.join(name)),
             "{name} diverged from frozen replay"
         );
     }
