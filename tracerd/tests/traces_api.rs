@@ -25,6 +25,9 @@ use aetelier_types::orderbooks::core::{Orderbook, f64_to_decimal};
 use aetelier_types::trades::{Trade, TradeSide};
 use aetelier_types::trading_pair::TradingPair;
 use tracer_engine::bars::read_fills_csv;
+use tracer_engine::ledger::{
+    EVENT_SCHEMA, Event, EventKind, LedgerWriter, Leg, Mode, PostState, event_id, trade_id,
+};
 use tracer_engine::nyse::regime;
 
 fn repo_root() -> PathBuf {
@@ -1232,6 +1235,20 @@ async fn live_depth_and_schema_find_parquet_under_day_directories() {
 async fn an_evicted_live_tape_signals_trace_still_serves_its_tape() {
     let (w, _, _) = live_world("live_evicted_signals", false);
     write_live_signals_record(&w, "tr_liveevict001", true);
+    let mid = (w.span.0 + w.span.1) / 2;
+    write_ledger(
+        &w,
+        "tr_liveevict001",
+        &[ledger_event(
+            "tr_liveevict001",
+            mid,
+            0,
+            EventKind::Posted,
+            Leg::Entry,
+            mid,
+            mid + 1_000,
+        )],
+    );
 
     for route in ["orderbook", "trades", "depth"] {
         let (status, body) = get_json(
@@ -1244,6 +1261,436 @@ async fn an_evicted_live_tape_signals_trace_still_serves_its_tape() {
     }
     let (_, trades) = get_json(&w, "/api/tracer/traces/tr_liveevict001/trades", Some(OWNER)).await;
     assert!(trades.unwrap()["total"].as_u64().unwrap() > 0);
+    assert_eq!(depth_ts(&w, "tr_liveevict001").await, [w.span.0, mid]);
+}
+
+fn ledger_event(
+    trace_id: &str,
+    t_post_ms: u64,
+    seq: u32,
+    kind: EventKind,
+    leg: Leg,
+    ts_ms: u64,
+    window_end_ms: u64,
+) -> Event {
+    let tid = trade_id("xyz_TSLA", t_post_ms, 1);
+    Event {
+        schema: EVENT_SCHEMA.into(),
+        event_id: event_id(&tid, seq),
+        trade_id: tid,
+        seq,
+        kind,
+        leg,
+        mode: Mode::Trace,
+        trace_id: Some(trace_id.into()),
+        ts_ms,
+        wall_ts_ms: ts_ms,
+        engine_version: "0.1.0".into(),
+        params_version: 1,
+        symbol: "xyz_TSLA".into(),
+        signal_side: 1,
+        maker_side: "buy".into(),
+        decile: 10,
+        score: 0.91,
+        regime: "EXT".into(),
+        posted_px: 390.0,
+        qty_usd: 1_000.0,
+        window_end_ms,
+        post_state: Some(PostState::Passive),
+        depth_ahead_usd: None,
+        book_ts_ms: None,
+        book_staleness_ms: None,
+        exit_price_stale: None,
+        milestone: None,
+        evidence_px: None,
+        cum_opp_usd: None,
+        filled_touch_ts_ms: None,
+        filled_through_ts_ms: None,
+        filled_queue_ts_ms: None,
+        verdict: None,
+        cross_px: None,
+        cross_kind: None,
+        taker_fee_usd: None,
+        evidence_opp_notional_usd: None,
+        evidence_opp_vwap: None,
+        evidence_n_trades: None,
+        bar_buy_usd: None,
+        bar_sell_usd: None,
+        bar_n: None,
+        gap_flags: vec![],
+    }
+}
+
+fn write_ledger(w: &World, trace_id: &str, events: &[Event]) {
+    let dir = w.dir.join("traces_live").join(trace_id).join("ledger");
+    let mut writer = LedgerWriter::new(&dir).unwrap();
+    for event in events {
+        writer.append(event).unwrap();
+    }
+    writer.flush().unwrap();
+    assert_eq!(writer.events_written, events.len() as u64);
+}
+
+fn set_record_status(w: &World, trace_id: &str, status: &str) {
+    let path = w.dir.join("traces_live").join(trace_id).join("trace.json");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    record["status"] = status.into();
+    std::fs::write(&path, record.to_string()).unwrap();
+}
+
+fn put_deep_books(w: &World, books_dir: &Path, name: &str, ts_list: &[u64]) {
+    let deep = deep_ob_parquet(w, 12, ts_list);
+    let tmp = books_dir.join(format!("{name}.tmp"));
+    std::fs::copy(&deep, &tmp).unwrap();
+    std::fs::rename(&tmp, books_dir.join(name)).unwrap();
+}
+
+async fn depth_ts(w: &World, trace_id: &str) -> Vec<u64> {
+    let (status, depth) = get_json(
+        w,
+        &format!("/api/tracer/traces/{trace_id}/depth"),
+        Some(OWNER),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{depth:?}");
+    depth.unwrap()["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["ts_ms"].as_u64().unwrap())
+        .collect()
+}
+
+const SPAN_LO_OFFSET: u64 = 150_000;
+const SPAN_HI_OFFSET: u64 = 300_000;
+
+fn spanned_live_trace(name: &str, trace_id: &str) -> (World, PathBuf, u64) {
+    let (w, _, books_dir) = live_world(name, false);
+    let base = w.span.0;
+    std::fs::remove_file(books_dir.join("ob_sync_1.parquet")).unwrap();
+    let ts_list: Vec<u64> = (0..6).map(|k| base + k * 100_000).collect();
+    put_deep_books(&w, &books_dir, "ob_sync_1.parquet", &ts_list);
+    write_live_signals_record(&w, trace_id, false);
+    let entry = base + SPAN_LO_OFFSET;
+    write_ledger(
+        &w,
+        trace_id,
+        &[
+            ledger_event(
+                trace_id,
+                entry,
+                0,
+                EventKind::Posted,
+                Leg::Entry,
+                entry,
+                entry + 30_000,
+            ),
+            ledger_event(
+                trace_id,
+                entry,
+                1,
+                EventKind::Filled,
+                Leg::Entry,
+                entry + 20_000,
+                entry + 30_000,
+            ),
+            ledger_event(
+                trace_id,
+                entry,
+                2,
+                EventKind::Posted,
+                Leg::Exit,
+                base + 220_000,
+                base + SPAN_HI_OFFSET - 60_000,
+            ),
+        ],
+    );
+    (w, books_dir, base)
+}
+
+#[tokio::test]
+async fn a_complete_live_tape_trace_serves_depth_for_its_ledger_span() {
+    let (w, _, base) = spanned_live_trace("live_span_depth", "tr_livespan0001");
+
+    let (status, depth) =
+        get_json(&w, "/api/tracer/traces/tr_livespan0001/depth", Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let rows = depth.unwrap()["rows"].as_array().unwrap().clone();
+    let ts: Vec<u64> = rows.iter().map(|r| r["ts_ms"].as_u64().unwrap()).collect();
+    assert_eq!(ts, [base + 100_000, base + 200_000, base + 300_000]);
+    for row in &rows {
+        assert_eq!(row["bids"].as_array().unwrap().len(), 10);
+        assert_eq!(row["asks"].as_array().unwrap().len(), 10);
+    }
+}
+
+#[tokio::test]
+async fn a_running_live_tape_trace_gets_its_depth_once_complete() {
+    let (w, books_dir, base) = spanned_live_trace("live_span_running", "tr_livespan0002");
+    set_record_status(&w, "tr_livespan0002", "running");
+
+    assert!(depth_ts(&w, "tr_livespan0002").await.is_empty());
+
+    put_deep_books(
+        &w,
+        &books_dir,
+        "ob_sync_2.parquet",
+        &[base + 250_000, base + 350_000],
+    );
+    set_record_status(&w, "tr_livespan0002", "complete");
+
+    assert_eq!(
+        depth_ts(&w, "tr_livespan0002").await,
+        [
+            base + 100_000,
+            base + 200_000,
+            base + 250_000,
+            base + 300_000
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_books_file_appended_after_completion_extends_the_span_depth() {
+    let (w, books_dir, base) = spanned_live_trace("live_span_append", "tr_livespan0003");
+    assert_eq!(
+        depth_ts(&w, "tr_livespan0003").await,
+        [base + 100_000, base + 200_000, base + 300_000]
+    );
+
+    put_deep_books(
+        &w,
+        &books_dir,
+        "ob_sync_2.parquet",
+        &[base + 120_000, base + 250_000, base + 350_000],
+    );
+
+    assert_eq!(
+        depth_ts(&w, "tr_livespan0003").await,
+        [
+            base + 120_000,
+            base + 200_000,
+            base + 250_000,
+            base + 300_000
+        ]
+    );
+}
+
+async fn metric_line_appears(w: &World, line: &str) -> bool {
+    for _ in 0..100 {
+        let (_, body) = get_text(w, "/metrics", None).await;
+        if body.lines().any(|l| l == line) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn a_live_tape_strategy_trace_is_warmed_with_its_span_depth_on_completion() {
+    let (w, _, _) = live_world("live_span_prewarm", false);
+    let loaded_twice = "tracer_tape_loads_total{result=\"ok\"} 2";
+    let config = serde_json::json!({"order_source": "strategy", "tape": "live"});
+    let (status, body) = post_trace(&w, &config, &[], Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let trace_id = body["trace_id"].as_str().unwrap().to_string();
+    let record = wait_complete(&w, &trace_id, OWNER).await;
+    assert!(record["summary"]["events_written"].as_u64().unwrap() > 0);
+
+    assert!(metric_line_appears(&w, loaded_twice).await);
+    let ts = depth_ts(&w, &trace_id).await;
+    assert!(!ts.is_empty());
+    let (_, metrics) = get_text(&w, "/metrics", None).await;
+    assert!(metrics.lines().any(|l| l == loaded_twice), "{metrics}");
+}
+
+#[tokio::test]
+async fn completing_live_tape_traces_keeps_the_live_tape_cached() {
+    let (w, _, _) = live_world("live_span_prewarm_lru", false);
+    assert!(metric_line_appears(&w, "tracer_tape_loads_total{result=\"ok\"} 1").await);
+    let config = serde_json::json!({"order_source": "strategy", "tape": "live"});
+    let users = ["user-a", "user-b", "user-c", "user-d"];
+    for user in users {
+        let (status, body) = post_trace(&w, &config, &[], Some(user)).await;
+        assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+        let trace_id = body["trace_id"].as_str().unwrap().to_string();
+        wait_complete(&w, &trace_id, user).await;
+    }
+    let loaded_five = "tracer_tape_loads_total{result=\"ok\"} 5";
+    assert!(metric_line_appears(&w, loaded_five).await);
+
+    let trades = live_trades(&w, "").await;
+    assert!(trades["total"].as_u64().unwrap() > 0);
+    let (_, metrics) = get_text(&w, "/metrics", None).await;
+    assert!(metrics.lines().any(|l| l == loaded_five), "{metrics}");
+}
+
+#[tokio::test]
+async fn a_live_tape_trace_reuses_the_cached_live_trades_and_rebuilds_only_its_depth() {
+    let (w, _, base) = spanned_live_trace("live_span_seed", "tr_livespan0004");
+    let live_total = live_trades(&w, "").await["total"].as_u64().unwrap();
+    assert!(live_total > 0);
+    let trades_file = w
+        .dir
+        .join("bnd_trades/hyperliquid/perpetual/trades/trades_sync_1.parquet");
+    std::fs::write(&trades_file, b"not a parquet file").unwrap();
+
+    let (status, trades) =
+        get_json(&w, "/api/tracer/traces/tr_livespan0004/trades", Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{trades:?}");
+    assert_eq!(trades.unwrap()["total"].as_u64().unwrap(), live_total);
+    assert_eq!(
+        depth_ts(&w, "tr_livespan0004").await,
+        [base + 100_000, base + 200_000, base + 300_000]
+    );
+    assert_eq!(
+        live_trades(&w, "").await["total"].as_u64().unwrap(),
+        live_total
+    );
+}
+
+fn trades_ts(body: &serde_json::Value) -> Vec<u64> {
+    body["trades"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["ts_ms"].as_u64().unwrap())
+        .collect()
+}
+
+async fn live_trades(w: &World, query: &str) -> serde_json::Value {
+    let (status, body) = get_json(
+        w,
+        &format!("/api/tracer/traces/live/trades?{query}"),
+        Some(OWNER),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{query}");
+    body.unwrap()
+}
+
+#[tokio::test]
+async fn trades_are_served_within_a_time_window_in_either_order() {
+    let (w, _, _) = live_world("trades_window", false);
+    let fills = read_fills_csv(&repo_root().join("fixtures/mini_fills_xyz_TSLA.csv")).unwrap();
+    let total = fills.len() as u64;
+    let newest = live_trades(&w, "limit=1000").await;
+    let newest_ts = trades_ts(&newest);
+    let (from, to) = (newest_ts[900], newest_ts[100]);
+    let matched = fills
+        .iter()
+        .filter(|f| f.time_ms >= from && f.time_ms <= to)
+        .count() as u64;
+    assert!(matched > 100);
+
+    let desc = live_trades(&w, &format!("from={from}&to={to}&order=desc&limit=50")).await;
+    let ts = trades_ts(&desc);
+    assert_eq!(ts.len(), 50);
+    assert_eq!(ts[0], to);
+    assert!(ts.windows(2).all(|p| p[0] >= p[1]));
+    assert!(ts.iter().all(|t| (from..=to).contains(t)));
+    assert_eq!(desc["matched"].as_u64().unwrap(), matched);
+    assert_eq!(desc["total"].as_u64().unwrap(), total);
+    assert_eq!(desc["order"], "desc");
+    assert_eq!(desc["next_cursor"], 50);
+    assert_eq!(desc["older_cursor"], 50);
+
+    let asc = live_trades(&w, &format!("from={from}&to={to}&order=asc&limit=50")).await;
+    let first_page = trades_ts(&asc);
+    assert_eq!(first_page[0], from);
+    assert!(first_page.windows(2).all(|p| p[0] <= p[1]));
+    assert!(first_page.iter().all(|t| (from..=to).contains(t)));
+    assert_eq!(asc["order"], "asc");
+    assert_eq!(asc["matched"].as_u64().unwrap(), matched);
+    assert_eq!(asc["total"].as_u64().unwrap(), total);
+    assert!(asc["older_cursor"].is_null());
+    let cursor = asc["next_cursor"].as_u64().unwrap();
+    assert_eq!(cursor, 50);
+
+    let second = live_trades(
+        &w,
+        &format!("from={from}&to={to}&order=asc&limit=50&cursor={cursor}"),
+    )
+    .await;
+    let both = live_trades(&w, &format!("from={from}&to={to}&order=asc&limit=100")).await;
+    let mut paged = asc["trades"].as_array().unwrap().clone();
+    paged.extend(second["trades"].as_array().unwrap().iter().cloned());
+    assert_eq!(&paged, both["trades"].as_array().unwrap());
+
+    let tail = live_trades(
+        &w,
+        &format!(
+            "from={from}&to={to}&order=asc&limit=50&cursor={}",
+            matched - 3
+        ),
+    )
+    .await;
+    assert_eq!(trades_ts(&tail).len(), 3);
+    assert_eq!(*trades_ts(&tail).last().unwrap(), to);
+    assert!(tail["next_cursor"].is_null());
+
+    let inverted = live_trades(&w, &format!("from={to}&to={from}")).await;
+    assert_eq!(inverted["matched"], 0);
+    assert!(inverted["trades"].as_array().unwrap().is_empty());
+    assert!(inverted["next_cursor"].is_null());
+}
+
+#[tokio::test]
+async fn trades_without_window_params_keep_the_legacy_page() {
+    let (w, _, _) = live_world("trades_legacy", false);
+    let fills = read_fills_csv(&repo_root().join("fixtures/mini_fills_xyz_TSLA.csv")).unwrap();
+    let total = fills.len() as u64;
+    let mut fill_ts: Vec<u64> = fills.iter().map(|f| f.time_ms).collect();
+    fill_ts.sort_unstable();
+
+    let legacy = live_trades(&w, "limit=7&cursor=3").await;
+    let ts = trades_ts(&legacy);
+    let expected: Vec<u64> = fill_ts.iter().rev().skip(3).take(7).copied().collect();
+    assert_eq!(ts, expected);
+    assert_eq!(legacy["total"].as_u64().unwrap(), total);
+    assert_eq!(legacy["older_cursor"], 10);
+    assert_eq!(legacy["matched"].as_u64().unwrap(), total);
+    assert_eq!(legacy["order"], "desc");
+    assert_eq!(legacy["next_cursor"], 10);
+
+    let explicit = live_trades(&w, "limit=7&cursor=3&order=desc").await;
+    assert_eq!(explicit["trades"], legacy["trades"]);
+    assert_eq!(explicit["older_cursor"], legacy["older_cursor"]);
+
+    let last = live_trades(&w, &format!("limit=10&cursor={}", total - 2)).await;
+    assert_eq!(trades_ts(&last), [fill_ts[1], fill_ts[0]]);
+    assert!(last["older_cursor"].is_null());
+
+    let keys: Vec<&String> = legacy.as_object().unwrap().keys().collect();
+    assert_eq!(
+        keys,
+        [
+            "matched",
+            "next_cursor",
+            "older_cursor",
+            "order",
+            "schema",
+            "total",
+            "trace_id",
+            "trades"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_trades_order_is_a_bad_request() {
+    let (w, _, _) = live_world("trades_bad_order", false);
+
+    let (status, _) = get_json(
+        &w,
+        "/api/tracer/traces/live/trades?order=sideways",
+        Some(OWNER),
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

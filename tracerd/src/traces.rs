@@ -1,7 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Multipart, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -10,19 +10,21 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use sha2::Digest;
 
+use tracer_engine::ledger::Event;
 use tracer_engine::market_engine::read_gap_spans;
 use tracer_engine::market_engine::{GapSpan, tape_files_sorted};
 use tracer_engine::params::TracerParams;
 use tracer_engine::trace::{
-    BookTick, DEPTH_ROWS_CAP, DEPTH_ROWS_DEFAULT, DepthRow, MAX_SIGNALS_BYTES, OrderSourceSpec,
-    PreflightReport, RowError, SchemaFieldOut, TapeRole, TraceOverrides, TraceRequest,
-    TraceSummary, TradePoint, book_series, decimate_depth, depth_window, execute, load_depth_files,
-    load_depth_rows, load_live_tape_files, load_trade_rows, parquet_schema_fields, prepare,
+    BookTick, DEPTH_ROWS_CAP, DEPTH_ROWS_DEFAULT, DEPTH_SPAN_ROWS_CAP, DepthFilter, DepthRow,
+    MAX_SIGNALS_BYTES, OrderSourceSpec, PreflightReport, RowError, SchemaFieldOut, TapeRole,
+    TraceOverrides, TraceRequest, TraceSummary, TradePoint, book_series, decimate_depth,
+    depth_window, execute, load_depth_files, load_depth_rows, load_live_tape_files,
+    load_trade_rows, parquet_schema_fields, prepare, settle_depth_span, trades_in_window,
 };
 
 use tracing::{error, info, warn};
 
-use crate::api::{AppState, EventsQuery, paged_events};
+use crate::api::{AppState, EventsQuery, deduped_events, paged_events};
 use crate::metrics::Metrics;
 use crate::tape_cache::{LoadError, TapeCache};
 
@@ -83,7 +85,8 @@ pub struct CachedTape {
     pub trades: Vec<TradePoint>,
     pub books: Vec<BookTick>,
     pub depth: Vec<DepthRow>,
-    seen: Mutex<HashSet<String>>,
+    pub depth_filter: DepthFilter,
+    seen: Mutex<Option<HashSet<String>>>,
 }
 
 impl CachedTape {
@@ -105,6 +108,7 @@ pub struct TraceRuntime {
     pub metrics: Arc<Metrics>,
     tx: mpsc::Sender<String>,
     tapes: Arc<TapeCache<CachedTape>>,
+    spans: Mutex<HashMap<String, (u64, u64)>>,
     deleted: Mutex<HashSet<String>>,
 }
 
@@ -137,6 +141,7 @@ impl TraceRuntime {
             metrics,
             tx,
             tapes: TapeCache::new(TAPE_CACHE_ENTRIES),
+            spans: Mutex::new(HashMap::new()),
             deleted: Mutex::new(HashSet::new()),
         });
         for record in rt.list_records() {
@@ -163,16 +168,19 @@ impl TraceRuntime {
         let worker = rt.clone();
         std::thread::spawn(move || {
             while let Ok(trace_id) = rx.recv() {
-                if let Err(e) = worker.run_one(&trace_id) {
-                    error!(trace = %trace_id, error = %format!("{e:#}"), "trace failed");
-                    worker
-                        .metrics
-                        .inc("tracer_trace_jobs_total", &[("status", "failed")]);
-                    let _ = worker.update_record(&trace_id, |r| {
-                        r.status = "failed".into();
-                        r.terminal_ms = Some(wall_ms());
-                        r.error = Some(format!("{e:#}"));
-                    });
+                match worker.run_one(&trace_id) {
+                    Ok(()) => worker.warm_completed_live_tape(&trace_id),
+                    Err(e) => {
+                        error!(trace = %trace_id, error = %format!("{e:#}"), "trace failed");
+                        worker
+                            .metrics
+                            .inc("tracer_trace_jobs_total", &[("status", "failed")]);
+                        let _ = worker.update_record(&trace_id, |r| {
+                            r.status = "failed".into();
+                            r.terminal_ms = Some(wall_ms());
+                            r.error = Some(format!("{e:#}"));
+                        });
+                    }
                 }
             }
         });
@@ -223,6 +231,44 @@ impl TraceRuntime {
 
     fn drop_cached(&self, trace_id: &str) {
         self.tapes.remove(trace_id);
+        self.spans.lock().unwrap().remove(trace_id);
+    }
+
+    fn warm_completed_live_tape(self: &Arc<Self>, trace_id: &str) {
+        let Some(record) = self.read_record(trace_id) else {
+            return;
+        };
+        if record.status != "complete" || record.tape_source != "live" {
+            return;
+        }
+        let warm = self.clone();
+        std::thread::spawn(move || {
+            let _ = warm.tape(&record, Duration::ZERO);
+        });
+    }
+
+    fn depth_filter_for(&self, record: &TraceRecord) -> DepthFilter {
+        if record.tape_source != "live" {
+            return DepthFilter::All;
+        }
+        if record.trace_id == LIVE_ID || record.status != "complete" {
+            return DepthFilter::Nothing;
+        }
+        if let Some(&(lo, hi)) = self.spans.lock().unwrap().get(&record.trace_id) {
+            return DepthFilter::Within { lo, hi };
+        }
+        let ledger_dir = self.trace_dir(&record.trace_id).join("ledger");
+        let events = deduped_events(&ledger_dir);
+        match ledger_span(events.iter().map(|(_, _, e)| e), record.cross_window_ms) {
+            Some((lo, hi)) => {
+                self.spans
+                    .lock()
+                    .unwrap()
+                    .insert(record.trace_id.clone(), (lo, hi));
+                DepthFilter::Within { lo, hi }
+            }
+            None => DepthFilter::Nothing,
+        }
     }
 
     fn purge_dir(&self, trace_id: &str) {
@@ -418,6 +464,7 @@ impl TraceRuntime {
         record: &TraceRecord,
         budget: Duration,
     ) -> Result<Arc<CachedTape>, LoadError> {
+        let started = Instant::now();
         let (files, _) = self
             .tape_request_for(record)
             .map_err(|e| LoadError::Failed(format!("{e:#}")))?;
@@ -433,29 +480,87 @@ impl TraceRuntime {
             .collect();
         let key = record.trace_id.clone();
         let live = record.tape_source == "live";
+        let filter = self.depth_filter_for(record);
         let base = self.tapes.get(&key);
         if let Some(cached) = &base
             && cached.trades_files == trades_files
             && cached.books_files == books_files
+            && cached.depth_filter == filter
         {
             return Ok(cached.clone());
         }
         self.tapes.remove(&key);
-        let base = base.filter(|cached| live && cached.extends(&trades_files, &books_files));
+        let base = match base.filter(|cached| live && cached.extends(&trades_files, &books_files)) {
+            Some(cached) => TapeBase::Extend(cached),
+            None => self.live_seed(&key, live, &trades_files, &books_files),
+        };
+        let loaded = self.load_tape(
+            &key,
+            base,
+            trades_files.clone(),
+            books_files.clone(),
+            filter,
+            budget,
+        )?;
+        if loaded.depth_filter == filter {
+            return Ok(loaded);
+        }
+        self.tapes.remove(&key);
+        let base = if live && loaded.extends(&trades_files, &books_files) {
+            TapeBase::Extend(loaded)
+        } else {
+            TapeBase::Fresh
+        };
+        self.load_tape(
+            &key,
+            base,
+            trades_files,
+            books_files,
+            filter,
+            budget.saturating_sub(started.elapsed()),
+        )
+    }
+
+    fn live_seed(
+        &self,
+        key: &str,
+        live: bool,
+        trades_files: &[PathBuf],
+        books_files: &[PathBuf],
+    ) -> TapeBase {
+        if !live || key == LIVE_ID {
+            return TapeBase::Fresh;
+        }
+        match self.tapes.get(LIVE_ID) {
+            Some(cached) if cached.extends(trades_files, books_files) => TapeBase::Seed(cached),
+            _ => TapeBase::Fresh,
+        }
+    }
+
+    fn load_tape(
+        self: &Arc<Self>,
+        key: &str,
+        base: TapeBase,
+        trades_files: Vec<PathBuf>,
+        books_files: Vec<PathBuf>,
+        filter: DepthFilter,
+        budget: Duration,
+    ) -> Result<Arc<CachedTape>, LoadError> {
         let metrics = self.metrics.clone();
         let tapes = self.tapes.clone();
-        let log_key = key.clone();
-        let outcome = self.tapes.get_or_load(&key, budget, move || {
-            let incremental = base.is_some();
+        let log_key = key.to_owned();
+        let outcome = self.tapes.get_or_load(key, budget, move || {
+            let incremental = !matches!(base, TapeBase::Fresh);
             info!(
                 trace = %log_key,
                 trades_files = trades_files.len(),
                 books_files = books_files.len(),
                 incremental,
+                ?filter,
                 "tape load started"
             );
-            let started = std::time::Instant::now();
-            let result = build_tape(base, trades_files, books_files, !live);
+            let started = Instant::now();
+            let result = build_tape(base, trades_files, books_files, filter);
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             match &result {
                 Ok(tape) => {
@@ -499,18 +604,56 @@ impl TraceRuntime {
     }
 }
 
+pub fn ledger_span<'a>(
+    events: impl IntoIterator<Item = &'a Event>,
+    cross_window_ms: u64,
+) -> Option<(u64, u64)> {
+    let (lo, hi) = events.into_iter().fold(None, |span, e| {
+        let end = e.ts_ms.max(e.window_end_ms);
+        Some(match span {
+            None => (e.ts_ms, end),
+            Some((lo, hi)) => (e.ts_ms.min(lo), end.max(hi)),
+        })
+    })?;
+    Some((lo, hi.saturating_add(cross_window_ms)))
+}
+
+enum TapeBase {
+    Fresh,
+    Extend(Arc<CachedTape>),
+    Seed(Arc<CachedTape>),
+}
+
 fn build_tape(
-    base: Option<Arc<CachedTape>>,
+    base: TapeBase,
     trades_files: Vec<PathBuf>,
     books_files: Vec<PathBuf>,
-    with_depth: bool,
+    filter: DepthFilter,
 ) -> anyhow::Result<CachedTape> {
-    let (mut trades, mut books, mut depth, mut seen, trades_from, books_from) = match &base {
-        Some(cached) => (
+    let base = match base {
+        TapeBase::Fresh => None,
+        TapeBase::Extend(cached) => {
+            let seen = cached.seen.lock().unwrap().take();
+            seen.map(|seen| (cached, seen))
+        }
+        TapeBase::Seed(cached) => {
+            let seen = cached.seen.lock().unwrap().clone();
+            seen.map(|seen| (cached, seen))
+        }
+    };
+    let rebuild_depth = base
+        .as_ref()
+        .is_some_and(|(cached, _)| cached.depth_filter != filter);
+    let (mut trades, mut books, mut depth, mut seen, trades_from, books_from) = match base {
+        Some((cached, seen)) => (
             cached.trades.clone(),
             cached.books.clone(),
-            cached.depth.clone(),
-            std::mem::take(&mut *cached.seen.lock().unwrap()),
+            if rebuild_depth {
+                Vec::new()
+            } else {
+                cached.depth.clone()
+            },
+            seen,
             cached.trades_files.len(),
             cached.books_files.len(),
         ),
@@ -528,22 +671,31 @@ fn build_tape(
         trades.extend(load_trade_rows(&new_trades, &mut seen)?);
         trades.sort_by_key(|p| p.0);
     }
+    if rebuild_depth && filter != DepthFilter::Nothing {
+        let old_books: Vec<&Path> = books_files[..books_from]
+            .iter()
+            .map(PathBuf::as_path)
+            .collect();
+        depth = load_depth_files(&old_books, filter)?.1;
+    }
     if !new_books.is_empty() {
-        let (ticks, rows) = load_depth_files(&new_books, with_depth)?;
+        let (ticks, rows) = load_depth_files(&new_books, filter)?;
         books.extend(ticks);
         books.sort_by_key(|t| t.ts_ms);
         books.dedup_by_key(|t| t.ts_ms);
         depth.extend(rows);
-        depth.sort_by_key(|r| r.ts_ms);
-        depth.dedup_by_key(|r| r.ts_ms);
     }
+    depth.sort_by_key(|r| r.ts_ms);
+    depth.dedup_by_key(|r| r.ts_ms);
+    let depth = settle_depth_span(depth, filter, DEPTH_SPAN_ROWS_CAP);
     Ok(CachedTape {
         trades_files,
         books_files,
         trades,
         books,
         depth,
-        seen: Mutex::new(seen),
+        depth_filter: filter,
+        seen: Mutex::new(Some(seen)),
     })
 }
 
@@ -1310,10 +1462,30 @@ pub async fn trace_depth(
     })))
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TradesOrder {
+    Asc,
+    #[default]
+    Desc,
+}
+
 #[derive(serde::Deserialize)]
 pub struct TradesQuery {
     cursor: Option<usize>,
     limit: Option<usize>,
+    from: Option<u64>,
+    to: Option<u64>,
+    order: Option<TradesOrder>,
+}
+
+fn trade_json((ts_ms, px, sz, is_buy): &TradePoint) -> serde_json::Value {
+    serde_json::json!({
+        "ts_ms": ts_ms,
+        "px": px,
+        "sz": sz,
+        "side": if *is_buy { "buy" } else { "sell" },
+    })
 }
 
 pub async fn trace_trades(
@@ -1329,29 +1501,41 @@ pub async fn trace_trades(
         .map_err(tape_http_error)?;
     let limit = q.limit.unwrap_or(100).min(1000);
     let offset = q.cursor.unwrap_or(0);
-    let total = tape.trades.len();
-    let page: Vec<serde_json::Value> = tape
-        .trades
-        .iter()
-        .rev()
-        .skip(offset)
-        .take(limit)
-        .map(|(ts_ms, px, sz, is_buy)| {
-            serde_json::json!({
-                "ts_ms": ts_ms,
-                "px": px,
-                "sz": sz,
-                "side": if *is_buy { "buy" } else { "sell" },
-            })
-        })
-        .collect();
+    let order = q.order.unwrap_or_default();
+    let window = trades_in_window(&tape.trades, q.from, q.to);
+    let matched = window.len();
+    let page: Vec<serde_json::Value> = match order {
+        TradesOrder::Desc => window
+            .iter()
+            .rev()
+            .skip(offset)
+            .take(limit)
+            .map(trade_json)
+            .collect(),
+        TradesOrder::Asc => window
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(trade_json)
+            .collect(),
+    };
     let next = offset + page.len();
+    let next_cursor = (next < matched).then_some(next);
     Ok(Json(serde_json::json!({
         "schema": "tracer.tracetrades.v1",
         "trace_id": id,
-        "total": total,
+        "total": tape.trades.len(),
+        "matched": matched,
+        "order": match order {
+            TradesOrder::Asc => "asc",
+            TradesOrder::Desc => "desc",
+        },
         "trades": page,
-        "older_cursor": if next < total { Some(next) } else { None },
+        "next_cursor": next_cursor,
+        "older_cursor": match order {
+            TradesOrder::Desc => next_cursor,
+            TradesOrder::Asc => None,
+        },
     })))
 }
 

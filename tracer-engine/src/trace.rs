@@ -1081,12 +1081,23 @@ pub fn load_trade_rows(
         .collect())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepthFilter {
+    All,
+    Nothing,
+    Within { lo: u64, hi: u64 },
+}
+
+pub const DEPTH_SPAN_ROWS_CAP: usize = 100_000;
+
 pub fn load_depth_files(
     paths: &[&Path],
-    with_depth: bool,
+    filter: DepthFilter,
 ) -> anyhow::Result<(Vec<BookTick>, Vec<DepthRow>)> {
     let mut ticks: Vec<BookTick> = Vec::new();
     let mut rows: Vec<DepthRow> = Vec::new();
+    let mut prior: Option<DepthRow> = None;
+    let mut span = SpanSampler::new(DEPTH_SPAN_ROWS_CAP - 1);
     for path in paths {
         expect_schema(path, TapeRole::Orderbook)?;
         let data = read_ob_parquet(path, OrderbookTarget::Snapshot)
@@ -1094,23 +1105,125 @@ pub fn load_depth_files(
         let OrderbookTargetData::Snapshot(books) = data else {
             anyhow::bail!("{}: not an orderbook snapshot parquet", path.display());
         };
-        for ob in &books {
+        let mut file_prior: Option<(u64, usize)> = None;
+        let mut file_last: Option<usize> = None;
+        for (idx, ob) in books.iter().enumerate() {
             let ts_ms = ob.effective_ts_us() / 1_000;
             ticks.push(BookTick {
                 ts_ms,
                 bid_px: ob.bids.last_key_value().and_then(|(px, _)| px.to_f64()),
                 ask_px: ob.asks.first_key_value().and_then(|(px, _)| px.to_f64()),
             });
-            if with_depth {
-                rows.push(depth_row(ts_ms, ob));
+            match filter {
+                DepthFilter::All => rows.push(depth_row(ts_ms, ob)),
+                DepthFilter::Nothing => {}
+                DepthFilter::Within { lo, hi } => {
+                    if ts_ms < lo {
+                        if file_prior.is_none_or(|(best, _)| ts_ms > best) {
+                            file_prior = Some((ts_ms, idx));
+                        }
+                    } else if ts_ms <= hi {
+                        span.offer(|| depth_row(ts_ms, ob));
+                        file_last = Some(idx);
+                    }
+                }
             }
         }
+        if let Some(idx) = file_last {
+            let ob = &books[idx];
+            span.keep_last(|| depth_row(ob.effective_ts_us() / 1_000, ob));
+        }
+        if let Some((ts_ms, idx)) = file_prior
+            && prior.as_ref().is_none_or(|p| ts_ms > p.ts_ms)
+        {
+            prior = Some(depth_row(ts_ms, &books[idx]));
+        }
     }
+    rows.extend(span.finish());
+    rows.extend(prior);
     ticks.sort_by_key(|t| t.ts_ms);
     ticks.dedup_by_key(|t| t.ts_ms);
     rows.sort_by_key(|r| r.ts_ms);
     rows.dedup_by_key(|r| r.ts_ms);
     Ok((ticks, rows))
+}
+
+pub fn settle_depth_span(rows: Vec<DepthRow>, filter: DepthFilter, cap: usize) -> Vec<DepthRow> {
+    let DepthFilter::Within { lo, hi } = filter else {
+        return rows;
+    };
+    let mut rows = rows;
+    rows.retain(|r| r.ts_ms <= hi);
+    let first_in_span = rows.partition_point(|r| r.ts_ms < lo);
+    rows.drain(..first_in_span.saturating_sub(1));
+    cap_depth_rows(rows, cap)
+}
+
+fn cap_depth_rows(rows: Vec<DepthRow>, cap: usize) -> Vec<DepthRow> {
+    let cap = cap.max(2);
+    if rows.len() <= cap {
+        return rows;
+    }
+    let last = rows.len() - 1;
+    let stride = last.div_ceil(cap - 1);
+    rows.into_iter()
+        .enumerate()
+        .filter(|(i, _)| i.is_multiple_of(stride) || *i == last)
+        .map(|(_, r)| r)
+        .collect()
+}
+
+struct SpanSampler {
+    cap: usize,
+    stride: usize,
+    offered: usize,
+    kept: Vec<(usize, DepthRow)>,
+    tail: Option<(usize, DepthRow)>,
+}
+
+impl SpanSampler {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(2),
+            stride: 1,
+            offered: 0,
+            kept: Vec::new(),
+            tail: None,
+        }
+    }
+
+    fn offer(&mut self, make: impl FnOnce() -> DepthRow) {
+        let index = self.offered;
+        self.offered += 1;
+        if !index.is_multiple_of(self.stride) {
+            return;
+        }
+        self.kept.push((index, make()));
+        if self.kept.len() >= self.cap {
+            self.stride *= 2;
+            let stride = self.stride;
+            self.kept.retain(|(i, _)| i.is_multiple_of(stride));
+        }
+    }
+
+    fn keep_last(&mut self, make: impl FnOnce() -> DepthRow) {
+        let Some(last) = self.offered.checked_sub(1) else {
+            return;
+        };
+        if self.kept.last().is_none_or(|(i, _)| *i != last) {
+            self.tail = Some((last, make()));
+        }
+    }
+
+    fn finish(self) -> Vec<DepthRow> {
+        let last = self.offered.checked_sub(1);
+        let tail = self.tail.filter(|(i, _)| Some(*i) == last);
+        self.kept
+            .into_iter()
+            .chain(tail)
+            .map(|(_, row)| row)
+            .collect()
+    }
 }
 
 fn depth_row(ts_ms: u64, ob: &aetelier_types::orderbooks::core::Orderbook) -> DepthRow {
@@ -1145,6 +1258,18 @@ pub fn depth_window(rows: &[DepthRow], t0: Option<u64>, t1: Option<u64>) -> &[De
     let start = rows.partition_point(|r| r.ts_ms < lo);
     let end = rows.partition_point(|r| r.ts_ms <= hi);
     &rows[start..end.max(start)]
+}
+
+pub fn trades_in_window(
+    trades: &[TradePoint],
+    from: Option<u64>,
+    to: Option<u64>,
+) -> &[TradePoint] {
+    let lo = from.unwrap_or(0);
+    let hi = to.unwrap_or(u64::MAX);
+    let start = trades.partition_point(|t| t.0 < lo);
+    let end = trades.partition_point(|t| t.0 <= hi);
+    &trades[start..end.max(start)]
 }
 
 pub const DEPTH_LEVELS: usize = 10;
@@ -1279,5 +1404,122 @@ mod depth_tests {
         assert_eq!(depth_window(&rows, Some(5_000), None).len(), 0);
         assert_eq!(depth_window(&rows, None, Some(0)).len(), 1);
         assert!(depth_window(&[], Some(1), Some(2)).is_empty());
+    }
+
+    #[test]
+    fn span_cap_bounds_rows_and_keeps_first_and_last() {
+        let rows: Vec<DepthRow> = (0..1_000).map(|i| row(i * 10)).collect();
+        let filter = DepthFilter::Within { lo: 0, hi: 9_990 };
+
+        for cap in [2, 3, 7, 10, 999] {
+            let out = settle_depth_span(rows.clone(), filter, cap);
+            assert!(out.len() <= cap, "cap {cap} got {}", out.len());
+            assert_eq!(out.first().unwrap().ts_ms, 0);
+            assert_eq!(out.last().unwrap().ts_ms, 9_990);
+            assert!(out.windows(2).all(|p| p[0].ts_ms < p[1].ts_ms));
+        }
+        assert_eq!(settle_depth_span(rows.clone(), filter, 1_000).len(), 1_000);
+    }
+
+    #[test]
+    fn span_cap_leaves_all_and_nothing_untouched() {
+        let rows: Vec<DepthRow> = (0..50).map(|i| row(i * 10)).collect();
+
+        assert_eq!(
+            settle_depth_span(rows.clone(), DepthFilter::All, 3).len(),
+            50
+        );
+        assert_eq!(
+            settle_depth_span(rows.clone(), DepthFilter::Nothing, 3).len(),
+            50
+        );
+    }
+
+    #[test]
+    fn span_settling_keeps_only_the_latest_prior_row_and_drops_rows_past_hi() {
+        let rows: Vec<DepthRow> = (0..10).map(|i| row(i * 100)).collect();
+        let out = settle_depth_span(
+            rows,
+            DepthFilter::Within { lo: 350, hi: 600 },
+            DEPTH_SPAN_ROWS_CAP,
+        );
+        let ts: Vec<u64> = out.iter().map(|r| r.ts_ms).collect();
+        assert_eq!(ts, [300, 400, 500, 600]);
+
+        let none_prior = settle_depth_span(
+            (5..8).map(|i| row(i * 100)).collect(),
+            DepthFilter::Within { lo: 500, hi: 600 },
+            DEPTH_SPAN_ROWS_CAP,
+        );
+        assert_eq!(none_prior.len(), 2);
+        assert_eq!(none_prior[0].ts_ms, 500);
+    }
+
+    #[test]
+    fn span_sampler_streams_within_the_cap_and_keeps_first_and_last() {
+        for (n, cap) in [
+            (1_000u64, 10usize),
+            (1_001, 10),
+            (37, 5),
+            (5, 10),
+            (2, 2),
+            (999, 2),
+        ] {
+            let mut sampler = SpanSampler::new(cap);
+            let mut peak = 0;
+            for i in 0..n {
+                sampler.offer(|| row(i * 10));
+                peak = peak.max(sampler.kept.len());
+                if i % 100 == 99 {
+                    sampler.keep_last(|| row(i * 10));
+                }
+            }
+            sampler.keep_last(|| row((n - 1) * 10));
+            let out = sampler.finish();
+
+            assert!(peak < cap, "n {n} cap {cap} peak {peak}");
+            assert!(out.len() <= cap, "n {n} cap {cap} got {}", out.len());
+            assert_eq!(out.first().unwrap().ts_ms, 0);
+            assert_eq!(out.last().unwrap().ts_ms, (n - 1) * 10);
+            assert!(out.windows(2).all(|p| p[0].ts_ms < p[1].ts_ms));
+            let gaps: Vec<u64> = out[..out.len() - 1]
+                .windows(2)
+                .map(|p| p[1].ts_ms - p[0].ts_ms)
+                .collect();
+            assert!(gaps.windows(2).all(|g| g[0] == g[1]), "n {n} cap {cap}");
+        }
+    }
+
+    #[test]
+    fn span_sampler_keeps_everything_under_the_cap() {
+        let mut sampler = SpanSampler::new(100);
+        for i in 0..50 {
+            sampler.offer(|| row(i));
+        }
+        sampler.keep_last(|| row(49));
+
+        assert_eq!(sampler.finish().len(), 50);
+        assert!(SpanSampler::new(10).finish().is_empty());
+    }
+
+    fn trade(ts_ms: u64) -> TradePoint {
+        (ts_ms, 100.0, 1.0, true)
+    }
+
+    #[test]
+    fn trades_window_is_inclusive_and_empty_when_inverted() {
+        let trades: Vec<TradePoint> = [10, 20, 20, 30, 40].into_iter().map(trade).collect();
+
+        let ts = |w: &[TradePoint]| w.iter().map(|t| t.0).collect::<Vec<u64>>();
+        assert_eq!(
+            ts(trades_in_window(&trades, Some(20), Some(30))),
+            [20, 20, 30]
+        );
+        assert_eq!(trades_in_window(&trades, None, None).len(), 5);
+        assert_eq!(ts(trades_in_window(&trades, None, Some(10))), [10]);
+        assert_eq!(ts(trades_in_window(&trades, Some(40), None)), [40]);
+        assert!(trades_in_window(&trades, Some(31), Some(39)).is_empty());
+        assert!(trades_in_window(&trades, Some(30), Some(20)).is_empty());
+        assert!(trades_in_window(&[], Some(1), Some(2)).is_empty());
     }
 }
