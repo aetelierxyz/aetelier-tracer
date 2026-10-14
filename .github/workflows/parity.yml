@@ -7,15 +7,57 @@ permissions:
   contents: read
 
 jobs:
+  host-mounts:
+    name: the export and the frozen replay must exist on the runner host
+    runs-on: [self-hosted, linux-amd64]
+    env:
+      FILLS_DIR: ${{ vars.TRACER_FILLS_DIR }}
+      REPLAY_DIR: ${{ vars.TRACER_REPLAY_DIR }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: repository variables name absolute host directories holding the inputs
+        run: |
+          set -euo pipefail
+          for var in FILLS_DIR REPLAY_DIR; do
+            dir="${!var}"
+            if [ -z "$dir" ]; then
+              echo "::error::repository variable TRACER_$var is unset"
+              exit 1
+            fi
+            if [ "${dir:0:1}" != "/" ]; then
+              echo "::error::repository variable TRACER_$var=$dir is not an absolute path"
+              exit 1
+            fi
+            if [ ! -d "$dir" ]; then
+              echo "::error::TRACER_$var=$dir does not exist on the runner host"
+              exit 1
+            fi
+          done
+          if [ -z "$(ls -A "$FILLS_DIR")" ]; then
+            echo "::error::TRACER_FILLS_DIR=$FILLS_DIR is empty on the runner host"
+            exit 1
+          fi
+          for f in corrected_ledger.json fillrates.json; do
+            if [ ! -s "$REPLAY_DIR/$f" ]; then
+              echo "::error::TRACER_REPLAY_DIR=$REPLAY_DIR has no non-empty $f on the runner host"
+              exit 1
+            fi
+          done
+
   full-gates:
     name: full parity gates over the private study export
+    needs: host-mounts
     runs-on: [self-hosted, linux-amd64]
     container:
       image: rust:1.99-bookworm
       volumes:
         - ${{ vars.TRACER_FILLS_DIR }}:/fills:ro
+        - ${{ vars.TRACER_REPLAY_DIR }}:/replay:ro
     env:
       TRACER_FILLS_DIR: /fills
+      TRACER_REPLAY_DIR: /replay
       CARGO_TERM_COLOR: always
     defaults:
       run:
@@ -23,11 +65,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: the export must be mounted
+      - name: the frozen replay must match fixtures/frozen_replay.sha256
         run: |
           set -euo pipefail
-          if [ ! -d /fills ] || [ -z "$(ls -A /fills)" ]; then
-            echo "::error::TRACER_FILLS_DIR repository variable unset or the directory is empty"
+          if ! (cd /replay && sha256sum --strict -c "$GITHUB_WORKSPACE/fixtures/frozen_replay.sha256"); then
+            echo "::error::/replay (TRACER_REPLAY_DIR) does not match fixtures/frozen_replay.sha256"
             exit 1
           fi
 
