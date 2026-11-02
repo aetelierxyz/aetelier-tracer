@@ -69,8 +69,6 @@ enum Command {
         max_traces_per_user: usize,
         #[arg(long, env = "TRACER_TAPE_RETENTION_MS", default_value_t = traces::DEFAULT_TAPE_RETENTION_MS)]
         tape_retention_ms: u64,
-        #[arg(long, env = "KAFKA_BROKERS")]
-        kafka_brokers: Option<String>,
     },
     Replay {
         #[arg(long, env = "TRACER_FILLS_DIR")]
@@ -170,11 +168,9 @@ async fn run_live(
     traces_dir: Option<PathBuf>,
     max_traces_per_user: usize,
     tape_retention_ms: u64,
-    kafka_brokers: Option<String>,
 ) -> anyhow::Result<()> {
     let params = TracerParams::load(&params_path)?;
     let stem = symbol.replace(':', "_");
-    let _ = kafka_brokers;
     let metrics = Metrics::shared();
     let traces_rt = traces_dir
         .map(|dir| {
@@ -372,6 +368,7 @@ fn run_replay(
     println!("paper trades: {}", trades.len());
     let verdicts = evaluate(&trades, &data, &params, grace_ms, cross_window_ms)?;
     write_artifacts(&verdicts, &params, grace_ms, cross_window_ms, out)?;
+    stash_params(params_path, out)?;
     let mut writer = LedgerWriter::new(&out.join("ledger"))?;
     emit_events(&verdicts, &params, grace_ms, &mut writer)?;
     let entry_through = verdicts
@@ -386,7 +383,7 @@ fn run_replay(
         writer.events_written
     );
     println!(
-        "artifacts: {}/corrected_ledger.json, fillrates.json, ledger/",
+        "artifacts: {}/corrected_ledger.json, fillrates.json, tracer_params.v1.json, ledger/",
         out.display()
     );
     Ok(())
@@ -448,12 +445,17 @@ fn run_evaluate(
             let summary = execute(&prepared, grace_ms, cross_window_ms, out)?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
             println!(
-                "artifacts: {}/corrected_ledger.json, fillrates.json, ledger/",
+                "artifacts: {}/corrected_ledger.json, fillrates.json, tracer_params.v1.json, ledger/",
                 out.display()
             );
             Ok(())
         }
     }
+}
+
+fn stash_params(params_path: &std::path::Path, out: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::copy(params_path, out.join(tracer_engine::params::ARTIFACT_FILE))?;
+    Ok(())
 }
 
 fn export_golden(
@@ -517,7 +519,6 @@ async fn main() -> anyhow::Result<()> {
             traces_dir,
             max_traces_per_user,
             tape_retention_ms,
-            kafka_brokers,
         } => {
             run_live(
                 symbol,
@@ -535,7 +536,6 @@ async fn main() -> anyhow::Result<()> {
                 traces_dir,
                 max_traces_per_user,
                 tape_retention_ms,
-                kafka_brokers,
             )
             .await
         }
@@ -648,6 +648,22 @@ mod tests {
     #[test]
     fn cli_definition_is_consistent() {
         super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn stash_params_copies_the_frozen_file_byte_for_byte() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../params/tracer_params.v1.json");
+        let out = std::env::temp_dir().join("tracerd_stash_params");
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+
+        stash_params(&src, &out).unwrap();
+
+        assert_eq!(
+            std::fs::read(out.join("tracer_params.v1.json")).unwrap(),
+            std::fs::read(&src).unwrap()
+        );
     }
 
     #[test]

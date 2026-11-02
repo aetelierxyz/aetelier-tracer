@@ -568,6 +568,10 @@ pub fn write_artifacts_stamped(
         out_dir.join("fillrates.json"),
         serde_json::to_string_pretty(&fillrates)? + "\n",
     )?;
+    std::fs::write(
+        out_dir.join(crate::params::ARTIFACT_FILE),
+        serde_json::to_string_pretty(params)? + "\n",
+    )?;
     Ok(())
 }
 
@@ -956,6 +960,12 @@ mod tests {
             .map(|c| c["posted"].as_u64().unwrap())
             .sum();
         assert_eq!(posted, 4);
+
+        let written = TracerParams::load(&out.join(crate::params::ARTIFACT_FILE)).unwrap();
+        assert_eq!(written.hold_ms, params.hold_ms);
+        assert_eq!(written.notional_usd, params.notional_usd);
+        assert_eq!(written.input_sha256, params.input_sha256);
+        assert_eq!(written.symbols.len(), params.symbols.len());
 
         let mut writer = LedgerWriter::new(&out.join("ledger")).unwrap();
         emit_events(&v, &params, DEFAULT_GRACE_MS, &mut writer).unwrap();

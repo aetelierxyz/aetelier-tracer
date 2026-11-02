@@ -1984,16 +1984,21 @@ async fn artifacts_list_and_download_byte_exact_files() {
         .map(|a| a["name"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(
-        &names[..3],
-        ["trace.json", "corrected_ledger.json", "fillrates.json"]
+        &names[..4],
+        [
+            "trace.json",
+            "corrected_ledger.json",
+            "fillrates.json",
+            "tracer_params.v1.json"
+        ]
     );
     assert!(
-        names[3..]
+        names[4..]
             .iter()
             .all(|n| n.starts_with("ledger/events_") && n.ends_with(".jsonl")),
         "{names:?}"
     );
-    assert!(names.len() >= 4, "{names:?}");
+    assert!(names.len() >= 5, "{names:?}");
 
     for artifact in listing["artifacts"].as_array().unwrap() {
         let name = artifact["name"].as_str().unwrap();

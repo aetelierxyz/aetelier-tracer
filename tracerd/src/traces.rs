@@ -13,7 +13,7 @@ use sha2::Digest;
 use tracer_engine::ledger::Event;
 use tracer_engine::market_engine::read_gap_spans;
 use tracer_engine::market_engine::{GapSpan, tape_files_sorted};
-use tracer_engine::params::TracerParams;
+use tracer_engine::params::{ARTIFACT_FILE, TracerParams};
 use tracer_engine::trace::{
     BookTick, DEPTH_ROWS_CAP, DEPTH_ROWS_DEFAULT, DEPTH_SPAN_ROWS_CAP, DepthFilter, DepthRow,
     MAX_SIGNALS_BYTES, OrderSourceSpec, PreflightReport, RowError, SchemaFieldOut, TapeRole,
@@ -1169,11 +1169,16 @@ pub struct ArtifactsQuery {
 }
 
 fn artifact_names(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = ["trace.json", "corrected_ledger.json", "fillrates.json"]
-        .into_iter()
-        .filter(|name| dir.join(name).is_file())
-        .map(str::to_owned)
-        .collect();
+    let mut names: Vec<String> = [
+        "trace.json",
+        "corrected_ledger.json",
+        "fillrates.json",
+        ARTIFACT_FILE,
+    ]
+    .into_iter()
+    .filter(|name| dir.join(name).is_file())
+    .map(str::to_owned)
+    .collect();
     let mut ledger: Vec<String> = std::fs::read_dir(dir.join("ledger"))
         .map(|entries| {
             entries

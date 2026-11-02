@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const SCHEMA: &str = "tracer.params.v1";
+pub const ARTIFACT_FILE: &str = "tracer_params.v1.json";
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -86,6 +87,17 @@ mod tests {
         assert_eq!(tsla.taker_fee_leg_bps, 1.044);
         let iren = p.symbol("para_IREN").unwrap();
         assert!(iren.maker_fee_leg_bps > 0.0);
+    }
+
+    #[test]
+    fn committed_artifact_round_trips_without_loss() {
+        let path = committed_artifact();
+        let p = TracerParams::load(&path).unwrap();
+        let rendered = serde_json::to_string_pretty(&p).unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let original: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(reparsed, original);
     }
 
     #[test]

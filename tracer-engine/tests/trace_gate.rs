@@ -334,7 +334,11 @@ fn mini_signals_trace_reproduces_replay_artifacts_modulo_provenance() {
     .unwrap();
     assert_eq!(summary.n_signals, w.replay_trades.len());
 
-    for name in ["corrected_ledger.json", "fillrates.json"] {
+    for name in [
+        "corrected_ledger.json",
+        "fillrates.json",
+        "tracer_params.v1.json",
+    ] {
         assert_eq!(
             artifact_norm(&trace_out.join(name)),
             artifact_norm(&w.replay_out.join(name)),
@@ -372,6 +376,16 @@ fn trace_artifacts_carry_trace_stamps() {
     let sha = ledger["input_sha256"].as_object().unwrap();
     assert!(sha.keys().any(|k| k.starts_with("trades/")));
     assert!(sha.keys().any(|k| k.starts_with("signals/")));
+    let params = TracerParams::load(&trace_out.join("tracer_params.v1.json")).unwrap();
+    assert_eq!(
+        params.input_sha256,
+        ledger["input_sha256"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()))
+            .collect()
+    );
 
     let events = events_norm(&trace_out.join("ledger"));
     assert!(!events.is_empty());
