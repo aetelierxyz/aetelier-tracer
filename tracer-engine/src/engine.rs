@@ -17,6 +17,7 @@ use crate::verdict::{MakerSide, first_opposite_trade, scan_maker};
 
 pub const WATERMARK_SLACK_MS: u64 = 2_000;
 pub const DEFAULT_IDLE_AFTER_MS: u64 = 30_000;
+pub const DEFAULT_BOOKS_STALL_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Clone, Debug)]
 pub struct LiveConfig {
@@ -25,6 +26,7 @@ pub struct LiveConfig {
     pub cross_window_ms: u64,
     pub queue_verdicts: bool,
     pub idle_after_ms: u64,
+    pub books_stall_ms: u64,
 }
 
 struct SignalState {
@@ -136,6 +138,7 @@ pub struct EngineCounters {
     pub book_degraded: u64,
     pub duplicates_dropped: u64,
     pub paper_exit_unpriced: u64,
+    pub books_degraded_episodes: u64,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -161,6 +164,7 @@ pub struct EngineStatus {
     pub trades: StreamStatus,
     pub books: Option<StreamStatus>,
     pub merged_watermark_ms: u64,
+    pub books_degraded: bool,
     pub idle: bool,
     pub session: String,
     pub verdict_trail_ms: u64,
@@ -212,6 +216,8 @@ pub struct LiveEngine {
     last_advance_wall_ms: u64,
     trades_last_advance_wall_ms: u64,
     books_last_advance_wall_ms: u64,
+    books_degraded: bool,
+    merged_wm_ms: u64,
     ready: bool,
 }
 
@@ -265,6 +271,8 @@ impl LiveEngine {
             last_advance_wall_ms: 0,
             trades_last_advance_wall_ms: 0,
             books_last_advance_wall_ms: 0,
+            books_degraded: false,
+            merged_wm_ms: 0,
             ready: false,
             params,
             cfg,
@@ -272,10 +280,29 @@ impl LiveEngine {
     }
 
     pub fn merged_watermark_ms(&self) -> u64 {
+        self.merged_wm_ms.max(self.stream_watermark_ms())
+    }
+
+    fn stream_watermark_ms(&self) -> u64 {
+        let trades = self.trades_tail.tail.watermark_ms;
         match &self.books_tail {
-            Some(b) => self.trades_tail.tail.watermark_ms.min(b.tail.watermark_ms),
-            None => self.trades_tail.tail.watermark_ms,
+            Some(b) if !self.books_degraded => trades.min(b.tail.watermark_ms),
+            _ => trades,
         }
+    }
+
+    fn update_books_degraded(&mut self, wall_ms: u64) {
+        let Some(b) = self.books_tail.as_ref() else {
+            self.books_degraded = false;
+            return;
+        };
+        let lagging = b.tail.watermark_ms < self.trades_tail.tail.watermark_ms;
+        let stalled_for = wall_ms.saturating_sub(self.books_last_advance_wall_ms);
+        let degraded = self.ready && lagging && stalled_for > self.cfg.books_stall_ms;
+        if degraded && !self.books_degraded {
+            self.counters.books_degraded_episodes += 1;
+        }
+        self.books_degraded = degraded;
     }
 
     fn stream_status(
@@ -315,6 +342,7 @@ impl LiveEngine {
             symbol: self.cfg.symbol_stem.clone(),
             queue_verdicts: self.cfg.queue_verdicts,
             merged_watermark_ms: self.merged_watermark_ms(),
+            books_degraded: self.books_degraded,
             idle: self.ready
                 && wall_ms.saturating_sub(self.last_advance_wall_ms) > self.cfg.idle_after_ms,
             session: regime_label(wall_ms).into(),
@@ -797,21 +825,26 @@ impl LiveEngine {
         self.trades.extend(new_trades);
         self.trades
             .sort_by(|a, b| (a.ts_ms, &a.id).cmp(&(b.ts_ms, &b.id)));
+        self.update_books_degraded(wall_ms);
         let wm = self.merged_watermark_ms();
+        self.merged_wm_ms = wm;
         if wm > wm_before || !self.ready {
             self.last_advance_wall_ms = wall_ms;
         }
         self.finalize_entries(wm);
         self.finalize_exits(wm);
-        let retention_ms = self.params.hold_ms
-            + self.cfg.grace_ms
-            + self.cfg.cross_window_ms
-            + 10 * WATERMARK_SLACK_MS;
+        let retention_ms = self
+            .params
+            .hold_ms
+            .saturating_add(self.cfg.grace_ms)
+            .saturating_add(self.cfg.cross_window_ms)
+            .saturating_add(10 * WATERMARK_SLACK_MS);
         let cutoff = wm.saturating_sub(retention_ms);
         self.trades.retain(|p| p.ts_ms >= cutoff);
         self.trades_tail.prune_ids(cutoff);
         if let Some(b) = self.books_tail.as_mut() {
-            b.prune(cutoff);
+            let books_cutoff = b.tail.watermark_ms.min(wm).saturating_sub(retention_ms);
+            b.prune(books_cutoff);
         }
         self.recent_bars.retain(|b| b.close_ms >= cutoff);
         self.ready = true;
@@ -895,6 +928,7 @@ mod tests {
             cross_window_ms: 10_000,
             queue_verdicts: false,
             idle_after_ms: 5_000,
+            books_stall_ms: 60_000,
         }
     }
 
@@ -956,6 +990,48 @@ mod tests {
             .map(|e| e["kind"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(kinds, vec!["POSTED".to_string()]);
+    }
+
+    #[test]
+    fn a_stalled_books_stream_degrades_so_trades_finalize_and_prune() {
+        let (binding, ledger) = fixture("books_stall");
+        let dir = binding.join("hyperliquid/perpetual/trades");
+        let books_root = binding.parent().unwrap().join("books_binding");
+        std::fs::create_dir_all(books_root.join("hyperliquid/perpetual/orderbooks")).unwrap();
+        write_trades_parquet(&preamble_and_burst(), &dir.join("a.parquet")).unwrap();
+        let mut eng =
+            LiveEngine::new(test_params(), cfg(), &binding, Some(&books_root), &ledger).unwrap();
+        eng.tick(1_000).unwrap();
+        assert_eq!(eng.counters.posted, 1);
+
+        write_trades_parquet(
+            &[
+                trade(20_000, 99.0, 1.0, false, "thru"),
+                trade(73_000, 100.0, 0.1, true, "wm73"),
+            ],
+            &dir.join("b.parquet"),
+        )
+        .unwrap();
+        eng.tick(2_000).unwrap();
+        assert!(!eng.status(2_000).books_degraded);
+        assert_eq!(eng.merged_watermark_ms(), 0);
+        assert_eq!(eng.counters.entry_filled_through, 0);
+
+        eng.tick(62_000).unwrap();
+        assert!(eng.status(62_000).books_degraded);
+        assert_eq!(eng.counters.books_degraded_episodes, 1);
+        assert_eq!(eng.merged_watermark_ms(), 73_000);
+        assert_eq!(eng.counters.entry_filled_through, 1);
+
+        let far = 10_000_000;
+        write_trades_parquet(
+            &[trade(far, 100.0, 0.1, true, "far")],
+            &dir.join("c.parquet"),
+        )
+        .unwrap();
+        eng.tick(far).unwrap();
+        assert_eq!(eng.merged_watermark_ms(), far);
+        assert!(eng.trades.iter().all(|t| t.ts_ms > 73_000));
     }
 
     #[test]
