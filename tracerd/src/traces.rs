@@ -46,6 +46,7 @@ pub const TAPE_LOAD_WAIT_MS: u64 = 20_000;
 pub const TAPE_RETRY_AFTER_S: &str = "2";
 pub const LIST_LIMIT_DEFAULT: usize = 100;
 pub const LIST_LIMIT_MAX: usize = 500;
+pub const CONFIG_PART_CAP: usize = 64 * 1024;
 pub const OWNER_ID_MAX_LEN: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1009,6 +1010,69 @@ fn bad_request(reason: String) -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+fn over_cap(filename: &str, cap: u64) -> (StatusCode, Json<serde_json::Value>) {
+    rejection(&PreflightReport {
+        schema: tracer_engine::trace::PREFLIGHT_SCHEMA,
+        span: None,
+        files: vec![],
+        signal_rows: 0,
+        row_errors: vec![RowError {
+            row: 0,
+            field: format!("file:{filename}"),
+            reason: format!("exceeds cap {cap} bytes"),
+        }],
+    })
+}
+
+async fn read_config_part(
+    mut field: axum::extract::multipart::Field<'_>,
+) -> Result<TraceConfigIn, (StatusCode, Json<serde_json::Value>)> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| bad_request(format!("config part: {e}")))?
+    {
+        if buf.len() + chunk.len() > CONFIG_PART_CAP {
+            return Err(bad_request(format!(
+                "config part exceeds {CONFIG_PART_CAP} bytes"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf).map_err(|e| bad_request(format!("config json: {e}")))
+}
+
+async fn stream_part_to_file(
+    mut field: axum::extract::multipart::Field<'_>,
+    path: &Path,
+    filename: &str,
+    cap: u64,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    use tokio::io::AsyncWriteExt;
+    let name = field.name().unwrap_or_default().to_string();
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|e| bad_request(format!("{name} write: {e}")))?;
+    let mut written: u64 = 0;
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| bad_request(format!("{name} part: {e}")))?
+    {
+        written += chunk.len() as u64;
+        if written > cap {
+            return Err(over_cap(filename, cap));
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| bad_request(format!("{name} write: {e}")))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| bad_request(format!("{name} write: {e}")))
+}
+
 fn rejection(report: &PreflightReport) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -1038,6 +1102,7 @@ async fn stage_upload(
         files: Vec::new(),
     };
     let mut config: Option<TraceConfigIn> = None;
+    let mut seen: HashSet<String> = HashSet::new();
     loop {
         let field = match multipart.next_field().await {
             Ok(Some(f)) => f,
@@ -1045,16 +1110,12 @@ async fn stage_upload(
             Err(e) => return Err(bad_request(format!("multipart: {e}"))),
         };
         let name = field.name().unwrap_or_default().to_string();
+        if !seen.insert(name.clone()) {
+            return Err(bad_request(format!("repeated part {name:?}")));
+        }
         match name.as_str() {
             "config" => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| bad_request(format!("config part: {e}")))?;
-                config = Some(
-                    serde_json::from_str(&text)
-                        .map_err(|e| bad_request(format!("config json: {e}")))?,
-                );
+                config = Some(read_config_part(field).await?);
             }
             "orderbook" | "trades" | "signals" => {
                 let ext = if name == "signals" { "csv" } else { "parquet" };
@@ -1068,26 +1129,8 @@ async fn stage_upload(
                     "trades" => tracer_engine::trace::tape_cap(TapeRole::Trades),
                     _ => tracer_engine::trace::tape_cap(TapeRole::Orderbook),
                 };
-                let bytes = field
-                    .bytes()
-                    .await
-                    .map_err(|e| bad_request(format!("{name} part: {e}")))?;
-                if bytes.len() as u64 > cap {
-                    return Err(rejection(&PreflightReport {
-                        schema: tracer_engine::trace::PREFLIGHT_SCHEMA,
-                        span: None,
-                        files: vec![],
-                        signal_rows: 0,
-                        row_errors: vec![RowError {
-                            row: 0,
-                            field: format!("file:{filename}"),
-                            reason: format!("{} bytes exceeds cap {cap}", bytes.len()),
-                        }],
-                    }));
-                }
                 let path = dir.join(format!("{name}__{filename}"));
-                std::fs::write(&path, &bytes)
-                    .map_err(|e| bad_request(format!("{name} write: {e}")))?;
+                stream_part_to_file(field, &path, &filename, cap).await?;
                 staged.files.push((name, path));
             }
             other => return Err(bad_request(format!("unknown part {other:?}"))),

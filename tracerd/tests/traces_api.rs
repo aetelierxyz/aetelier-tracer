@@ -562,6 +562,114 @@ async fn heavy_routes_answer_busy_while_light_routes_keep_serving() {
     }
 }
 
+async fn post_raw(w: &World, body: Vec<u8>) -> (axum::http::StatusCode, serde_json::Value) {
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/tracer/traces")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .header("x-aetelier-user", OWNER)
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let resp = app(w).oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+fn part(name: &str, filename: Option<&str>, data: &[u8]) -> Vec<u8> {
+    let disposition = match filename {
+        Some(f) => format!("form-data; name=\"{name}\"; filename=\"{f}\""),
+        None => format!("form-data; name=\"{name}\""),
+    };
+    let mut out =
+        format!("--{BOUNDARY}\r\nContent-Disposition: {disposition}\r\n\r\n").into_bytes();
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+fn close_body(mut body: Vec<u8>) -> Vec<u8> {
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+#[tokio::test]
+async fn uploads_are_capped_while_streaming_and_parts_must_be_unique() {
+    let w = world("upload_caps");
+    let config = br#"{"order_source": "signals", "tape": "upload"}"#;
+    let ob = std::fs::read(&w.ob_parquet).unwrap();
+    let trades = std::fs::read(&w.trades_parquet).unwrap();
+
+    let oversized = vec![b'x'; tracer_engine::trace::MAX_SIGNALS_BYTES as usize + 1];
+    let mut body = part("config", None, config);
+    body.extend(part("orderbook", Some("ob.parquet"), &ob));
+    body.extend(part("trades", Some("tr.parquet"), &trades));
+    body.extend(part("signals", Some("big.csv"), &oversized));
+    let (status, report) = post_raw(&w, close_body(body)).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        "{report}"
+    );
+    assert_eq!(report["row_errors"][0]["field"], "file:big.csv");
+
+    let padded = format!(
+        r#"{{"order_source": "strategy", "tape": "upload", "pad": "{}"}}"#,
+        "p".repeat(traces::CONFIG_PART_CAP)
+    );
+    let (status, body) = post_raw(&w, close_body(part("config", None, padded.as_bytes()))).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("config part exceeds"),
+        "{body}"
+    );
+
+    let mut body = part(
+        "config",
+        None,
+        br#"{"order_source": "strategy", "tape": "upload"}"#,
+    );
+    body.extend(part("orderbook", Some("ob.parquet"), &ob));
+    body.extend(part("trades", Some("a.parquet"), &trades));
+    body.extend(part("trades", Some("b.parquet"), &trades));
+    let (status, body) = post_raw(&w, close_body(body)).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"].as_str().unwrap().contains("repeated part"),
+        "{body}"
+    );
+
+    let mut body = part(
+        "config",
+        None,
+        br#"{"order_source": "strategy", "tape": "upload"}"#,
+    );
+    body.extend(part(
+        "config",
+        None,
+        br#"{"order_source": "strategy", "tape": "upload"}"#,
+    ));
+    let (status, _) = post_raw(&w, close_body(body)).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+
+    let leftovers: Vec<String> = std::fs::read_dir(w.dir.join("traces"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("staging_"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
 #[tokio::test]
 async fn preflight_only_reports_without_persisting() {
     let w = world("preflight");
