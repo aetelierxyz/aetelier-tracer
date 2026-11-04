@@ -31,4 +31,4 @@ tower-http = { version = "0.6", features = ["catch-panic", "cors", "trace"] }
 tracer-engine = { path = "tracer-engine" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-uuid = "1"
+uuid = { version = "1", features = ["v4"] }

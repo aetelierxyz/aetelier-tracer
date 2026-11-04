@@ -630,6 +630,60 @@ async fn the_service_principal_value_in_the_user_header_grants_nothing() {
     assert_eq!(status, axum::http::StatusCode::OK);
 }
 
+async fn post_trace_slowly(
+    router: axum::Router,
+    body: Vec<u8>,
+    user: String,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use futures_util::StreamExt;
+    let mid = body.len() / 2;
+    let chunks = vec![body[..mid].to_vec(), body[mid..].to_vec()];
+    let stream = futures_util::stream::iter(chunks).then(|chunk| async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        Ok::<Vec<u8>, std::io::Error>(chunk)
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/tracer/traces")
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .header("x-aetelier-user", user)
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_uploads_stage_in_separate_directories() {
+    let w = world("concurrent_staging");
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let body = multipart_body(&config, files);
+    let users: Vec<String> = (0..8).map(|i| format!("user-{i}")).collect();
+    let handles: Vec<_> = users
+        .iter()
+        .map(|u| tokio::spawn(post_trace_slowly(app(&w), body.clone(), u.clone())))
+        .collect();
+    for (handle, user) in handles.into_iter().zip(&users) {
+        let (status, body) = handle.await.unwrap();
+        assert_eq!(status, axum::http::StatusCode::CREATED, "{user} {body}");
+        let id = body["trace_id"].as_str().unwrap().to_string();
+        wait_complete(&w, &id, user).await;
+    }
+    let leftovers: Vec<String> = std::fs::read_dir(w.dir.join("traces"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("staging_"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
 #[tokio::test]
 async fn identical_strategy_uploads_by_two_users_get_separate_traces() {
     let w = world("two_users");
