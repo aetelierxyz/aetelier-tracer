@@ -11,13 +11,13 @@ license = "Apache-2.0"
 repository = "https://github.com/aetelierxyz/aetelier-tracer"
 
 [workspace.dependencies]
-aetelier-io = { git = "https://github.com/IteraLabs/aetelier-sdk", rev = "681a344e895f2b7bfa44cbbb032be9c535ba35e7", features = ["parquet"] }
-aetelier-types = { git = "https://github.com/IteraLabs/aetelier-sdk", rev = "681a344e895f2b7bfa44cbbb032be9c535ba35e7" }
+aetelier-io = { git = "https://github.com/aetelierxyz/aetelier-sdk", rev = "5a63477a279176c2fd8f1f269f44206ca4373df9", features = ["parquet"] }
+aetelier-types = { git = "https://github.com/aetelierxyz/aetelier-sdk", rev = "5a63477a279176c2fd8f1f269f44206ca4373df9" }
 anyhow = "1"
-arrow-schema = "57.2"
+arrow-schema = "60.1"
 axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
-parquet = "57.2"
+parquet = "60.1"
 sha2 = "0.10"
 chrono = "0.4"
 chrono-tz = "0.10"
