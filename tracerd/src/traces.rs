@@ -42,6 +42,33 @@ pub const TAPE_LOAD_WAIT_MS: u64 = 20_000;
 pub const TAPE_RETRY_AFTER_S: &str = "2";
 pub const LIST_LIMIT_DEFAULT: usize = 100;
 pub const LIST_LIMIT_MAX: usize = 500;
+pub const OWNER_ID_MAX_LEN: usize = 128;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Principal {
+    Service,
+    User(String),
+}
+
+impl Principal {
+    pub fn owner(&self) -> &str {
+        match self {
+            Principal::Service => SERVICE_PRINCIPAL,
+            Principal::User(id) => id,
+        }
+    }
+
+    pub fn is_service(&self) -> bool {
+        matches!(self, Principal::Service)
+    }
+}
+
+pub fn is_owner_id(id: &str) -> bool {
+    (1..=OWNER_ID_MAX_LEN).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
 
 pub type TapeFiles = Vec<(TapeRole, PathBuf)>;
 
@@ -769,15 +796,14 @@ fn service_credential_matches(headers: &HeaderMap) -> bool {
     header_value(headers, SERVICE_HEADER).is_some_and(|presented| secret_eq(&expected, &presented))
 }
 
-fn caller_of(headers: &HeaderMap) -> Result<String, StatusCode> {
+fn caller_of(headers: &HeaderMap) -> Result<Principal, StatusCode> {
     if service_credential_matches(headers) {
-        return Ok(SERVICE_PRINCIPAL.to_string());
+        return Ok(Principal::Service);
     }
-    header_value(headers, USER_HEADER).ok_or(StatusCode::UNAUTHORIZED)
-}
-
-fn is_service(caller: &str) -> bool {
-    caller == SERVICE_PRINCIPAL
+    header_value(headers, USER_HEADER)
+        .filter(|id| is_owner_id(id))
+        .map(Principal::User)
+        .ok_or(StatusCode::UNAUTHORIZED)
 }
 
 fn is_trace_id(id: &str) -> bool {
@@ -798,13 +824,14 @@ fn scoped_trace_id(engine_id: &str, user: &str) -> String {
     format!("tr_{}", &hex[..12])
 }
 
-fn visible_to(record: &TraceRecord, caller: &str) -> Result<(), StatusCode> {
-    if record.trace_id == LIVE_ID || is_service(caller) {
+fn visible_to(record: &TraceRecord, caller: &Principal) -> Result<(), StatusCode> {
+    if record.trace_id == LIVE_ID {
         return Ok(());
     }
-    match &record.user_id {
-        Some(owner) if owner == caller => Ok(()),
-        _ => Err(StatusCode::NOT_FOUND),
+    match caller {
+        Principal::Service => Ok(()),
+        Principal::User(id) if record.user_id.as_deref() == Some(id.as_str()) => Ok(()),
+        Principal::User(_) => Err(StatusCode::NOT_FOUND),
     }
 }
 
@@ -936,7 +963,9 @@ pub async fn create_trace(
             Json(serde_json::json!({"error": "caller identity required"})),
         )
     })?;
-    if !is_service(&user) && rt.count_for(&user) >= rt.max_traces_per_user {
+    if let Principal::User(id) = &user
+        && rt.count_for(id) >= rt.max_traces_per_user
+    {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({
@@ -1015,7 +1044,7 @@ pub async fn create_trace(
             Err(report) => return Err(rejection(&report)),
             Ok(p) => p,
         };
-    let trace_id = scoped_trace_id(&prepared.trace_id, &user);
+    let trace_id = scoped_trace_id(&prepared.trace_id, user.owner());
 
     if config.preflight_only {
         return Ok((
@@ -1066,7 +1095,7 @@ pub async fn create_trace(
         created_ms: now,
         terminal_ms: None,
         tape_evicted: false,
-        user_id: Some(user),
+        user_id: Some(user.owner().to_string()),
         status: "queued".into(),
         error: None,
         order_source: config.order_source.clone(),
@@ -1131,7 +1160,7 @@ pub async fn list_traces(
     let visible: Vec<TraceRecord> = rt
         .list_records()
         .into_iter()
-        .filter(|r| is_service(&caller) || r.user_id.as_deref() == Some(caller.as_str()))
+        .filter(|r| caller.is_service() || r.user_id.as_deref() == Some(caller.owner()))
         .collect();
     let total = visible.len();
     let page: Vec<&TraceRecord> = visible
