@@ -254,10 +254,22 @@ async fn health() -> &'static str {
     "ok"
 }
 
+fn params_unready(s: &AppState) -> Option<String> {
+    let path = s.params_path.as_ref()?;
+    tracer_engine::params::TracerParams::load(path)
+        .err()
+        .map(|e| format!("params: {e:#}"))
+}
+
 async fn readyz(State(s): State<AppState>) -> impl IntoResponse {
     let mut readiness = s.ready.read().unwrap().clone();
     if readiness.ready
         && let Some(reason) = s.traces.as_ref().and_then(|rt| rt.worker_readiness().err())
+    {
+        readiness = Readiness::not_ready(reason);
+    }
+    if readiness.ready
+        && let Some(reason) = params_unready(&s)
     {
         readiness = Readiness::not_ready(reason);
     }

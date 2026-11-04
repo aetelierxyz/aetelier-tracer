@@ -18,5 +18,6 @@ LABEL org.opencontainers.image.source="https://github.com/aetelierxyz/aetelier-t
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libssl3 && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/target/release/tracerd /usr/local/bin/tracerd
 COPY --from=build /app/params /opt/aetelier/tracer/params
+ENV TRACER_PARAMS=/opt/aetelier/tracer/params/tracer_params.v1.json
 ENTRYPOINT ["tracerd"]
 CMD ["--help"]

@@ -615,3 +615,27 @@ async fn handler_panic_returns_500_and_is_counted() {
     assert_eq!(body["error"], "internal error");
     assert_eq!(metrics.counter(api::PANICS_METRIC, &[]), 1);
 }
+
+#[tokio::test]
+async fn readyz_is_unavailable_when_the_params_file_does_not_load() {
+    let dir = std::env::temp_dir().join("tracer_api_readyz_params");
+    build_fixture_ledger(&dir);
+    let origins = vec!["http://localhost:3000".to_string()];
+
+    let (code, _) = get_json(router(state(&dir), &origins), "/readyz").await;
+    assert_eq!(code, 200);
+
+    let mut missing = state(&dir);
+    missing.params_path = Some(dir.join("absent_params.json"));
+    let (code, body) = get_json(router(missing, &origins), "/readyz").await;
+    assert_eq!(code, 503);
+    assert!(body.as_str().unwrap().contains("params"), "{body}");
+
+    let broken_path = dir.join("broken_params.json");
+    std::fs::write(&broken_path, "{}").unwrap();
+    let mut broken = state(&dir);
+    broken.params_path = Some(broken_path);
+    let (code, _) = get_json(router(broken, &origins), "/readyz").await;
+    assert_eq!(code, 503);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

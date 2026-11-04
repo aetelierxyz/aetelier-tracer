@@ -548,6 +548,7 @@ async fn main() -> anyhow::Result<()> {
             tape_retention_ms,
             params,
         } => {
+            TracerParams::load(&params)?;
             let metrics = Metrics::shared();
             let traces_rt = traces_dir
                 .map(|dir| {
