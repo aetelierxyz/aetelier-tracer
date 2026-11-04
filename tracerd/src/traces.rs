@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Multipart, Path as AxumPath, Query, State};
@@ -37,6 +38,10 @@ pub const LIVE_ID: &str = "live";
 pub const DEFAULT_MAX_TRACES_PER_USER: usize = 50;
 pub const DEFAULT_TAPE_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 pub const DEFAULT_SWEEP_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
+pub const READY_MAX_QUEUE: usize = 256;
+pub const QUEUE_DEPTH_METRIC: &str = "tracer_trace_queue_depth";
+pub const WORKER_RESTARTS_METRIC: &str = "tracer_trace_worker_restarts_total";
+pub const PANICKED_ERROR: &str = "internal: engine panic";
 pub const TAPE_CACHE_ENTRIES: usize = 4;
 pub const TAPE_LOAD_WAIT_MS: u64 = 20_000;
 pub const TAPE_RETRY_AFTER_S: &str = "2";
@@ -137,6 +142,10 @@ pub struct TraceRuntime {
     tapes: Arc<TapeCache<CachedTape>>,
     spans: Mutex<HashMap<String, (u64, u64)>>,
     deleted: Mutex<HashSet<String>>,
+    queued: AtomicUsize,
+    worker_alive: AtomicBool,
+    #[cfg(test)]
+    panic_on: Mutex<HashSet<String>>,
 }
 
 impl TraceRuntime {
@@ -170,10 +179,14 @@ impl TraceRuntime {
             tapes: TapeCache::new(TAPE_CACHE_ENTRIES),
             spans: Mutex::new(HashMap::new()),
             deleted: Mutex::new(HashSet::new()),
+            queued: AtomicUsize::new(0),
+            worker_alive: AtomicBool::new(true),
+            #[cfg(test)]
+            panic_on: Mutex::new(HashSet::new()),
         });
         for record in rt.list_records() {
             if record.status == "queued" || record.status == "running" {
-                let _ = rt.tx.send(record.trace_id.clone());
+                let _ = rt.enqueue(&record.trace_id);
             }
         }
         let sweeper = rt.clone();
@@ -192,26 +205,99 @@ impl TraceRuntime {
                 let _ = warm.tape(&live_pseudo_record(&warm), Duration::ZERO);
             });
         }
-        let worker = rt.clone();
+        rt.spawn_worker(Arc::new(Mutex::new(rx)));
+        Ok(rt)
+    }
+
+    fn enqueue(&self, trace_id: &str) -> Result<(), mpsc::SendError<String>> {
+        let depth = self.queued.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Err(e) = self.tx.send(trace_id.to_string()) {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+            return Err(e);
+        }
+        self.metrics.set(QUEUE_DEPTH_METRIC, &[], depth as f64);
+        Ok(())
+    }
+
+    fn spawn_worker(self: &Arc<Self>, jobs: Arc<Mutex<mpsc::Receiver<String>>>) {
+        let rt = self.clone();
         std::thread::spawn(move || {
-            while let Ok(trace_id) = rx.recv() {
-                match worker.run_one(&trace_id) {
-                    Ok(()) => worker.warm_completed_live_tape(&trace_id),
-                    Err(e) => {
-                        error!(trace = %trace_id, error = %format!("{e:#}"), "trace failed");
-                        worker
-                            .metrics
-                            .inc("tracer_trace_jobs_total", &[("status", "failed")]);
-                        let _ = worker.update_record(&trace_id, |r| {
-                            r.status = "failed".into();
-                            r.terminal_ms = Some(wall_ms());
-                            r.error = Some(format!("{e:#}"));
-                        });
-                    }
+            loop {
+                let worker = rt.clone();
+                let rx = jobs.clone();
+                rt.worker_alive.store(true, Ordering::SeqCst);
+                let exited = std::thread::spawn(move || worker.work(&rx)).join();
+                rt.worker_alive.store(false, Ordering::SeqCst);
+                if exited.is_ok() {
+                    break;
                 }
+                error!("trace worker died; restarting");
+                rt.metrics.inc(WORKER_RESTARTS_METRIC, &[]);
             }
         });
-        Ok(rt)
+    }
+
+    fn work(self: &Arc<Self>, jobs: &Mutex<mpsc::Receiver<String>>) {
+        loop {
+            let next = locked(jobs).recv();
+            let Ok(trace_id) = next else {
+                return;
+            };
+            let depth = self.queued.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
+            self.metrics.set(QUEUE_DEPTH_METRIC, &[], depth as f64);
+            self.run_guarded(&trace_id);
+        }
+    }
+
+    fn run_guarded(self: &Arc<Self>, trace_id: &str) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if locked(&self.panic_on).remove(trace_id) {
+                panic!("injected panic for {trace_id}");
+            }
+            self.run_one(trace_id)?;
+            self.warm_completed_live_tape(trace_id);
+            Ok::<(), anyhow::Error>(())
+        }));
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let message = format!("{e:#}");
+                error!(trace = %trace_id, error = %message, "trace failed");
+                self.mark_failed(trace_id, "failed", message);
+            }
+            Err(payload) => {
+                error!(trace = %trace_id, panic = %panic_message(payload.as_ref()), "trace panicked");
+                self.mark_failed(trace_id, "panicked", PANICKED_ERROR.to_string());
+            }
+        }
+    }
+
+    fn mark_failed(&self, trace_id: &str, outcome: &str, message: String) {
+        self.metrics
+            .inc("tracer_trace_jobs_total", &[("status", outcome)]);
+        let _ = self.update_record(trace_id, |r| {
+            r.status = "failed".into();
+            r.terminal_ms = Some(wall_ms());
+            r.error = Some(message);
+        });
+    }
+
+    pub fn worker_readiness(&self) -> Result<(), String> {
+        if !self.worker_alive.load(Ordering::SeqCst) {
+            return Err("trace worker down".into());
+        }
+        let depth = self.queued.load(Ordering::SeqCst);
+        if depth > READY_MAX_QUEUE {
+            return Err(format!("trace queue depth {depth} over {READY_MAX_QUEUE}"));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn panic_on(&self, trace_id: &str) {
+        locked(&self.panic_on).insert(trace_id.to_string());
     }
 
     fn trace_dir(&self, trace_id: &str) -> PathBuf {
@@ -249,16 +335,16 @@ impl TraceRuntime {
     }
 
     fn is_deleted(&self, trace_id: &str) -> bool {
-        self.deleted.lock().unwrap().contains(trace_id)
+        locked(&self.deleted).contains(trace_id)
     }
 
     fn clear_tombstone(&self, trace_id: &str) {
-        self.deleted.lock().unwrap().remove(trace_id);
+        locked(&self.deleted).remove(trace_id);
     }
 
     fn drop_cached(&self, trace_id: &str) {
         self.tapes.remove(trace_id);
-        self.spans.lock().unwrap().remove(trace_id);
+        locked(&self.spans).remove(trace_id);
     }
 
     fn warm_completed_live_tape(self: &Arc<Self>, trace_id: &str) {
@@ -281,7 +367,7 @@ impl TraceRuntime {
         if record.trace_id == LIVE_ID || record.status != "complete" {
             return DepthFilter::Nothing;
         }
-        if let Some(&(lo, hi)) = self.spans.lock().unwrap().get(&record.trace_id) {
+        if let Some(&(lo, hi)) = locked(&self.spans).get(&record.trace_id) {
             return DepthFilter::Within { lo, hi };
         }
         let ledger_dir = self.trace_dir(&record.trace_id).join("ledger");
@@ -309,7 +395,7 @@ impl TraceRuntime {
         if !is_trace_id(trace_id) {
             return Err(StatusCode::NOT_FOUND);
         }
-        self.deleted.lock().unwrap().insert(trace_id.to_string());
+        locked(&self.deleted).insert(trace_id.to_string());
         self.drop_cached(trace_id);
         self.purge_dir(trace_id);
         Ok(())
@@ -660,11 +746,11 @@ fn build_tape(
     let base = match base {
         TapeBase::Fresh => None,
         TapeBase::Extend(cached) => {
-            let seen = cached.seen.lock().unwrap().take();
+            let seen = locked(&cached.seen).take();
             seen.map(|seen| (cached, seen))
         }
         TapeBase::Seed(cached) => {
-            let seen = cached.seen.lock().unwrap().clone();
+            let seen = locked(&cached.seen).clone();
             seen.map(|seen| (cached, seen))
         }
     };
@@ -764,6 +850,18 @@ fn now_from(state: &AppState) -> u64 {
 
 fn runtime(state: &AppState) -> Result<Arc<TraceRuntime>, StatusCode> {
     state.traces.clone().ok_or(StatusCode::NOT_FOUND)
+}
+
+fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_default()
 }
 
 fn wall_ms() -> u64 {
@@ -1111,8 +1209,7 @@ pub async fn create_trace(
     rt.clear_tombstone(&trace_id);
     rt.write_record(&record)
         .map_err(|e| bad_request(format!("record: {e:#}")))?;
-    rt.tx
-        .send(record.trace_id.clone())
+    rt.enqueue(&record.trace_id)
         .map_err(|e| bad_request(format!("enqueue: {e}")))?;
     Ok((
         StatusCode::CREATED,

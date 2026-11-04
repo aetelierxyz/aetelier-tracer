@@ -255,7 +255,12 @@ async fn health() -> &'static str {
 }
 
 async fn readyz(State(s): State<AppState>) -> impl IntoResponse {
-    let readiness = s.ready.read().unwrap().clone();
+    let mut readiness = s.ready.read().unwrap().clone();
+    if readiness.ready
+        && let Some(reason) = s.traces.as_ref().and_then(|rt| rt.worker_readiness().err())
+    {
+        readiness = Readiness::not_ready(reason);
+    }
     if readiness.ready {
         (StatusCode::OK, "ready".to_owned())
     } else {

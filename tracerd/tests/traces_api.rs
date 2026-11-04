@@ -475,6 +475,55 @@ async fn a_failed_trace_is_requeued_when_its_config_is_submitted_again() {
 }
 
 #[tokio::test]
+async fn a_panicking_trace_fails_alone_and_the_worker_keeps_running() {
+    let w = world("worker_panic");
+    let rt = w.state.traces.clone().unwrap();
+    let preflight =
+        serde_json::json!({"order_source": "strategy", "tape": "upload", "preflight_only": true});
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let (status, pre) = post_trace(&w, &preflight, files, Some("user-a")).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{pre}");
+    let id = pre["trace_id"].as_str().unwrap().to_string();
+    rt.panic_on(&id);
+
+    let (status, body) = post_trace(&w, &config, files, Some("user-a")).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let mut failed = None;
+    for _ in 0..300 {
+        let (_, body) = get_json(&w, &format!("/api/tracer/traces/{id}"), Some("user-a")).await;
+        let body = body.unwrap();
+        if body["status"] == "failed" {
+            failed = Some(body);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let failed = failed.expect("panicking trace never reached failed");
+    assert_eq!(failed["error"], traces::PANICKED_ERROR);
+    assert_eq!(
+        w.state
+            .metrics
+            .counter("tracer_trace_jobs_total", &[("status", "panicked")]),
+        1
+    );
+    let (status, _) = get_text(&w, "/readyz", None).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert!(rt.worker_readiness().is_ok());
+
+    let (status, body) = post_trace(&w, &config, files, Some("user-b")).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let other = body["trace_id"].as_str().unwrap().to_string();
+    wait_complete(&w, &other, "user-b").await;
+
+    let (status, body) = post_trace(&w, &config, files, Some("user-a")).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    assert_eq!(body["trace_id"], id.as_str());
+    let done = wait_complete(&w, &id, "user-a").await;
+    assert!(done["error"].is_null(), "{done}");
+}
+
+#[tokio::test]
 async fn a_deleted_trace_runs_again_when_its_config_is_submitted_again() {
     let w = world("recreate_deleted");
     let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
