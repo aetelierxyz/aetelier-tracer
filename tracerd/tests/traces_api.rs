@@ -534,6 +534,54 @@ async fn a_trace_is_invisible_to_a_caller_who_is_not_its_owner() {
 }
 
 #[tokio::test]
+async fn the_service_principal_value_in_the_user_header_grants_nothing() {
+    let w = world("svc_spoof");
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let (status, body) = post_trace(&w, &config, files, Some("user-a")).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let id = body["trace_id"].as_str().unwrap().to_string();
+    wait_complete(&w, &id, "user-a").await;
+
+    let too_long = "u".repeat(129);
+    let spoofs = [
+        "svc:in-network",
+        "svc:other",
+        "user a",
+        "a/b",
+        too_long.as_str(),
+    ];
+    for spoof in spoofs {
+        for route in trace_routes(&id) {
+            let (status, _) = get_json(&w, &route, Some(spoof)).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{spoof} {route}"
+            );
+        }
+        let (status, _) = get_json(&w, "/api/tracer/traces", Some(spoof)).await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED, "{spoof} list");
+        assert_eq!(
+            delete_trace(&w, &id, Some(spoof)).await,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "{spoof} delete"
+        );
+        let (status, _) = post_trace(&w, &config, files, Some(spoof)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "{spoof} create"
+        );
+    }
+
+    let (status, _) = get_json(&w, &format!("/api/tracer/traces/{id}"), Some("user-a")).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let (status, _) = get_json(&w, "/api/tracer/traces", Some(&"u".repeat(128))).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+}
+
+#[tokio::test]
 async fn identical_strategy_uploads_by_two_users_get_separate_traces() {
     let w = world("two_users");
     let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
