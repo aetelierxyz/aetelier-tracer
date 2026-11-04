@@ -104,12 +104,19 @@ pub fn tape_files_sorted(dir: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
+pub const MAX_READ_ATTEMPTS: u32 = 3;
+pub const TAPE_FUTURE_TOLERANCE_MS: u64 = 5 * 60 * 1000;
+
 pub struct StreamTail {
     dir: PathBuf,
     processed: BTreeSet<String>,
+    read_failures: HashMap<String, u32>,
     pub watermark_ms: u64,
     pub last_file: Option<String>,
     pub files_read: u64,
+    pub files_skipped: u64,
+    pub rows_future_dropped: u64,
+    pub last_read_error: Option<String>,
 }
 
 impl StreamTail {
@@ -117,22 +124,60 @@ impl StreamTail {
         Self {
             dir,
             processed: BTreeSet::new(),
+            read_failures: HashMap::new(),
             watermark_ms: 0,
             last_file: None,
             files_read: 0,
+            files_skipped: 0,
+            rows_future_dropped: 0,
+            last_read_error: None,
         }
     }
 
-    pub fn poll_new_files(&mut self) -> anyhow::Result<Vec<PathBuf>> {
-        let mut fresh = Vec::new();
-        for (key, path) in tape_files_sorted(&self.dir) {
-            if self.processed.insert(key.clone()) {
-                self.last_file = Some(key);
-                self.files_read += 1;
-                fresh.push(path);
+    pub fn pending_files(&self) -> Vec<(String, PathBuf)> {
+        tape_files_sorted(&self.dir)
+            .into_iter()
+            .filter(|(key, _)| !self.processed.contains(key))
+            .collect()
+    }
+
+    fn mark_read(&mut self, key: String) {
+        self.read_failures.remove(&key);
+        self.processed.insert(key.clone());
+        self.last_file = Some(key);
+        self.files_read += 1;
+    }
+
+    fn mark_failed(&mut self, key: &str, error: String) -> bool {
+        self.last_read_error = Some(error);
+        let attempts = self.read_failures.entry(key.to_string()).or_insert(0);
+        *attempts += 1;
+        if *attempts < MAX_READ_ATTEMPTS {
+            return false;
+        }
+        self.read_failures.remove(key);
+        self.processed.insert(key.to_string());
+        self.files_skipped += 1;
+        true
+    }
+
+    pub fn read_new<T>(&mut self, mut read: impl FnMut(&Path) -> anyhow::Result<T>) -> Vec<T> {
+        let mut out = Vec::new();
+        for (key, path) in self.pending_files() {
+            match read(&path) {
+                Ok(v) => {
+                    self.mark_read(key);
+                    out.push(v);
+                }
+                Err(e) => {
+                    let skipped = self.mark_failed(&key, format!("{}: {e:#}", path.display()));
+                    if !skipped {
+                        break;
+                    }
+                }
             }
         }
-        Ok(fresh)
+        out
     }
 }
 
@@ -176,15 +221,24 @@ impl TradeTailer {
     }
 
     pub fn poll(&mut self) -> anyhow::Result<Vec<TapeTrade>> {
+        self.poll_until(u64::MAX)
+    }
+
+    pub fn poll_until(&mut self, max_ts_ms: u64) -> anyhow::Result<Vec<TapeTrade>> {
         let mut out = Vec::new();
         if !self.try_resolve()? {
             return Ok(out);
         }
-        for path in self.tail.poll_new_files()? {
-            let trades = read_trades_parquet(&path)
-                .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let files = self
+            .tail
+            .read_new(|path| read_trades_parquet(path).map_err(|e| anyhow::anyhow!("{e}")));
+        for trades in files {
             for t in trades {
                 let ts_ms = t.source_trade_ts_us / 1_000;
+                if ts_ms > max_ts_ms {
+                    self.tail.rows_future_dropped += 1;
+                    continue;
+                }
                 if let Some(prev) = self.seen_ids.insert(t.id.clone(), ts_ms) {
                     self.seen_ids.insert(t.id.clone(), prev.max(ts_ms));
                     self.duplicates_dropped += 1;
@@ -361,6 +415,48 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_tape_file_is_retried_then_skipped_without_losing_later_files() {
+        let root = binding_fixture("unreadable");
+        let dir = root.join("hyperliquid/perpetual/trades");
+        std::fs::write(dir.join("a.parquet"), b"not parquet").unwrap();
+        write_trades_parquet(
+            &[trade(2_000_000, 100.0, 1.0, true, "t2")],
+            &dir.join("b.parquet"),
+        )
+        .unwrap();
+        let mut tailer = TradeTailer::new(&root).unwrap();
+        assert!(tailer.poll().unwrap().is_empty());
+        assert!(tailer.poll().unwrap().is_empty());
+        let third = tailer.poll().unwrap();
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].id, "t2");
+        assert_eq!(tailer.tail.files_skipped, 1);
+        assert_eq!(tailer.tail.watermark_ms, 2_000);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rows_beyond_the_future_bound_do_not_move_the_watermark() {
+        let root = binding_fixture("future_rows");
+        let dir = root.join("hyperliquid/perpetual/trades");
+        write_trades_parquet(
+            &[
+                trade(1_000_000, 100.0, 1.0, true, "ok"),
+                trade(1_000_000_000_000, 100.0, 1.0, true, "us_as_ms"),
+            ],
+            &dir.join("a.parquet"),
+        )
+        .unwrap();
+        let mut tailer = TradeTailer::new(&root).unwrap();
+        let trades = tailer.poll_until(5_000).unwrap();
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].id, "ok");
+        assert_eq!(tailer.tail.watermark_ms, 1_000);
+        assert_eq!(tailer.tail.rows_future_dropped, 1);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn ambiguous_binding_layout_fails_loudly() {
         let root = binding_fixture("ambiguous");
         std::fs::create_dir_all(root.join("binance/perpetual/trades")).unwrap();
@@ -512,7 +608,7 @@ mod wave_layout_tests {
         touch(&leaf.join("2026-09-14/a.parquet"));
         touch(&leaf.join("2026-09-14/index.jsonl"));
         let mut tail = StreamTail::new(leaf.clone());
-        let first: Vec<_> = tail.poll_new_files().unwrap();
+        let first: Vec<_> = tail.read_new(|p| Ok(p.to_path_buf()));
         assert_eq!(
             first,
             vec![
@@ -522,9 +618,65 @@ mod wave_layout_tests {
         );
         assert_eq!(tail.files_read, 2);
         touch(&leaf.join("2026-09-15/c.parquet"));
-        let second = tail.poll_new_files().unwrap();
+        let second = tail.read_new(|p| Ok(p.to_path_buf()));
         assert_eq!(second, vec![leaf.join("2026-09-15/c.parquet")]);
         assert_eq!(tail.last_file.as_deref(), Some("2026-09-15/c.parquet"));
+    }
+
+    #[test]
+    fn a_failing_file_blocks_later_files_until_it_is_skipped() {
+        let leaf = leaf_fixture("fail_skip");
+        for name in ["a", "b", "c"] {
+            touch(&leaf.join(format!("2026-09-14/{name}.parquet")));
+        }
+        let mut tail = StreamTail::new(leaf.clone());
+        let fail_b = |p: &Path| -> anyhow::Result<PathBuf> {
+            anyhow::ensure!(!p.ends_with("b.parquet"), "torn file");
+            Ok(p.to_path_buf())
+        };
+        assert_eq!(
+            tail.read_new(fail_b),
+            vec![leaf.join("2026-09-14/a.parquet")]
+        );
+        assert!(
+            tail.last_read_error
+                .as_deref()
+                .unwrap()
+                .contains("torn file")
+        );
+        assert!(tail.read_new(fail_b).is_empty());
+        assert_eq!(tail.files_skipped, 0);
+        assert_eq!(
+            tail.read_new(fail_b),
+            vec![leaf.join("2026-09-14/c.parquet")]
+        );
+        assert_eq!(tail.files_skipped, 1);
+        assert_eq!(tail.files_read, 2);
+        assert!(tail.read_new(fail_b).is_empty());
+    }
+
+    #[test]
+    fn a_file_that_reads_on_retry_is_not_lost() {
+        let leaf = leaf_fixture("fail_recover");
+        touch(&leaf.join("2026-09-14/a.parquet"));
+        touch(&leaf.join("2026-09-14/b.parquet"));
+        let mut tail = StreamTail::new(leaf.clone());
+        let mut calls = 0;
+        let first = tail.read_new(|p| {
+            calls += 1;
+            anyhow::ensure!(calls > 1, "not yet");
+            Ok(p.to_path_buf())
+        });
+        assert!(first.is_empty());
+        let second = tail.read_new(|p| Ok(p.to_path_buf()));
+        assert_eq!(
+            second,
+            vec![
+                leaf.join("2026-09-14/a.parquet"),
+                leaf.join("2026-09-14/b.parquet")
+            ]
+        );
+        assert_eq!(tail.files_skipped, 0);
     }
 
     #[test]
@@ -535,7 +687,10 @@ mod wave_layout_tests {
         touch(&root.join("not-a-day/hidden.parquet"));
         touch(&root.join("a.parquet"));
         let mut tail = StreamTail::new(root.clone());
-        assert_eq!(tail.poll_new_files().unwrap(), vec![root.join("a.parquet")]);
+        assert_eq!(
+            tail.read_new(|p| Ok(p.to_path_buf())),
+            vec![root.join("a.parquet")]
+        );
     }
 }
 

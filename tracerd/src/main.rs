@@ -326,6 +326,16 @@ fn record_engine_status(metrics: &Metrics, status: &EngineStatus) {
             &labels,
             stream.files_read as f64,
         );
+        metrics.set(
+            "tracer_stream_files_skipped",
+            &labels,
+            stream.files_skipped as f64,
+        );
+        metrics.set(
+            "tracer_stream_rows_future_dropped",
+            &labels,
+            stream.rows_future_dropped as f64,
+        );
         metrics.set_flag("tracer_stream_stalled", &labels, stream.stalled);
     }
     metrics.set(

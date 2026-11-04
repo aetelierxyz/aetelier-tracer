@@ -81,17 +81,26 @@ impl BookTailer {
     }
 
     pub fn poll(&mut self) -> anyhow::Result<()> {
+        self.poll_until(u64::MAX)
+    }
+
+    pub fn poll_until(&mut self, max_ts_ms: u64) -> anyhow::Result<()> {
         if !self.try_resolve()? {
             return Ok(());
         }
-        for path in self.tail.poll_new_files()? {
-            let data = read_ob_parquet(&path, OrderbookTarget::Snapshot)
-                .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let files = self.tail.read_new(|path| {
+            read_ob_parquet(path, OrderbookTarget::Snapshot).map_err(|e| anyhow::anyhow!("{e}"))
+        });
+        for data in files {
             let OrderbookTargetData::Snapshot(books) = data else {
                 continue;
             };
             for ob in books {
                 let ts_ms = ob.effective_ts_us() / 1_000;
+                if ts_ms > max_ts_ms {
+                    self.tail.rows_future_dropped += 1;
+                    continue;
+                }
                 let level_vec = |m: &BTreeMap<
                     rust_decimal::Decimal,
                     aetelier_types::levels::Level,
