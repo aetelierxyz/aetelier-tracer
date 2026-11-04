@@ -1,4 +1,5 @@
 mod api;
+mod auth;
 mod metrics;
 mod tape_cache;
 mod traces;
@@ -57,6 +58,8 @@ enum Command {
         poll_ms: u64,
         #[arg(long, env = "TRACER_PORT", default_value_t = 8330)]
         port: u16,
+        #[arg(long, env = "TRACER_BIND", default_value = "0.0.0.0")]
+        bind: std::net::IpAddr,
         #[arg(long, env = "TRACER_EXIT_GRACE_MS", default_value_t = DEFAULT_GRACE_MS)]
         grace_ms: u64,
         #[arg(long, env = "TRACER_CROSS_WINDOW_MS", default_value_t = DEFAULT_CROSS_WINDOW_MS)]
@@ -89,6 +92,8 @@ enum Command {
         artifacts: Option<PathBuf>,
         #[arg(long, env = "TRACER_PORT", default_value_t = 8330)]
         port: u16,
+        #[arg(long, env = "TRACER_BIND", default_value = "0.0.0.0")]
+        bind: std::net::IpAddr,
         #[arg(long, env = "TRACER_TRACES_DIR")]
         traces_dir: Option<PathBuf>,
         #[arg(long, env = "TRACER_MAX_TRACES_PER_USER", default_value_t = traces::DEFAULT_MAX_TRACES_PER_USER)]
@@ -142,11 +147,12 @@ enum Command {
     },
 }
 
-async fn serve_api(state: AppState, port: u16) -> anyhow::Result<()> {
+async fn serve_api(state: AppState, bind: std::net::IpAddr, port: u16) -> anyhow::Result<()> {
     let origins = origins_from_env();
+    let auth_mode = state.auth.mode();
     let app = router(state, &origins);
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
-    info!(port, "api listening");
+    let listener = tokio::net::TcpListener::bind((bind, port)).await?;
+    info!(%bind, port, auth = ?auth_mode, "api listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -162,6 +168,7 @@ async fn run_live(
     queue_verdicts: bool,
     poll_ms: u64,
     port: u16,
+    bind: std::net::IpAddr,
     grace_ms: u64,
     cross_window_ms: u64,
     idle_after_ms: u64,
@@ -170,6 +177,7 @@ async fn run_live(
     tape_retention_ms: u64,
 ) -> anyhow::Result<()> {
     let params = TracerParams::load(&params_path)?;
+    let auth = auth::ServiceAuth::from_env()?.shared();
     let stem = symbol.replace(':', "_");
     let metrics = Metrics::shared();
     let traces_rt = traces_dir
@@ -214,6 +222,7 @@ async fn run_live(
         symbol_stem: Some(stem),
         traces: traces_rt,
         params_path: Some(params_path),
+        auth,
         now_ms: wall_now_ms,
     };
     let publish = state.clone();
@@ -265,7 +274,7 @@ async fn run_live(
             std::thread::sleep(std::time::Duration::from_millis(poll_ms));
         }
     });
-    serve_api(state, port).await
+    serve_api(state, bind, port).await
 }
 
 const LEDGER_SIZE_EVERY_TICKS: u64 = 15;
@@ -513,6 +522,7 @@ async fn main() -> anyhow::Result<()> {
             queue_verdicts,
             poll_ms,
             port,
+            bind,
             grace_ms,
             cross_window_ms,
             idle_after_ms,
@@ -530,6 +540,7 @@ async fn main() -> anyhow::Result<()> {
                 queue_verdicts,
                 poll_ms,
                 port,
+                bind,
                 grace_ms,
                 cross_window_ms,
                 idle_after_ms,
@@ -543,12 +554,14 @@ async fn main() -> anyhow::Result<()> {
             ledger_dir,
             artifacts,
             port,
+            bind,
             traces_dir,
             max_traces_per_user,
             tape_retention_ms,
             params,
         } => {
             TracerParams::load(&params)?;
+            let auth = auth::ServiceAuth::from_env()?.shared();
             let metrics = Metrics::shared();
             let traces_rt = traces_dir
                 .map(|dir| {
@@ -588,9 +601,10 @@ async fn main() -> anyhow::Result<()> {
                 symbol_stem: None,
                 traces: traces_rt,
                 params_path: Some(params),
+                auth,
                 now_ms: wall_now_ms,
             };
-            serve_api(state, port).await
+            serve_api(state, bind, port).await
         }
         Command::Replay {
             fills,
