@@ -127,6 +127,13 @@ impl CachedTape {
     }
 }
 
+struct LiveDepthCache {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    row: Option<DepthRow>,
+}
+
 pub struct TraceRuntime {
     pub dir: PathBuf,
     pub params_path: PathBuf,
@@ -142,6 +149,8 @@ pub struct TraceRuntime {
     tapes: Arc<TapeCache<CachedTape>>,
     spans: Mutex<HashMap<String, (u64, u64)>>,
     deleted: Mutex<HashSet<String>>,
+    owner_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    live_depth: Mutex<Option<LiveDepthCache>>,
     queued: AtomicUsize,
     worker_alive: AtomicBool,
     #[cfg(test)]
@@ -179,6 +188,8 @@ impl TraceRuntime {
             tapes: TapeCache::new(TAPE_CACHE_ENTRIES),
             spans: Mutex::new(HashMap::new()),
             deleted: Mutex::new(HashSet::new()),
+            owner_locks: Mutex::new(HashMap::new()),
+            live_depth: Mutex::new(None),
             queued: AtomicUsize::new(0),
             worker_alive: AtomicBool::new(true),
             #[cfg(test)]
@@ -207,6 +218,33 @@ impl TraceRuntime {
         }
         rt.spawn_worker(Arc::new(Mutex::new(rx)));
         Ok(rt)
+    }
+
+    fn owner_lock(&self, owner: &str) -> Arc<tokio::sync::Mutex<()>> {
+        locked(&self.owner_locks)
+            .entry(owner.to_string())
+            .or_default()
+            .clone()
+    }
+
+    pub fn live_depth_row(&self, path: &Path) -> anyhow::Result<Option<DepthRow>> {
+        let meta = std::fs::metadata(path)?;
+        let (len, modified) = (meta.len(), meta.modified().ok());
+        if let Some(cached) = locked(&self.live_depth).as_ref()
+            && cached.path == path
+            && cached.len == len
+            && cached.modified == modified
+        {
+            return Ok(cached.row.clone());
+        }
+        let row = load_depth_rows(&[path], None, None)?.last().cloned();
+        *locked(&self.live_depth) = Some(LiveDepthCache {
+            path: path.to_path_buf(),
+            len,
+            modified,
+            row: row.clone(),
+        });
+        Ok(row)
     }
 
     fn enqueue(&self, trace_id: &str) -> Result<(), mpsc::SendError<String>> {
@@ -947,6 +985,26 @@ fn caller_of(auth: &ServiceAuth, headers: &HeaderMap) -> Result<Principal, Statu
     }
 }
 
+pub struct TraceId(pub String);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for TraceId {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let AxumPath(id) = AxumPath::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        if id == LIVE_ID || is_trace_id(&id) {
+            Ok(Self(id))
+        } else {
+            Err(StatusCode::NOT_FOUND)
+        }
+    }
+}
+
 fn is_trace_id(id: &str) -> bool {
     id.len() == 15
         && id.starts_with("tr_")
@@ -1151,17 +1209,6 @@ pub async fn create_trace(
             Json(serde_json::json!({"error": "caller identity required"})),
         )
     })?;
-    if let Principal::User(id) = &user
-        && rt.count_for(id) >= rt.max_traces_per_user
-    {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({
-                "error": "trace quota reached",
-                "limit": rt.max_traces_per_user,
-            })),
-        ));
-    }
     let now = now_from(&s);
     let (config, staged) = stage_upload(&rt.dir, &mut multipart).await?;
     let config = config.ok_or_else(|| bad_request("missing config part".into()))?;
@@ -1254,7 +1301,10 @@ pub async fn create_trace(
         ));
     }
 
-    if let Some(existing) = rt.read_record(&trace_id)
+    let owner_lock = rt.owner_lock(user.owner());
+    let _owner_guard = owner_lock.lock().await;
+    let existing = rt.read_record(&trace_id);
+    if let Some(existing) = &existing
         && existing.status != "failed"
     {
         return Ok((
@@ -1263,6 +1313,18 @@ pub async fn create_trace(
                 "trace_id": existing.trace_id,
                 "status": existing.status,
                 "preflight": existing.preflight,
+            })),
+        ));
+    }
+    if existing.is_none()
+        && let Principal::User(id) = &user
+        && rt.count_for(id) >= rt.max_traces_per_user
+    {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "trace quota reached",
+                "limit": rt.max_traces_per_user,
             })),
         ));
     }
@@ -1429,7 +1491,7 @@ fn artifact_content_type(name: &str) -> &'static str {
 
 pub async fn trace_artifacts(
     State(s): State<AppState>,
-    AxumPath(id): AxumPath<String>,
+    TraceId(id): TraceId,
     Query(q): Query<ArtifactsQuery>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
@@ -1501,7 +1563,7 @@ fn listed_record(record: &TraceRecord) -> serde_json::Value {
 
 pub async fn get_trace(
     State(s): State<AppState>,
-    AxumPath(id): AxumPath<String>,
+    TraceId(id): TraceId,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let rt = runtime(&s)?;
@@ -1515,7 +1577,7 @@ pub async fn get_trace(
 
 pub async fn delete_trace(
     State(s): State<AppState>,
-    AxumPath(id): AxumPath<String>,
+    TraceId(id): TraceId,
     headers: HeaderMap,
 ) -> Result<StatusCode, StatusCode> {
     let rt = runtime(&s)?;
@@ -1544,7 +1606,7 @@ fn trace_artifact(
 
 pub async fn trace_ledger(
     State(s): State<AppState>,
-    AxumPath(id): AxumPath<String>,
+    TraceId(id): TraceId,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     caller_of(&s.auth, &headers)?;
@@ -1557,7 +1619,7 @@ pub async fn trace_ledger(
 
 pub async fn trace_fillrates(
     State(s): State<AppState>,
-    AxumPath(id): AxumPath<String>,
+    TraceId(id): TraceId,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     caller_of(&s.auth, &headers)?;
@@ -1570,7 +1632,7 @@ pub async fn trace_fillrates(
 
 pub async fn trace_events(
     State(s): State<AppState>,
-    AxumPath(id): AxumPath<String>,
+    TraceId(id): TraceId,
     Query(q): Query<EventsQuery>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, TapeHttpError> {
@@ -1642,7 +1704,7 @@ fn owned_record_or_live(
 
 pub async fn trace_orderbook(
     State(s): State<AppState>,
-    AxumPath(id): AxumPath<String>,
+    TraceId(id): TraceId,
     Query(q): Query<OrderbookQuery>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, TapeHttpError> {
@@ -1667,18 +1729,21 @@ pub struct DepthQuery {
 
 pub async fn trace_depth(
     State(s): State<AppState>,
-    AxumPath(id): AxumPath<String>,
+    TraceId(id): TraceId,
     Query(q): Query<DepthQuery>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, TapeHttpError> {
     let rt = runtime(&s)?;
     let max_rows = q.max.unwrap_or(DEPTH_ROWS_DEFAULT).clamp(1, DEPTH_ROWS_CAP);
     let rows: Vec<DepthRow> = if id == LIVE_ID {
+        caller_of(&s.auth, &headers)?;
         let path = live_role_parquet(&rt, TapeRole::Orderbook)?;
+        let rt = rt.clone();
         off_runtime(&s.heavy, move || {
-            let rows = load_depth_rows(&[&path], None, None)
+            let row = rt
+                .live_depth_row(&path)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            Ok::<_, TapeHttpError>(rows.last().cloned().into_iter().collect())
+            Ok::<_, TapeHttpError>(row.into_iter().collect())
         })
         .await?
     } else {
@@ -1734,7 +1799,7 @@ fn trade_json((ts_ms, px, sz, is_buy): &TradePoint) -> serde_json::Value {
 
 pub async fn trace_trades(
     State(s): State<AppState>,
-    AxumPath(id): AxumPath<String>,
+    TraceId(id): TraceId,
     Query(q): Query<TradesQuery>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, TapeHttpError> {
@@ -1804,17 +1869,18 @@ fn live_role_parquet(rt: &TraceRuntime, role: TapeRole) -> Result<PathBuf, Statu
 
 pub async fn trace_schema(
     State(s): State<AppState>,
-    AxumPath(id): AxumPath<String>,
+    TraceId(id): TraceId,
     Query(q): Query<SchemaQuery>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, TapeHttpError> {
     let rt = runtime(&s)?;
+    caller_of(&s.auth, &headers)?;
     let role = match q.source.as_str() {
         "orderbook" => TapeRole::Orderbook,
         "trades" => TapeRole::Trades,
         _ => return Err(StatusCode::BAD_REQUEST.into()),
     };
-    let path: PathBuf = if id == "live" {
+    let path: PathBuf = if id == LIVE_ID {
         live_role_parquet(&rt, role)?
     } else {
         let record = read_owned(&rt, &s.auth, &id, &headers)?;
