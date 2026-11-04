@@ -1,6 +1,8 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+pub const FAILURE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoadError {
@@ -18,26 +20,44 @@ struct Gate<T> {
 struct Inner<T> {
     entries: Vec<(String, Arc<T>)>,
     loading: HashMap<String, Arc<Gate<T>>>,
+    failed: HashMap<String, (Instant, String)>,
 }
 
 pub struct TapeCache<T> {
     capacity: usize,
+    failure_ttl: Duration,
     inner: Mutex<Inner<T>>,
+}
+
+fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+enum Lookup<T> {
+    Hit(Arc<T>),
+    Failed(String),
+    Wait(Arc<Gate<T>>),
+    Start(Arc<Gate<T>>),
 }
 
 impl<T: Send + Sync + 'static> TapeCache<T> {
     pub fn new(capacity: usize) -> Arc<Self> {
+        Self::with_failure_ttl(capacity, FAILURE_TTL)
+    }
+
+    pub fn with_failure_ttl(capacity: usize, failure_ttl: Duration) -> Arc<Self> {
         Arc::new(Self {
             capacity: capacity.max(1),
+            failure_ttl,
             inner: Mutex::new(Inner {
                 entries: Vec::new(),
                 loading: HashMap::new(),
+                failed: HashMap::new(),
             }),
         })
     }
 
-    pub fn get(&self, key: &str) -> Option<Arc<T>> {
-        let mut inner = self.inner.lock().unwrap();
+    fn touch(inner: &mut Inner<T>, key: &str) -> Option<Arc<T>> {
         let position = inner.entries.iter().position(|(k, _)| k == key)?;
         let entry = inner.entries.remove(position);
         let value = entry.1.clone();
@@ -45,19 +65,46 @@ impl<T: Send + Sync + 'static> TapeCache<T> {
         Some(value)
     }
 
+    pub fn get(&self, key: &str) -> Option<Arc<T>> {
+        Self::touch(&mut locked(&self.inner), key)
+    }
+
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().entries.len()
+        locked(&self.inner).entries.len()
     }
 
     pub fn remove(&self, key: &str) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = locked(&self.inner);
         inner.entries.retain(|(k, _)| k != key);
+        inner.failed.remove(key);
     }
 
     #[cfg(test)]
     pub fn keys(&self) -> Vec<String> {
-        let inner = self.inner.lock().unwrap();
+        let inner = locked(&self.inner);
         inner.entries.iter().map(|(k, _)| k.clone()).collect()
+    }
+
+    fn lookup(&self, key: &str) -> Lookup<T> {
+        let mut inner = locked(&self.inner);
+        if let Some(value) = Self::touch(&mut inner, key) {
+            return Lookup::Hit(value);
+        }
+        if let Some((at, reason)) = inner.failed.get(key) {
+            if at.elapsed() < self.failure_ttl {
+                return Lookup::Failed(reason.clone());
+            }
+            inner.failed.remove(key);
+        }
+        if let Some(gate) = inner.loading.get(key) {
+            return Lookup::Wait(gate.clone());
+        }
+        let gate = Arc::new(Gate {
+            done: Mutex::new(None),
+            ready: Condvar::new(),
+        });
+        inner.loading.insert(key.to_owned(), gate.clone());
+        Lookup::Start(gate)
     }
 
     pub fn get_or_load(
@@ -66,34 +113,28 @@ impl<T: Send + Sync + 'static> TapeCache<T> {
         budget: Duration,
         load: impl FnOnce() -> Result<T, String> + Send + 'static,
     ) -> Result<Arc<T>, LoadError> {
-        if let Some(value) = self.get(key) {
-            return Ok(value);
-        }
-        let gate = {
-            let mut inner = self.inner.lock().unwrap();
-            if let Some(gate) = inner.loading.get(key) {
-                gate.clone()
-            } else {
-                let gate = Arc::new(Gate {
-                    done: Mutex::new(None),
-                    ready: Condvar::new(),
-                });
-                inner.loading.insert(key.to_owned(), gate.clone());
+        let gate = match self.lookup(key) {
+            Lookup::Hit(value) => return Ok(value),
+            Lookup::Failed(reason) => return Err(LoadError::Failed(reason)),
+            Lookup::Wait(gate) => gate,
+            Lookup::Start(gate) => {
                 let cache = self.clone();
                 let key = key.to_owned();
                 let gate_for_thread = gate.clone();
                 std::thread::spawn(move || {
-                    let outcome = load().map(Arc::new);
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(load))
+                        .unwrap_or_else(|_| Err("tape loader panicked".to_owned()))
+                        .map(Arc::new);
                     cache.finish(&key, &gate_for_thread, outcome);
                 });
                 gate
             }
         };
-        let guard = gate.done.lock().unwrap();
+        let guard = locked(&gate.done);
         let (guard, _) = gate
             .ready
             .wait_timeout_while(guard, budget, |done| done.is_none())
-            .unwrap();
+            .unwrap_or_else(PoisonError::into_inner);
         match guard.as_ref() {
             Some(Ok(value)) => Ok(value.clone()),
             Some(Err(reason)) => Err(LoadError::Failed(reason.clone())),
@@ -103,17 +144,25 @@ impl<T: Send + Sync + 'static> TapeCache<T> {
 
     fn finish(&self, key: &str, gate: &Gate<T>, outcome: Outcome<T>) {
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = locked(&self.inner);
             inner.loading.remove(key);
-            if let Ok(value) = &outcome {
-                inner.entries.retain(|(k, _)| k != key);
-                inner.entries.push((key.to_owned(), value.clone()));
-                while inner.entries.len() > self.capacity {
-                    inner.entries.remove(0);
+            match &outcome {
+                Ok(value) => {
+                    inner.failed.remove(key);
+                    inner.entries.retain(|(k, _)| k != key);
+                    inner.entries.push((key.to_owned(), value.clone()));
+                    while inner.entries.len() > self.capacity {
+                        inner.entries.remove(0);
+                    }
+                }
+                Err(reason) => {
+                    inner
+                        .failed
+                        .insert(key.to_owned(), (Instant::now(), reason.clone()));
                 }
             }
         }
-        *gate.done.lock().unwrap() = Some(outcome);
+        *locked(&gate.done) = Some(outcome);
         gate.ready.notify_all();
     }
 }
@@ -231,14 +280,40 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_load_is_reported_and_not_cached() {
-        let cache = TapeCache::<u32>::new(2);
+    fn a_failed_load_is_cached_briefly_then_retried() {
+        let cache = TapeCache::<u32>::with_failure_ttl(2, Duration::from_millis(100));
 
         let failed = cache.get_or_load("x", Duration::from_secs(5), || Err("boom".to_owned()));
+        let cached = cache.get_or_load("x", Duration::from_secs(5), || Ok(8));
+        std::thread::sleep(Duration::from_millis(150));
         let retried = cache.get_or_load("x", Duration::from_secs(5), || Ok(9));
 
         assert_eq!(failed, Err(LoadError::Failed("boom".to_owned())));
+        assert_eq!(cached, Err(LoadError::Failed("boom".to_owned())));
         assert_eq!(retried.map(|v| *v), Ok(9));
+    }
+
+    #[test]
+    fn remove_clears_a_cached_failure() {
+        let cache = TapeCache::<u32>::new(2);
+        let _ = cache.get_or_load("x", Duration::from_secs(5), || Err("boom".to_owned()));
+        cache.remove("x");
+        let retried = cache.get_or_load("x", Duration::from_secs(5), || Ok(9));
+        assert_eq!(retried.map(|v| *v), Ok(9));
+    }
+
+    #[test]
+    fn a_panicking_loader_fails_the_waiters_instead_of_hanging() {
+        let cache = TapeCache::<u32>::with_failure_ttl(2, Duration::ZERO);
+        let started = Instant::now();
+        let failed = cache.get_or_load("p", Duration::from_secs(5), || panic!("decode bug"));
+        assert_eq!(
+            failed,
+            Err(LoadError::Failed("tape loader panicked".to_owned()))
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        let retried = cache.get_or_load("p", Duration::from_secs(5), || Ok(3));
+        assert_eq!(retried.map(|v| *v), Ok(3));
     }
 
     #[test]
