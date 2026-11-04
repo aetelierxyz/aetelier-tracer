@@ -61,6 +61,7 @@ pub struct AppState {
     pub symbol_stem: Option<String>,
     pub traces: Option<Arc<crate::traces::TraceRuntime>>,
     pub params_path: Option<PathBuf>,
+    pub auth: Arc<crate::auth::ServiceAuth>,
     pub now_ms: fn() -> u64,
 }
 
@@ -157,10 +158,7 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> axum::Router {
             get(crate::traces::trace_artifacts),
         )
         .layer(axum::extract::DefaultBodyLimit::max(TRACE_UPLOAD_BODY_CAP));
-    let app = axum::Router::new()
-        .route("/health", get(health))
-        .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics_text))
+    let api = axum::Router::new()
         .route("/api/tracer/status", get(status))
         .route("/api/tracer/params", get(params))
         .route("/api/tracer/events", get(events))
@@ -169,7 +167,16 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> axum::Router {
         .route("/api/tracer/ledger", get(ledger))
         .route("/api/tracer/replay/ledger", get(replay_ledger))
         .route("/api/tracer/replay/fillrates", get(replay_fillrates))
-        .merge(traces);
+        .merge(traces)
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.auth.clone(),
+            crate::auth::require_service,
+        ));
+    let app = axum::Router::new()
+        .route("/health", get(health))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics_text))
+        .merge(api);
     with_panic_guard(app, state.metrics.clone())
         .layer(cors)
         .layer(axum::middleware::from_fn_with_state(
@@ -226,10 +233,7 @@ fn cors_layer(origins: &[String]) -> tower_http::cors::CorsLayer {
             axum::http::Method::POST,
             axum::http::Method::DELETE,
         ])
-        .allow_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderName::from_static(crate::traces::USER_HEADER),
-        ])
+        .allow_headers([axum::http::header::CONTENT_TYPE])
 }
 
 pub fn origins_from_env() -> Vec<String> {

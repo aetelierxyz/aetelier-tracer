@@ -8,6 +8,9 @@ use tower::ServiceExt;
 #[path = "../src/api.rs"]
 #[allow(dead_code)]
 mod api;
+#[path = "../src/auth.rs"]
+#[allow(dead_code)]
+mod auth;
 #[path = "../src/metrics.rs"]
 #[allow(dead_code)]
 mod metrics;
@@ -53,7 +56,13 @@ fn world(name: &str) -> World {
     world_with_quota(name, traces::DEFAULT_MAX_TRACES_PER_USER)
 }
 
+const TEST_TOKEN: &str = "test-service-token-0123456789abcdef";
+
 fn world_with_quota(name: &str, quota: usize) -> World {
+    world_with(name, quota, auth::AuthMode::Optional)
+}
+
+fn world_with(name: &str, quota: usize, mode: auth::AuthMode) -> World {
     let dir = temp_dir(name);
     let rows = read_fills_csv(&repo_root().join("fixtures/mini_fills_xyz_TSLA.csv")).unwrap();
     let pair = TradingPair::from_str("xyz:TSLA/USDC").unwrap();
@@ -150,6 +159,9 @@ fn world_with_quota(name: &str, quota: usize) -> World {
         symbol_stem: None,
         traces: Some(rt),
         params_path: Some(repo_root().join("params/tracer_params.v1.json")),
+        auth: auth::ServiceAuth::new(mode, Some(TEST_TOKEN))
+            .unwrap()
+            .shared(),
         now_ms: wall_now_ms,
     };
     World {
@@ -198,6 +210,16 @@ async fn post_trace(
     files: &[(&str, &Path)],
     user: Option<&str>,
 ) -> (axum::http::StatusCode, serde_json::Value) {
+    post_trace_as(w, config, files, None, user).await
+}
+
+async fn post_trace_as(
+    w: &World,
+    config: &serde_json::Value,
+    files: &[(&str, &Path)],
+    token: Option<&str>,
+    user: Option<&str>,
+) -> (axum::http::StatusCode, serde_json::Value) {
     let mut req = axum::http::Request::builder()
         .method("POST")
         .uri("/api/tracer/traces")
@@ -205,6 +227,9 @@ async fn post_trace(
             "content-type",
             format!("multipart/form-data; boundary={BOUNDARY}"),
         );
+    if let Some(t) = token {
+        req = req.header("x-aetelier-service", t);
+    }
     if let Some(u) = user {
         req = req.header("x-aetelier-user", u);
     }
@@ -910,8 +935,31 @@ async fn the_quota_refuses_a_further_upload_from_the_same_owner() {
     assert_eq!(status, axum::http::StatusCode::CREATED);
 }
 
+async fn call(
+    w: &World,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    user: Option<&str>,
+) -> (axum::http::StatusCode, Option<serde_json::Value>) {
+    let mut req = axum::http::Request::builder().method(method).uri(uri);
+    if let Some(t) = token {
+        req = req.header("x-aetelier-service", t);
+    }
+    if let Some(u) = user {
+        req = req.header("x-aetelier-user", u);
+    }
+    let resp = app(w)
+        .oneshot(req.body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).ok())
+}
+
 #[tokio::test]
-async fn the_service_credential_replaces_header_absence() {
+async fn the_token_authenticates_the_proxy_and_the_user_header_scopes_it() {
     let w = world("service_cred");
     let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
     let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
@@ -921,32 +969,144 @@ async fn the_service_credential_replaces_header_absence() {
     wait_complete(&w, &id, "user-a").await;
 
     let route = format!("/api/tracer/traces/{id}");
-    let svc = |token: Option<&str>| {
-        let mut req = axum::http::Request::builder().method("GET").uri(&route);
-        if let Some(t) = token {
-            req = req.header("x-aetelier-service", t);
-        }
-        req.body(axum::body::Body::empty()).unwrap()
-    };
+    let ok = axum::http::StatusCode::OK;
+    let unauthorized = axum::http::StatusCode::UNAUTHORIZED;
+    let not_found = axum::http::StatusCode::NOT_FOUND;
+    assert_eq!(call(&w, "GET", &route, Some(TEST_TOKEN), None).await.0, ok);
+    assert_eq!(
+        call(&w, "GET", &route, Some(TEST_TOKEN), Some("user-a"))
+            .await
+            .0,
+        ok
+    );
+    assert_eq!(
+        call(&w, "GET", &route, Some(TEST_TOKEN), Some("user-b"))
+            .await
+            .0,
+        not_found
+    );
+    assert_eq!(
+        call(&w, "GET", &route, Some("wrong"), None).await.0,
+        unauthorized
+    );
+    assert_eq!(
+        call(&w, "GET", &route, Some("wrong"), Some("user-a"))
+            .await
+            .0,
+        unauthorized
+    );
+    assert_eq!(call(&w, "GET", &route, None, None).await.0, unauthorized);
+    assert_eq!(
+        call(&w, "GET", &route, Some(TEST_TOKEN), Some("svc:in-network"))
+            .await
+            .0,
+        unauthorized
+    );
 
-    assert_eq!(
-        app(&w).oneshot(svc(Some("s3cret"))).await.unwrap().status(),
-        axum::http::StatusCode::UNAUTHORIZED
+    let (_, all) = call(&w, "GET", "/api/tracer/traces", Some(TEST_TOKEN), None).await;
+    assert_eq!(all.unwrap()["total"], 1);
+    let (_, scoped) = call(
+        &w,
+        "GET",
+        "/api/tracer/traces",
+        Some(TEST_TOKEN),
+        Some("user-b"),
+    )
+    .await;
+    assert_eq!(scoped.unwrap()["total"], 0);
+}
+
+#[tokio::test]
+async fn required_mode_needs_the_token_on_every_api_route() {
+    let w = world_with(
+        "auth_required",
+        traces::DEFAULT_MAX_TRACES_PER_USER,
+        auth::AuthMode::Required,
     );
-    unsafe { std::env::set_var("TRACER_SERVICE_TOKEN", "s3cret") };
-    assert_eq!(
-        app(&w).oneshot(svc(Some("s3cret"))).await.unwrap().status(),
-        axum::http::StatusCode::OK
-    );
-    assert_eq!(
-        app(&w).oneshot(svc(Some("wrong"))).await.unwrap().status(),
-        axum::http::StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        app(&w).oneshot(svc(None)).await.unwrap().status(),
-        axum::http::StatusCode::UNAUTHORIZED
-    );
-    unsafe { std::env::remove_var("TRACER_SERVICE_TOKEN") };
+    let unauthorized = axum::http::StatusCode::UNAUTHORIZED;
+    let api_routes = [
+        "/api/tracer/status",
+        "/api/tracer/params",
+        "/api/tracer/events",
+        "/api/tracer/gaps",
+        "/api/tracer/fillrates",
+        "/api/tracer/ledger",
+        "/api/tracer/replay/ledger",
+        "/api/tracer/replay/fillrates",
+        "/api/tracer/traces",
+        "/api/tracer/traces/live",
+        "/api/tracer/traces/live/ledger",
+    ];
+    for uri in api_routes {
+        assert_eq!(
+            call(&w, "GET", uri, None, Some("user-a")).await.0,
+            unauthorized,
+            "{uri}"
+        );
+        assert_eq!(
+            call(&w, "GET", uri, Some("wrong"), Some("user-a")).await.0,
+            unauthorized,
+            "{uri}"
+        );
+        assert_ne!(
+            call(&w, "GET", uri, Some(TEST_TOKEN), Some("user-a"))
+                .await
+                .0,
+            unauthorized,
+            "{uri}"
+        );
+    }
+    for uri in ["/health", "/readyz", "/metrics"] {
+        assert_eq!(
+            call(&w, "GET", uri, None, None).await.0,
+            axum::http::StatusCode::OK,
+            "{uri}"
+        );
+    }
+
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let (status, _) = post_trace(&w, &config, files, Some("user-a")).await;
+    assert_eq!(status, unauthorized);
+    let (status, body) = post_trace_as(&w, &config, files, Some(TEST_TOKEN), Some("user-a")).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let id = body["trace_id"].as_str().unwrap().to_string();
+    for _ in 0..300 {
+        let (_, body) = call(
+            &w,
+            "GET",
+            &format!("/api/tracer/traces/{id}"),
+            Some(TEST_TOKEN),
+            Some("user-a"),
+        )
+        .await;
+        if body.unwrap()["status"] == "complete" {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("trace {id} did not complete in required mode");
+}
+
+#[tokio::test]
+async fn cors_no_longer_allows_the_user_header() {
+    let w = world("cors_headers");
+    let req = axum::http::Request::builder()
+        .method("OPTIONS")
+        .uri("/api/tracer/traces")
+        .header("origin", "http://localhost:3000")
+        .header("access-control-request-method", "GET")
+        .header("access-control-request-headers", "x-aetelier-user")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app(&w).oneshot(req).await.unwrap();
+    let allowed = resp
+        .headers()
+        .get("access-control-allow-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(!allowed.contains("x-aetelier-user"), "{allowed}");
 }
 
 #[tokio::test]

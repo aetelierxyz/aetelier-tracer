@@ -26,13 +26,12 @@ use tracer_engine::trace::{
 use tracing::{error, info, warn};
 
 use crate::api::{AppState, EventsQuery, deduped_events, paged_events};
+use crate::auth::{ServiceAuth, ServiceCheck};
 use crate::metrics::Metrics;
 use crate::tape_cache::{LoadError, TapeCache};
 
 pub const TRACE_SCHEMA: &str = "tracer.trace.v1";
 pub const USER_HEADER: &str = "x-aetelier-user";
-pub const SERVICE_HEADER: &str = "x-aetelier-service";
-pub const SERVICE_TOKEN_ENV: &str = "TRACER_SERVICE_TOKEN";
 pub const SERVICE_PRINCIPAL: &str = "svc:in-network";
 pub const LIVE_ID: &str = "live";
 pub const DEFAULT_MAX_TRACES_PER_USER: usize = 50;
@@ -879,29 +878,15 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn secret_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-fn service_credential_matches(headers: &HeaderMap) -> bool {
-    let Some(expected) = std::env::var(SERVICE_TOKEN_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-    else {
-        return false;
-    };
-    header_value(headers, SERVICE_HEADER).is_some_and(|presented| secret_eq(&expected, &presented))
-}
-
-fn caller_of(headers: &HeaderMap) -> Result<Principal, StatusCode> {
-    if service_credential_matches(headers) {
-        return Ok(Principal::Service);
+fn caller_of(auth: &ServiceAuth, headers: &HeaderMap) -> Result<Principal, StatusCode> {
+    if !auth.admits(headers) {
+        return Err(StatusCode::UNAUTHORIZED);
     }
-    header_value(headers, USER_HEADER)
-        .filter(|id| is_owner_id(id))
-        .map(Principal::User)
-        .ok_or(StatusCode::UNAUTHORIZED)
+    match (auth.check(headers), header_value(headers, USER_HEADER)) {
+        (ServiceCheck::Valid, None) => Ok(Principal::Service),
+        (_, Some(id)) if is_owner_id(&id) => Ok(Principal::User(id)),
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
 }
 
 fn is_trace_id(id: &str) -> bool {
@@ -933,8 +918,13 @@ fn visible_to(record: &TraceRecord, caller: &Principal) -> Result<(), StatusCode
     }
 }
 
-fn read_owned(rt: &TraceRuntime, id: &str, headers: &HeaderMap) -> Result<TraceRecord, StatusCode> {
-    let caller = caller_of(headers)?;
+fn read_owned(
+    rt: &TraceRuntime,
+    auth: &ServiceAuth,
+    id: &str,
+    headers: &HeaderMap,
+) -> Result<TraceRecord, StatusCode> {
+    let caller = caller_of(auth, headers)?;
     let record = rt.read_record(id).ok_or(StatusCode::NOT_FOUND)?;
     visible_to(&record, &caller)?;
     Ok(record)
@@ -1054,7 +1044,7 @@ pub async fn create_trace(
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let rt = runtime(&s).map_err(|c| (c, Json(serde_json::json!({"error": "traces disabled"}))))?;
-    let user = caller_of(&headers).map_err(|c| {
+    let user = caller_of(&s.auth, &headers).map_err(|c| {
         (
             c,
             Json(serde_json::json!({"error": "caller identity required"})),
@@ -1247,7 +1237,7 @@ pub async fn list_traces(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let rt = runtime(&s)?;
-    let caller = caller_of(&headers)?;
+    let caller = caller_of(&s.auth, &headers)?;
     let limit = q
         .limit
         .unwrap_or(LIST_LIMIT_DEFAULT)
@@ -1334,7 +1324,7 @@ pub async fn trace_artifacts(
     headers: HeaderMap,
 ) -> Result<axum::response::Response, StatusCode> {
     let rt = runtime(&s)?;
-    let record = read_owned(&rt, &id, &headers)?;
+    let record = read_owned(&rt, &s.auth, &id, &headers)?;
     let dir = rt.dir.join(&record.trace_id);
     let names = artifact_names(&dir);
     match q.name {
@@ -1405,11 +1395,11 @@ pub async fn get_trace(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let rt = runtime(&s)?;
-    caller_of(&headers)?;
+    caller_of(&s.auth, &headers)?;
     if id == LIVE_ID {
         return rt.live_record().map(Json).ok_or(StatusCode::NOT_FOUND);
     }
-    let record = read_owned(&rt, &id, &headers)?;
+    let record = read_owned(&rt, &s.auth, &id, &headers)?;
     Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
 }
 
@@ -1419,18 +1409,19 @@ pub async fn delete_trace(
     headers: HeaderMap,
 ) -> Result<StatusCode, StatusCode> {
     let rt = runtime(&s)?;
-    let record = read_owned(&rt, &id, &headers)?;
+    let record = read_owned(&rt, &s.auth, &id, &headers)?;
     rt.delete_trace(&record.trace_id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 fn trace_artifact(
     rt: &TraceRuntime,
+    auth: &ServiceAuth,
     id: &str,
     name: &str,
     headers: &HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let record = read_owned(rt, id, headers)?;
+    let record = read_owned(rt, auth, id, headers)?;
     if record.status != "complete" {
         return Err(StatusCode::CONFLICT);
     }
@@ -1446,12 +1437,12 @@ pub async fn trace_ledger(
     AxumPath(id): AxumPath<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    caller_of(&headers)?;
+    caller_of(&s.auth, &headers)?;
     if id == LIVE_ID {
         return Ok(crate::api::live_ledger_json(&s, None));
     }
     let rt = runtime(&s)?;
-    trace_artifact(&rt, &id, "corrected_ledger.json", &headers)
+    trace_artifact(&rt, &s.auth, &id, "corrected_ledger.json", &headers)
 }
 
 pub async fn trace_fillrates(
@@ -1459,12 +1450,12 @@ pub async fn trace_fillrates(
     AxumPath(id): AxumPath<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    caller_of(&headers)?;
+    caller_of(&s.auth, &headers)?;
     if id == LIVE_ID {
         return crate::api::live_fillrates_json(&s, "all");
     }
     let rt = runtime(&s)?;
-    trace_artifact(&rt, &id, "fillrates.json", &headers)
+    trace_artifact(&rt, &s.auth, &id, "fillrates.json", &headers)
 }
 
 pub async fn trace_events(
@@ -1473,12 +1464,12 @@ pub async fn trace_events(
     Query(q): Query<EventsQuery>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    caller_of(&headers)?;
+    caller_of(&s.auth, &headers)?;
     let ledger_dir = if id == LIVE_ID {
         s.ledger_dir.clone()
     } else {
         let rt = runtime(&s)?;
-        read_owned(&rt, &id, &headers)?;
+        read_owned(&rt, &s.auth, &id, &headers)?;
         rt.dir.join(&id).join("ledger")
     };
     let page = paged_events(&ledger_dir, &q)?;
@@ -1526,10 +1517,11 @@ fn record_or_live(rt: &TraceRuntime, id: &str) -> Result<TraceRecord, StatusCode
 
 fn owned_record_or_live(
     rt: &TraceRuntime,
+    auth: &ServiceAuth,
     id: &str,
     headers: &HeaderMap,
 ) -> Result<TraceRecord, StatusCode> {
-    let caller = caller_of(headers)?;
+    let caller = caller_of(auth, headers)?;
     let record = record_or_live(rt, id)?;
     visible_to(&record, &caller)?;
     Ok(record)
@@ -1542,7 +1534,7 @@ pub async fn trace_orderbook(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, TapeHttpError> {
     let rt = runtime(&s)?;
-    let record = owned_record_or_live(&rt, &id, &headers)?;
+    let record = owned_record_or_live(&rt, &s.auth, &id, &headers)?;
     let tape = rt
         .tape(&record, Duration::from_millis(TAPE_LOAD_WAIT_MS))
         .map_err(tape_http_error)?;
@@ -1576,7 +1568,7 @@ pub async fn trace_depth(
             load_depth_rows(&[&path], None, None).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         rows.last().cloned().into_iter().collect()
     } else {
-        let record = read_owned(&rt, &id, &headers)?;
+        let record = read_owned(&rt, &s.auth, &id, &headers)?;
         let tape = rt
             .tape(&record, Duration::from_millis(TAPE_LOAD_WAIT_MS))
             .map_err(tape_http_error)?;
@@ -1625,7 +1617,7 @@ pub async fn trace_trades(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, TapeHttpError> {
     let rt = runtime(&s)?;
-    let record = owned_record_or_live(&rt, &id, &headers)?;
+    let record = owned_record_or_live(&rt, &s.auth, &id, &headers)?;
     let tape = rt
         .tape(&record, Duration::from_millis(TAPE_LOAD_WAIT_MS))
         .map_err(tape_http_error)?;
@@ -1705,7 +1697,7 @@ pub async fn trace_schema(
     let path: PathBuf = if id == "live" {
         live_role_parquet(&rt, role)?
     } else {
-        let record = read_owned(&rt, &id, &headers)?;
+        let record = read_owned(&rt, &s.auth, &id, &headers)?;
         match record.inputs.iter().find(|f| f.role == role.label()) {
             Some(file) => rt.dir.join(&id).join("inputs").join(&file.file),
             None if record.tape_source == "live" => live_role_parquet(&rt, role)?,

@@ -6,6 +6,9 @@ use tower::ServiceExt;
 #[path = "../src/api.rs"]
 #[allow(dead_code)]
 mod api;
+#[path = "../src/auth.rs"]
+#[allow(dead_code)]
+mod auth;
 #[path = "../src/metrics.rs"]
 #[allow(dead_code)]
 mod metrics;
@@ -33,6 +36,9 @@ fn state(name: &str) -> AppState {
         symbol_stem: None,
         traces: None,
         params_path: None,
+        auth: auth::ServiceAuth::new(auth::AuthMode::Optional, None)
+            .unwrap()
+            .shared(),
         now_ms: wall_now_ms,
     }
 }
