@@ -9,7 +9,7 @@ fn repo_root() -> PathBuf {
 fn tracked_files() -> Vec<PathBuf> {
     let root = repo_root();
     let mut files = Vec::new();
-    for dir in ["fixtures", "fixtures/api", "params"] {
+    for dir in ["fixtures", "fixtures/api", "fixtures/mini_golden", "params"] {
         for entry in std::fs::read_dir(root.join(dir)).unwrap() {
             let path = entry.unwrap().path();
             if path.is_file() && path.file_name().is_none_or(|n| n != "MANIFEST.sha256") {

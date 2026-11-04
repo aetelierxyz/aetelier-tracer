@@ -1,0 +1,149 @@
+{
+  "deltas_ms": [
+    0,
+    250,
+    1000
+  ],
+  "denominator": "paper_trades",
+  "engine_version": "0.1.0",
+  "entry_cells": [
+    {
+      "gapped": 0,
+      "leg": "entry",
+      "markout_bps": {
+        "m1": {
+          "mean": -0.9763800367240671,
+          "n": 20
+        },
+        "m5": {
+          "mean": -0.620444755436354,
+          "n": 21
+        }
+      },
+      "per_delta": [
+        {
+          "already_through": 3,
+          "delta_ms": 0,
+          "filled_through": 21,
+          "filled_touch": 21
+        },
+        {
+          "already_through": 1,
+          "delta_ms": 250,
+          "filled_through": 21,
+          "filled_touch": 21
+        },
+        {
+          "already_through": 1,
+          "delta_ms": 1000,
+          "filled_through": 21,
+          "filled_touch": 21
+        }
+      ],
+      "posted": 22,
+      "regime": "EXT",
+      "symbol": "xyz_TSLA",
+      "time_to_fill_ms": {
+        "through": {
+          "n": 21,
+          "p50": 56713,
+          "p90": 398059
+        },
+        "touch": {
+          "n": 21,
+          "p50": 56713,
+          "p90": 398059
+        }
+      }
+    },
+    {
+      "gapped": 0,
+      "leg": "entry",
+      "markout_bps": {
+        "m1": {
+          "mean": -4.455982388589907,
+          "n": 15
+        },
+        "m5": {
+          "mean": -13.803591000050831,
+          "n": 15
+        }
+      },
+      "per_delta": [
+        {
+          "already_through": 3,
+          "delta_ms": 0,
+          "filled_through": 15,
+          "filled_touch": 15
+        },
+        {
+          "already_through": 2,
+          "delta_ms": 250,
+          "filled_through": 15,
+          "filled_touch": 15
+        },
+        {
+          "already_through": 2,
+          "delta_ms": 1000,
+          "filled_through": 15,
+          "filled_touch": 15
+        }
+      ],
+      "posted": 17,
+      "regime": "RTH",
+      "symbol": "xyz_TSLA",
+      "time_to_fill_ms": {
+        "through": {
+          "n": 15,
+          "p50": 6079,
+          "p90": 85847
+        },
+        "touch": {
+          "n": 15,
+          "p50": 6079,
+          "p90": 85847
+        }
+      }
+    }
+  ],
+  "exit_cells": [
+    {
+      "exit_unpriced": 0,
+      "filled_through": 16,
+      "filled_touch": 16,
+      "gapped": 0,
+      "leg": "exit",
+      "posted": 21,
+      "regime": "EXT",
+      "symbol": "xyz_TSLA",
+      "taker_cross": 5,
+      "time_to_fill_ms": {
+        "through": {
+          "n": 16,
+          "p50": 15512,
+          "p90": 197007
+        }
+      }
+    },
+    {
+      "exit_unpriced": 0,
+      "filled_through": 13,
+      "filled_touch": 13,
+      "gapped": 0,
+      "leg": "exit",
+      "posted": 15,
+      "regime": "RTH",
+      "symbol": "xyz_TSLA",
+      "taker_cross": 2,
+      "time_to_fill_ms": {
+        "through": {
+          "n": 13,
+          "p50": 8445,
+          "p90": 96028
+        }
+      }
+    }
+  ],
+  "params_version": 1,
+  "schema": "tracer.fillrates.v1"
+}

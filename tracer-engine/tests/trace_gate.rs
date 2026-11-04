@@ -351,6 +351,63 @@ fn mini_signals_trace_reproduces_replay_artifacts_modulo_provenance() {
     );
 }
 
+const MINI_GOLDEN_DIR: &str = "fixtures/mini_golden";
+const MINI_GOLDEN_ARTIFACTS: [&str; 2] = ["corrected_ledger.json", "fillrates.json"];
+const MINI_GOLDEN_EVENTS: &str = "events.jsonl";
+
+fn render_events(events: &[serde_json::Value]) -> String {
+    events
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap() + "\n")
+        .collect()
+}
+
+fn read_golden_json(path: &Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("{}: {e}; regenerate with TRACER_BLESS=1", path.display()));
+    serde_json::from_str(&text).unwrap()
+}
+
+#[test]
+fn mini_replay_outputs_match_committed_goldens() {
+    let w = mini_world("public_golden");
+    let golden_dir = repo_root().join(MINI_GOLDEN_DIR);
+    let events = events_norm(&w.replay_out.join("ledger"));
+    if std::env::var("TRACER_BLESS").is_ok() {
+        std::fs::create_dir_all(&golden_dir).unwrap();
+        for name in MINI_GOLDEN_ARTIFACTS {
+            let v = artifact_norm(&w.replay_out.join(name));
+            std::fs::write(
+                golden_dir.join(name),
+                serde_json::to_string_pretty(&v).unwrap() + "\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(golden_dir.join(MINI_GOLDEN_EVENTS), render_events(&events)).unwrap();
+        return;
+    }
+    for name in MINI_GOLDEN_ARTIFACTS {
+        assert_eq!(
+            artifact_norm(&w.replay_out.join(name)),
+            read_golden_json(&golden_dir.join(name)),
+            "{name} drifted from {MINI_GOLDEN_DIR}; re-pin with TRACER_BLESS=1 only for an intended model change"
+        );
+    }
+    let golden_events: Vec<serde_json::Value> =
+        std::fs::read_to_string(golden_dir.join(MINI_GOLDEN_EVENTS))
+            .unwrap_or_else(|e| panic!("{MINI_GOLDEN_EVENTS}: {e}; regenerate with TRACER_BLESS=1"))
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+    assert_eq!(events.len(), golden_events.len(), "event count drifted");
+    for (i, (got, want)) in events.iter().zip(&golden_events).enumerate() {
+        assert_eq!(
+            got, want,
+            "event {i} drifted from {MINI_GOLDEN_DIR}/{MINI_GOLDEN_EVENTS}"
+        );
+    }
+}
+
 #[test]
 fn trace_artifacts_carry_trace_stamps() {
     let w = mini_world("stamps");
