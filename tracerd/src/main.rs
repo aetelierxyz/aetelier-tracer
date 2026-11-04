@@ -16,7 +16,9 @@ use tracer_engine::corrected::{
     DEFAULT_CROSS_WINDOW_MS, DEFAULT_GRACE_MS, emit_events, evaluate, write_artifacts,
 };
 use tracer_engine::engine::EngineStatus;
-use tracer_engine::engine::{DEFAULT_IDLE_AFTER_MS, LiveConfig, LiveEngine};
+use tracer_engine::engine::{
+    DEFAULT_BOOKS_STALL_MS, DEFAULT_IDLE_AFTER_MS, LiveConfig, LiveEngine,
+};
 use tracer_engine::ledger::LedgerWriter;
 use tracer_engine::nyse::regime_label;
 use tracer_engine::params::TracerParams;
@@ -66,6 +68,8 @@ enum Command {
         cross_window_ms: u64,
         #[arg(long, env = "TRACER_IDLE_AFTER_MS", default_value_t = DEFAULT_IDLE_AFTER_MS)]
         idle_after_ms: u64,
+        #[arg(long, env = "TRACER_BOOKS_STALL_MS", default_value_t = DEFAULT_BOOKS_STALL_MS)]
+        books_stall_ms: u64,
         #[arg(long, env = "TRACER_TRACES_DIR")]
         traces_dir: Option<PathBuf>,
         #[arg(long, env = "TRACER_MAX_TRACES_PER_USER", default_value_t = traces::DEFAULT_MAX_TRACES_PER_USER)]
@@ -172,6 +176,7 @@ async fn run_live(
     grace_ms: u64,
     cross_window_ms: u64,
     idle_after_ms: u64,
+    books_stall_ms: u64,
     traces_dir: Option<PathBuf>,
     max_traces_per_user: usize,
     tape_retention_ms: u64,
@@ -203,6 +208,7 @@ async fn run_live(
         cross_window_ms,
         queue_verdicts,
         idle_after_ms,
+        books_stall_ms,
     };
     let mut engine = LiveEngine::new(
         params,
@@ -357,6 +363,7 @@ fn record_engine_status(metrics: &Metrics, status: &EngineStatus) {
     );
     metrics.set("tracer_paper_n", &[], status.paper_n as f64);
     metrics.set_flag("tracer_idle", &[], status.idle);
+    metrics.set_flag("tracer_books_degraded", &[], status.books_degraded);
     metrics.set_flag("tracer_binding_pending", &[], status.binding_pending);
     metrics.set_flag("tracer_calendar_expired", &[], status.calendar_expired);
 }
@@ -538,6 +545,7 @@ async fn main() -> anyhow::Result<()> {
             grace_ms,
             cross_window_ms,
             idle_after_ms,
+            books_stall_ms,
             traces_dir,
             max_traces_per_user,
             tape_retention_ms,
@@ -556,6 +564,7 @@ async fn main() -> anyhow::Result<()> {
                 grace_ms,
                 cross_window_ms,
                 idle_after_ms,
+                books_stall_ms,
                 traces_dir,
                 max_traces_per_user,
                 tape_retention_ms,
