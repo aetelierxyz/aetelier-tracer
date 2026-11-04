@@ -72,6 +72,46 @@ pub fn wall_now_ms() -> u64 {
 }
 
 const TRACE_UPLOAD_BODY_CAP: usize = 450 * 1024 * 1024;
+pub const EVENTS_LIMIT_DEFAULT: usize = 200;
+pub const EVENTS_LIMIT_MAX: usize = 1000;
+pub const PANICS_METRIC: &str = "tracer_http_panics_total";
+
+#[derive(Clone)]
+struct PanicResponse(Arc<crate::metrics::Metrics>);
+
+impl tower_http::catch_panic::ResponseForPanic for PanicResponse {
+    type ResponseBody = axum::body::Body;
+
+    fn response_for_panic(
+        &mut self,
+        err: Box<dyn std::any::Any + Send + 'static>,
+    ) -> axum::http::Response<Self::ResponseBody> {
+        let message = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default();
+        tracing::error!(panic = %message, "handler panicked");
+        self.0.inc(PANICS_METRIC, &[]);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "internal error"})),
+        )
+            .into_response()
+    }
+}
+
+pub fn with_panic_guard<S>(
+    app: axum::Router<S>,
+    metrics: Arc<crate::metrics::Metrics>,
+) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    app.layer(tower_http::catch_panic::CatchPanicLayer::custom(
+        PanicResponse(metrics),
+    ))
+}
 
 pub fn router(state: AppState, allowed_origins: &[String]) -> axum::Router {
     let cors = cors_layer(allowed_origins);
@@ -117,7 +157,7 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> axum::Router {
             get(crate::traces::trace_artifacts),
         )
         .layer(axum::extract::DefaultBodyLimit::max(TRACE_UPLOAD_BODY_CAP));
-    axum::Router::new()
+    let app = axum::Router::new()
         .route("/health", get(health))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_text))
@@ -129,7 +169,8 @@ pub fn router(state: AppState, allowed_origins: &[String]) -> axum::Router {
         .route("/api/tracer/ledger", get(ledger))
         .route("/api/tracer/replay/ledger", get(replay_ledger))
         .route("/api/tracer/replay/fillrates", get(replay_fillrates))
-        .merge(traces)
+        .merge(traces);
+    with_panic_guard(app, state.metrics.clone())
         .layer(cors)
         .layer(axum::middleware::from_fn_with_state(
             state.metrics.clone(),
@@ -328,7 +369,10 @@ pub fn deduped_events(ledger_dir: &PathBuf) -> Vec<(String, usize, Event)> {
 }
 
 pub fn paged_events(ledger_dir: &PathBuf, q: &EventsQuery) -> Result<EventsPage, StatusCode> {
-    let limit = q.limit.unwrap_or(200).min(1000);
+    let limit = q
+        .limit
+        .unwrap_or(EVENTS_LIMIT_DEFAULT)
+        .clamp(1, EVENTS_LIMIT_MAX);
     let start = match &q.cursor {
         None => None,
         Some(c) => Some(decode_cursor(c).ok_or(StatusCode::BAD_REQUEST)?),

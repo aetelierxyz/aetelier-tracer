@@ -573,3 +573,45 @@ async fn duplicate_reappended_events_do_not_move_displayed_rates() {
     assert_eq!(ids.len(), n, "duplicate event_ids leaked across pages");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test]
+async fn events_limit_is_clamped_to_its_bounds() {
+    let dir = std::env::temp_dir().join("tracer_api_events_limit_clamp");
+    build_fixture_ledger(&dir);
+    let origins = vec!["http://localhost:3000".to_string()];
+    let app = || router(state(&dir), &origins);
+
+    let (code, all) = get_json(app(), "/api/tracer/events?limit=1000").await;
+    assert_eq!(code, 200);
+    let total = all["events"].as_array().unwrap().len();
+    assert!(total > 1);
+
+    let (code, one) = get_json(app(), "/api/tracer/events?limit=0").await;
+    assert_eq!(code, 200);
+    assert_eq!(one["events"].as_array().unwrap().len(), 1);
+    assert!(one["older_cursor"].is_string());
+
+    let (code, capped) = get_json(app(), "/api/tracer/events?limit=5000").await;
+    assert_eq!(code, 200);
+    assert_eq!(capped["events"].as_array().unwrap().len(), total);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn handler_panic_returns_500_and_is_counted() {
+    let metrics = metrics::Metrics::shared();
+    let boom = axum::Router::new().route(
+        "/boom",
+        axum::routing::get(|| async {
+            if FIXED_NOW_MS > 0 {
+                panic!("boom");
+            }
+            "unreachable"
+        }),
+    );
+    let app = api::with_panic_guard(boom, metrics.clone());
+    let (code, body) = get_json(app, "/boom").await;
+    assert_eq!(code, 500);
+    assert_eq!(body["error"], "internal error");
+    assert_eq!(metrics.counter(api::PANICS_METRIC, &[]), 1);
+}
