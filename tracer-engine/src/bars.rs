@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use crate::nyse::{Regime, regime};
+use crate::nyse::{Regime, regime, regime_label};
 
 pub const FILLS_HEADER: &str = "coin,time_ms,px,sz,side,crossed,tid,block_number,block_time";
 pub const BARS_HEADER: &str = "open_ms,close_ms,n,buy_usd,sell_usd,vwap,last_px,regime";
@@ -95,7 +95,7 @@ pub fn auto_threshold(rows: &[FillRow], target_secs: f64) -> (f64, &'static str)
         all_usd += usd;
         all_span.0 = all_span.0.min(r.time_ms);
         all_span.1 = all_span.1.max(r.time_ms);
-        if regime(r.time_ms) == Regime::Rth {
+        if regime(r.time_ms) == Some(Regime::Rth) {
             rth_usd += usd;
             rth_span_ms.0 = rth_span_ms.0.min(r.time_ms);
             rth_span_ms.1 = rth_span_ms.1.max(r.time_ms);
@@ -179,7 +179,7 @@ pub fn write_bars_csv(bars: &[Bar], path: &Path) -> anyhow::Result<()> {
             b.sell_usd,
             b.vwap,
             b.last_px,
-            regime(b.close_ms).label()
+            regime_label(b.close_ms)
         )?;
     }
     w.flush()?;

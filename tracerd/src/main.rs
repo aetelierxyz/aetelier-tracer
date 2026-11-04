@@ -18,7 +18,7 @@ use tracer_engine::corrected::{
 use tracer_engine::engine::EngineStatus;
 use tracer_engine::engine::{DEFAULT_IDLE_AFTER_MS, LiveConfig, LiveEngine};
 use tracer_engine::ledger::LedgerWriter;
-use tracer_engine::nyse::regime;
+use tracer_engine::nyse::regime_label;
 use tracer_engine::params::TracerParams;
 use tracer_engine::replay::{load_symbol_data, paper_trades_from};
 
@@ -176,6 +176,7 @@ async fn run_live(
     max_traces_per_user: usize,
     tape_retention_ms: u64,
 ) -> anyhow::Result<()> {
+    tracer_engine::bounds::check_windows(grace_ms, cross_window_ms)?;
     let params = TracerParams::load(&params_path)?;
     let auth = auth::ServiceAuth::from_env()?.shared();
     let stem = symbol.replace(':', "_");
@@ -371,6 +372,7 @@ fn run_replay(
     grace_ms: u64,
     cross_window_ms: u64,
 ) -> anyhow::Result<()> {
+    tracer_engine::bounds::check_windows(grace_ms, cross_window_ms)?;
     let params = TracerParams::load(params_path)?;
     let data = load_symbol_data(fills, &params)?;
     let trades = paper_trades_from(&data, &params)?;
@@ -500,7 +502,7 @@ fn export_golden(
             t.fee_entry_usd,
             t.fee_exit_usd,
             t.pnl_usd,
-            regime(t.t_entry_ms).label()
+            regime_label(t.t_entry_ms)
         )?;
     }
     w.flush()?;
