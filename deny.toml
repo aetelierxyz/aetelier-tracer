@@ -4,11 +4,7 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-    "RUSTSEC-2024-0320",
-    "RUSTSEC-2024-0436",
-    "RUSTSEC-2026-0189",
-]
+ignore = []
 
 [licenses]
 version = 2
@@ -37,4 +33,4 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = ["https://github.com/IteraLabs/aetelier-sdk"]
+allow-git = ["https://github.com/aetelierxyz/aetelier-sdk"]
