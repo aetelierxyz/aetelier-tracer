@@ -25,6 +25,7 @@ uuid.workspace = true
 [dev-dependencies]
 aetelier-io.workspace = true
 aetelier-types.workspace = true
+futures-util = "0.3"
 http-body-util = "0.1"
 rust_decimal.workspace = true
 tower = { version = "0.5", features = ["util"] }

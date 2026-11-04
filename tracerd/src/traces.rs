@@ -981,10 +981,9 @@ impl Drop for StagedUpload {
 
 async fn stage_upload(
     staging_root: &Path,
-    stamp: u64,
     multipart: &mut Multipart,
 ) -> Result<(Option<TraceConfigIn>, StagedUpload), (StatusCode, Json<serde_json::Value>)> {
-    let dir = staging_root.join(format!("staging_{stamp}_{}", std::process::id()));
+    let dir = staging_root.join(format!("staging_{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).map_err(|e| bad_request(format!("staging dir: {e}")))?;
     let mut staged = StagedUpload {
         dir: dir.clone(),
@@ -1073,7 +1072,7 @@ pub async fn create_trace(
         ));
     }
     let now = now_from(&s);
-    let (config, staged) = stage_upload(&rt.dir, now, &mut multipart).await?;
+    let (config, staged) = stage_upload(&rt.dir, &mut multipart).await?;
     let config = config.ok_or_else(|| bad_request("missing config part".into()))?;
 
     let overrides = (config.notional_usd.is_some()
