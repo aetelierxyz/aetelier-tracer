@@ -162,6 +162,7 @@ fn world_with(name: &str, quota: usize, mode: auth::AuthMode) -> World {
         auth: auth::ServiceAuth::new(mode, Some(TEST_TOKEN))
             .unwrap()
             .shared(),
+        heavy: api::heavy_permits(),
         now_ms: wall_now_ms,
     };
     World {
@@ -507,6 +508,58 @@ async fn trace_config_rejects_unknown_fields_and_out_of_bounds_overrides() {
     });
     let (status, body) = post_trace(&w, &ok, files, Some(OWNER)).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn heavy_routes_answer_busy_while_light_routes_keep_serving() {
+    let w = world("heavy_busy");
+    let config = serde_json::json!({"order_source": "strategy", "tape": "upload"});
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let (status, body) = post_trace(&w, &config, files, Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let id = body["trace_id"].as_str().unwrap().to_string();
+    wait_complete(&w, &id, OWNER).await;
+
+    let held = w
+        .state
+        .heavy
+        .clone()
+        .acquire_many_owned(api::HEAVY_CONCURRENCY as u32)
+        .await
+        .unwrap();
+    let heavy_routes = [
+        format!("/api/tracer/traces/{id}/trades"),
+        format!("/api/tracer/traces/{id}/depth"),
+        format!("/api/tracer/traces/{id}/orderbook"),
+        format!("/api/tracer/traces/{id}/schema?source=trades"),
+        format!("/api/tracer/traces/{id}/events"),
+    ];
+    for uri in &heavy_routes {
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .header("x-aetelier-user", OWNER)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app(&w).oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{uri}"
+        );
+        assert!(resp.headers().contains_key("retry-after"), "{uri}");
+    }
+    let (status, _) = post_trace(&w, &config, files, Some("user-b")).await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let (status, _) = get_text(&w, "/health", None).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let (status, _) = get_json(&w, &format!("/api/tracer/traces/{id}"), Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+
+    drop(held);
+    for uri in &heavy_routes {
+        let (status, _) = get_json(&w, uri, Some(OWNER)).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{uri}");
+    }
 }
 
 #[tokio::test]

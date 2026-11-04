@@ -814,6 +814,57 @@ fn build_tape(
 pub enum TapeHttpError {
     Status(StatusCode),
     Loading,
+    Busy,
+}
+
+pub struct Busy;
+
+impl From<Busy> for TapeHttpError {
+    fn from(_: Busy) -> Self {
+        Self::Busy
+    }
+}
+
+impl From<Busy> for (StatusCode, Json<serde_json::Value>) {
+    fn from(_: Busy) -> Self {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "busy, retry shortly"})),
+        )
+    }
+}
+
+async fn off_runtime<T, E>(
+    heavy: &Arc<tokio::sync::Semaphore>,
+    work: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<T, E>
+where
+    T: Send + 'static,
+    E: From<Busy> + Send + 'static,
+{
+    let permit = heavy.clone().try_acquire_owned().map_err(|_| Busy)?;
+    let joined = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await;
+    match joined {
+        Ok(result) => result,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(_) => Err(Busy.into()),
+    }
+}
+
+async fn tape_off_runtime(
+    heavy: &Arc<tokio::sync::Semaphore>,
+    rt: Arc<TraceRuntime>,
+    record: TraceRecord,
+) -> Result<Arc<CachedTape>, TapeHttpError> {
+    off_runtime(heavy, move || {
+        rt.tape(&record, Duration::from_millis(TAPE_LOAD_WAIT_MS))
+            .map_err(tape_http_error)
+    })
+    .await
 }
 
 impl From<StatusCode> for TapeHttpError {
@@ -830,6 +881,12 @@ impl IntoResponse for TapeHttpError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 [(axum::http::header::RETRY_AFTER, TAPE_RETRY_AFTER_S)],
                 Json(serde_json::json!({"schema": "tracer.tapeloading.v1", "loading": true})),
+            )
+                .into_response(),
+            Self::Busy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::RETRY_AFTER, TAPE_RETRY_AFTER_S)],
+                Json(serde_json::json!({"schema": "tracer.busy.v1", "busy": true})),
             )
                 .into_response(),
         }
@@ -1133,11 +1190,14 @@ pub async fn create_trace(
         cross_window_ms,
         gap_spans,
     };
-    let prepared =
-        match prepare(&req, &base_params).map_err(|e| bad_request(format!("prepare: {e:#}")))? {
-            Err(report) => return Err(rejection(&report)),
-            Ok(p) => p,
-        };
+    let outcome = off_runtime(&s.heavy, move || {
+        prepare(&req, &base_params).map_err(|e| bad_request(format!("prepare: {e:#}")))
+    })
+    .await?;
+    let prepared = match outcome {
+        Err(report) => return Err(rejection(&report)),
+        Ok(p) => p,
+    };
     let trace_id = scoped_trace_id(&prepared.trace_id, user.owner());
 
     if config.preflight_only {
@@ -1470,7 +1530,7 @@ pub async fn trace_events(
     AxumPath(id): AxumPath<String>,
     Query(q): Query<EventsQuery>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, TapeHttpError> {
     caller_of(&s.auth, &headers)?;
     let ledger_dir = if id == LIVE_ID {
         s.ledger_dir.clone()
@@ -1479,7 +1539,10 @@ pub async fn trace_events(
         read_owned(&rt, &s.auth, &id, &headers)?;
         rt.dir.join(&id).join("ledger")
     };
-    let page = paged_events(&ledger_dir, &q)?;
+    let page = off_runtime(&s.heavy, move || {
+        paged_events(&ledger_dir, &q).map_err(TapeHttpError::from)
+    })
+    .await?;
     Ok(Json(serde_json::to_value(page).unwrap_or_default()))
 }
 
@@ -1542,9 +1605,7 @@ pub async fn trace_orderbook(
 ) -> Result<Json<serde_json::Value>, TapeHttpError> {
     let rt = runtime(&s)?;
     let record = owned_record_or_live(&rt, &s.auth, &id, &headers)?;
-    let tape = rt
-        .tape(&record, Duration::from_millis(TAPE_LOAD_WAIT_MS))
-        .map_err(tape_http_error)?;
+    let tape = tape_off_runtime(&s.heavy, rt.clone(), record).await?;
     let points = q.points.unwrap_or(1024).min(4096);
     let series = book_series(&tape.books, q.t0, q.t1, points);
     Ok(Json(serde_json::json!({
@@ -1571,18 +1632,29 @@ pub async fn trace_depth(
     let max_rows = q.max.unwrap_or(DEPTH_ROWS_DEFAULT).clamp(1, DEPTH_ROWS_CAP);
     let rows: Vec<DepthRow> = if id == LIVE_ID {
         let path = live_role_parquet(&rt, TapeRole::Orderbook)?;
-        let rows =
-            load_depth_rows(&[&path], None, None).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        rows.last().cloned().into_iter().collect()
+        off_runtime(&s.heavy, move || {
+            let rows = load_depth_rows(&[&path], None, None)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            Ok::<_, TapeHttpError>(rows.last().cloned().into_iter().collect())
+        })
+        .await?
     } else {
         let record = read_owned(&rt, &s.auth, &id, &headers)?;
-        let tape = rt
-            .tape(&record, Duration::from_millis(TAPE_LOAD_WAIT_MS))
-            .map_err(tape_http_error)?;
-        if tape.books_files.is_empty() {
-            return Err(StatusCode::NOT_FOUND.into());
-        }
-        decimate_depth(depth_window(&tape.depth, q.from, q.to).to_vec(), max_rows)
+        let (from, to) = (q.from, q.to);
+        let rt = rt.clone();
+        off_runtime(&s.heavy, move || {
+            let tape = rt
+                .tape(&record, Duration::from_millis(TAPE_LOAD_WAIT_MS))
+                .map_err(tape_http_error)?;
+            if tape.books_files.is_empty() {
+                return Err(TapeHttpError::from(StatusCode::NOT_FOUND));
+            }
+            Ok(decimate_depth(
+                depth_window(&tape.depth, from, to).to_vec(),
+                max_rows,
+            ))
+        })
+        .await?
     };
     Ok(Json(serde_json::json!({
         "schema": "tracer.tracedepth.v1",
@@ -1625,9 +1697,7 @@ pub async fn trace_trades(
 ) -> Result<Json<serde_json::Value>, TapeHttpError> {
     let rt = runtime(&s)?;
     let record = owned_record_or_live(&rt, &s.auth, &id, &headers)?;
-    let tape = rt
-        .tape(&record, Duration::from_millis(TAPE_LOAD_WAIT_MS))
-        .map_err(tape_http_error)?;
+    let tape = tape_off_runtime(&s.heavy, rt.clone(), record).await?;
     let limit = q.limit.unwrap_or(100).min(1000);
     let offset = q.cursor.unwrap_or(0);
     let order = q.order.unwrap_or_default();
@@ -1694,12 +1764,12 @@ pub async fn trace_schema(
     AxumPath(id): AxumPath<String>,
     Query(q): Query<SchemaQuery>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, TapeHttpError> {
     let rt = runtime(&s)?;
     let role = match q.source.as_str() {
         "orderbook" => TapeRole::Orderbook,
         "trades" => TapeRole::Trades,
-        _ => return Err(StatusCode::BAD_REQUEST),
+        _ => return Err(StatusCode::BAD_REQUEST.into()),
     };
     let path: PathBuf = if id == "live" {
         live_role_parquet(&rt, role)?
@@ -1708,15 +1778,47 @@ pub async fn trace_schema(
         match record.inputs.iter().find(|f| f.role == role.label()) {
             Some(file) => rt.dir.join(&id).join("inputs").join(&file.file),
             None if record.tape_source == "live" => live_role_parquet(&rt, role)?,
-            None => return Err(StatusCode::NOT_FOUND),
+            None => return Err(StatusCode::NOT_FOUND.into()),
         }
     };
-    let fields: Vec<SchemaFieldOut> =
-        parquet_schema_fields(&path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let fields: Vec<SchemaFieldOut> = off_runtime(&s.heavy, move || {
+        parquet_schema_fields(&path)
+            .map_err(|_| TapeHttpError::from(StatusCode::INTERNAL_SERVER_ERROR))
+    })
+    .await?;
     Ok(Json(serde_json::json!({
         "schema": "tracer.traceschema.v1",
         "trace_id": id,
         "source": role.label(),
         "fields": fields,
     })))
+}
+
+#[cfg(test)]
+mod off_runtime_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_work_leaves_the_runtime_free_and_excess_work_is_busy() {
+        let heavy = Arc::new(tokio::sync::Semaphore::new(1));
+        let started = Instant::now();
+        let slow = off_runtime::<u32, TapeHttpError>(&heavy, || {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(7)
+        });
+        let probe = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let ticked = started.elapsed();
+            let busy = off_runtime::<u32, TapeHttpError>(&heavy, || Ok(1)).await;
+            (ticked, busy)
+        };
+        let (slow, (ticked, busy)) = tokio::join!(slow, probe);
+        assert!(ticked < Duration::from_millis(200), "{ticked:?}");
+        assert!(matches!(busy, Err(TapeHttpError::Busy)));
+        assert!(matches!(slow, Ok(7)));
+        assert!(matches!(
+            off_runtime::<u32, TapeHttpError>(&heavy, || Ok(2)).await,
+            Ok(2)
+        ));
+    }
 }
