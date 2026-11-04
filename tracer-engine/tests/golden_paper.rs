@@ -2,7 +2,7 @@ mod golden_pin;
 
 use std::path::{Path, PathBuf};
 
-use tracer_engine::nyse::regime;
+use tracer_engine::nyse::regime_label;
 use tracer_engine::paper::ExecutedTrade;
 use tracer_engine::params::TracerParams;
 use tracer_engine::replay::paper_trades;
@@ -78,7 +78,7 @@ fn render_golden(trades: &[ExecutedTrade]) -> String {
             t.fee_entry_usd,
             t.fee_exit_usd,
             t.pnl_usd,
-            regime(t.t_entry_ms).label()
+            regime_label(t.t_entry_ms)
         ));
     }
     out
@@ -99,7 +99,7 @@ fn assert_matches(trades: &[ExecutedTrade], golden: &[GoldenRow]) {
         assert_eq!(t.fee_entry_usd, g.fee_entry_usd, "row {i} fee_entry_usd");
         assert_eq!(t.fee_exit_usd, g.fee_exit_usd, "row {i} fee_exit_usd");
         assert_eq!(t.pnl_usd, g.pnl_usd, "row {i} pnl_usd");
-        assert_eq!(regime(t.t_entry_ms).label(), g.regime, "row {i} regime");
+        assert_eq!(regime_label(t.t_entry_ms), g.regime, "row {i} regime");
     }
 }
 

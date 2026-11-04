@@ -931,6 +931,7 @@ fn read_owned(
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TraceConfigIn {
     order_source: String,
     tape: String,
@@ -1077,6 +1078,12 @@ pub async fn create_trace(
     });
     let grace_ms = config.grace_ms.unwrap_or(rt.grace_ms);
     let cross_window_ms = config.cross_window_ms.unwrap_or(rt.cross_window_ms);
+    tracer_engine::bounds::check_windows(grace_ms, cross_window_ms)
+        .map_err(|e| bad_request(format!("config: {e:#}")))?;
+    if let Some(ov) = &overrides {
+        ov.validate()
+            .map_err(|e| bad_request(format!("config: {e:#}")))?;
+    }
 
     let part = |role: &str| staged.files.iter().find(|(n, _)| n == role);
     let (tape_files, gap_spans, tape_source) = match config.tape.as_str() {

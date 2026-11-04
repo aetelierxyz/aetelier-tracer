@@ -98,7 +98,7 @@ pub fn scan_maker(
     window_end_ms: u64,
     post_last_px: Option<f64>,
 ) -> MakerScan {
-    let t_start = t_post_ms + delta_ms;
+    let t_start = t_post_ms.saturating_add(delta_ms);
     let last_px = if delta_ms == 0 {
         post_last_px.or_else(|| last_px_at_or_before(trades, t_start))
     } else {
@@ -154,7 +154,7 @@ pub fn markout_bps(
     window_ms: u64,
     position_dir: i8,
 ) -> Option<f64> {
-    let idx = idx_after(trades, fill.ts_ms + window_ms);
+    let idx = idx_after(trades, fill.ts_ms.saturating_add(window_ms));
     if idx == 0 {
         return None;
     }

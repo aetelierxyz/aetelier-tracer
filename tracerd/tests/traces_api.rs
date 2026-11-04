@@ -31,7 +31,7 @@ use tracer_engine::bars::read_fills_csv;
 use tracer_engine::ledger::{
     EVENT_SCHEMA, Event, EventKind, LedgerWriter, Leg, Mode, PostState, event_id, trade_id,
 };
-use tracer_engine::nyse::regime;
+use tracer_engine::nyse::regime_label;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
@@ -392,7 +392,7 @@ async fn strict_rejection_returns_422_row_error_report() {
     let w = world("reject");
     let (t_min, _) = w.span;
     let t_entry = t_min + 3_600_000;
-    let wrong_regime = if regime(t_entry).label() == "RTH" {
+    let wrong_regime = if regime_label(t_entry) == "RTH" {
         "EXT"
     } else {
         "RTH"
@@ -432,6 +432,81 @@ async fn strict_rejection_returns_422_row_error_report() {
 
     let (status, _) = get_json(&w, "/api/tracer/traces", Some(OWNER)).await;
     assert_eq!(status, axum::http::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn out_of_range_signal_timestamps_are_row_errors_not_panics() {
+    let w = world("signals_ts_range");
+    let huge = u64::MAX;
+    let beyond_chrono = 9_000_000_000_000_000u64;
+    let signals = format!(
+        "{}\nxyz_TSLA,1,0.5,5,{huge},396.0,{huge},{huge},395.0,-0.1,-0.1,0.0,RTH\nxyz_TSLA,1,0.5,5,{beyond_chrono},396.0,{beyond_chrono},{beyond_chrono},395.0,-0.1,-0.1,0.0,RTH\n",
+        tracer_engine::trace::SIGNALS_HEADER,
+    );
+    let signals_path = w.dir.join("out_of_range.csv");
+    std::fs::write(&signals_path, signals).unwrap();
+    let config = serde_json::json!({"order_source": "signals", "tape": "upload"});
+    let (status, body) = post_trace(
+        &w,
+        &config,
+        &[
+            ("orderbook", &w.ob_parquet),
+            ("trades", &w.trades_parquet),
+            ("signals", &signals_path),
+        ],
+        Some(OWNER),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+        "{body}"
+    );
+    let errors = body["row_errors"].as_array().unwrap();
+    for row in [1, 2] {
+        for field in ["t_entry_ms", "t_exit_ms", "t_exit_real_ms"] {
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e["row"] == row && e["field"] == field),
+                "row {row} {field} missing in {errors:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn trace_config_rejects_unknown_fields_and_out_of_bounds_overrides() {
+    let w = world("config_bounds");
+    let files: &[(&str, &Path)] = &[("orderbook", &w.ob_parquet), ("trades", &w.trades_parquet)];
+    let eight_days = 8 * 24 * 60 * 60 * 1000u64;
+    let cases = [
+        serde_json::json!({"order_source": "strategy", "tape": "upload", "hold": 900000}),
+        serde_json::json!({"order_source": "strategy", "tape": "upload", "hold_ms": 0}),
+        serde_json::json!({"order_source": "strategy", "tape": "upload", "hold_ms": eight_days}),
+        serde_json::json!({"order_source": "strategy", "tape": "upload", "grace_ms": eight_days}),
+        serde_json::json!({"order_source": "strategy", "tape": "upload", "cross_window_ms": u64::MAX}),
+        serde_json::json!({"order_source": "strategy", "tape": "upload", "notional_usd": -1.0}),
+        serde_json::json!({"order_source": "strategy", "tape": "upload", "maker_fee_leg_bps": 5000.0}),
+    ];
+    for config in cases {
+        let (status, body) = post_trace(&w, &config, files, Some(OWNER)).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{config} {body}"
+        );
+    }
+    let ok = serde_json::json!({
+        "order_source": "strategy",
+        "tape": "upload",
+        "preflight_only": true,
+        "hold_ms": 600000,
+        "grace_ms": 300000,
+        "cross_window_ms": 60000,
+    });
+    let (status, body) = post_trace(&w, &ok, files, Some(OWNER)).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
 }
 
 #[tokio::test]

@@ -17,7 +17,7 @@ use tracer_engine::corrected::{
     DEFAULT_CROSS_WINDOW_MS, DEFAULT_GRACE_MS, emit_events, evaluate, write_artifacts,
 };
 use tracer_engine::ledger::LedgerWriter;
-use tracer_engine::nyse::regime;
+use tracer_engine::nyse::regime_label;
 use tracer_engine::paper::ExecutedTrade;
 use tracer_engine::params::TracerParams;
 use tracer_engine::replay::load_symbol_data;
@@ -137,7 +137,7 @@ fn render_signals(trades: &[ExecutedTrade]) -> String {
             t.fee_entry_usd,
             t.fee_exit_usd,
             t.pnl_usd,
-            regime(t.t_entry_ms).label()
+            regime_label(t.t_entry_ms)
         ));
     }
     out
@@ -421,7 +421,7 @@ fn row_error_permutations_produce_a_complete_report() {
             t.fee_entry_usd,
             t.fee_exit_usd,
             t.pnl_usd,
-            regime(t.t_entry_ms).label()
+            regime_label(t.t_entry_ms)
         )
     };
     csv.push_str(&good(t));
@@ -431,20 +431,20 @@ fn row_error_permutations_produce_a_complete_report() {
         t.t_entry_ms,
         t.t_entry_ms + hold,
         t.t_entry_ms + hold,
-        regime(t.t_entry_ms).label()
+        regime_label(t.t_entry_ms)
     ));
     csv.push_str(&format!(
         "xyz_TSLA,2,0.5,11,{},-4.0,{},{},100.0,-0.1,-0.1,0.0,{}\n",
         t.t_entry_ms,
         t.t_entry_ms + hold + 1,
         t.t_entry_ms + hold + 2,
-        regime(t.t_entry_ms).label()
+        regime_label(t.t_entry_ms)
     ));
     csv.push_str(&format!(
         "xyz_TSLA,-1,NaN,5,{span_break},100.0,{},{},100.0,-0.1,-0.1,0.0,{}\n",
         span_break + hold,
         span_break,
-        if regime(span_break).label() == "RTH" {
+        if regime_label(span_break) == "RTH" {
             "EXT"
         } else {
             "RTH"
@@ -623,7 +623,7 @@ fn signals_row_cap_rejects() {
         t.fee_entry_usd,
         t.fee_exit_usd,
         t.pnl_usd,
-        regime(t.t_entry_ms).label()
+        regime_label(t.t_entry_ms)
     );
     for _ in 0..=tracer_engine::trace::MAX_SIGNAL_ROWS {
         csv.push_str(&row);

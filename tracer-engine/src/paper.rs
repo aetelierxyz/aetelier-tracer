@@ -52,7 +52,7 @@ pub fn run_symbol(
         let extreme = d == 0 || d == 9;
         if extreme && !prev_extreme {
             let side: i8 = if d == 9 { 1 } else { -1 };
-            let t_exit = b.close_ms + hold_ms;
+            let t_exit = b.close_ms.saturating_add(hold_ms);
             let idx = prices.partition_point(|(t, _)| *t <= t_exit);
             if idx > 0 && b.vwap > 0.0 {
                 let (exit_ts, exit_px) = prices[idx - 1];

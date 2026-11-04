@@ -130,11 +130,12 @@ pub fn event_id(trade_id: &str, seq: u32) -> String {
     format!("{trade_id}|{seq}")
 }
 
-fn day_stamp(ts_ms: u64) -> String {
-    chrono::DateTime::from_timestamp_millis(ts_ms as i64)
-        .expect("valid ms timestamp")
-        .format("%Y%m%d")
-        .to_string()
+fn day_stamp(ts_ms: u64) -> anyhow::Result<String> {
+    let at = i64::try_from(ts_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .ok_or_else(|| anyhow::anyhow!("event ts_ms {ts_ms} is not a valid timestamp"))?;
+    Ok(at.format("%Y%m%d").to_string())
 }
 
 pub struct LedgerWriter {
@@ -154,7 +155,7 @@ impl LedgerWriter {
     }
 
     pub fn append(&mut self, event: &Event) -> anyhow::Result<()> {
-        let day = day_stamp(event.ts_ms);
+        let day = day_stamp(event.ts_ms)?;
         let rotate = match &self.open_day {
             Some((open, _)) => *open != day,
             None => true,
@@ -188,6 +189,19 @@ impl LedgerWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unconvertible_timestamp_is_an_error_not_a_panic() {
+        let dir = std::env::temp_dir().join("tracer_ledger_ts_range");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut w = LedgerWriter::new(&dir).unwrap();
+        for (seq, ts_ms) in [(0, u64::MAX), (1, 9_000_000_000_000_000)] {
+            let mut e = event(1_755_000_000_000, seq);
+            e.ts_ms = ts_ms;
+            assert!(w.append(&e).is_err(), "{ts_ms}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn event(ts_ms: u64, seq: u32) -> Event {
         let tid = trade_id("xyz_TSLA", 1_755_000_000_000, 1);

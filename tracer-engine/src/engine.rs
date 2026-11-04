@@ -9,7 +9,7 @@ use crate::ledger::{
     EVENT_SCHEMA, Event, EventKind, LedgerWriter, Leg, Mode, PostState, Verdict, event_id, trade_id,
 };
 use crate::market_engine::{GapSpan, TapeTrade, TradeTailer, gap_overlaps, read_gap_spans};
-use crate::nyse::{calendar_expired, regime};
+use crate::nyse::{calendar_expired, regime_label};
 use crate::params::TracerParams;
 use crate::verdict::{MakerSide, first_opposite_trade, scan_maker};
 
@@ -304,7 +304,7 @@ impl LiveEngine {
             merged_watermark_ms: self.merged_watermark_ms(),
             idle: self.ready
                 && wall_ms.saturating_sub(self.last_advance_wall_ms) > self.cfg.idle_after_ms,
-            session: regime(wall_ms).label().into(),
+            session: regime_label(wall_ms).into(),
             verdict_trail_ms: trades
                 .watermark_ms
                 .saturating_sub(self.merged_watermark_ms()),
@@ -369,7 +369,7 @@ impl LiveEngine {
             maker_side: maker_side.label().into(),
             decile: t.decile,
             score: t.score,
-            regime: regime(ts_ms).label().into(),
+            regime: regime_label(ts_ms).into(),
             posted_px,
             qty_usd: self.params.notional_usd,
             window_end_ms,
@@ -448,7 +448,7 @@ impl LiveEngine {
             posted_px: bar.vwap,
             depth,
             phase: LegPhase::Entry {
-                window_end_ms: bar.close_ms + self.params.hold_ms,
+                window_end_ms: bar.close_ms.saturating_add(self.params.hold_ms),
             },
         };
         let already_through = match maker_side {
@@ -498,7 +498,7 @@ impl LiveEngine {
                 still_open.push(t);
                 continue;
             }
-            let t_exit_post = t.t_post_ms + self.params.hold_ms;
+            let t_exit_post = t.t_post_ms.saturating_add(self.params.hold_ms);
             let nominal_exit = self.exit_posted_px(t_exit_post);
             match nominal_exit {
                 Some((px, _)) => {
@@ -634,7 +634,7 @@ impl LiveEngine {
             t.phase = LegPhase::Exit {
                 t_exit_post_ms: t_exit_post,
                 posted_px,
-                grace_end_ms: t_exit_post + self.cfg.grace_ms,
+                grace_end_ms: t_exit_post.saturating_add(self.cfg.grace_ms),
             };
             let mut e = self.base_event(&t, t.seq, EventKind::Posted, Leg::Exit, t_exit_post);
             e.exit_price_stale = Some(stale);
@@ -660,7 +660,9 @@ impl LiveEngine {
                 still_open.push(t);
                 continue;
             };
-            let final_bound = grace_end_ms + self.cfg.cross_window_ms + WATERMARK_SLACK_MS;
+            let final_bound = grace_end_ms
+                .saturating_add(self.cfg.cross_window_ms)
+                .saturating_add(WATERMARK_SLACK_MS);
             if wm < final_bound {
                 still_open.push(t);
                 continue;
@@ -690,7 +692,7 @@ impl LiveEngine {
                 &fillrows,
                 maker_side,
                 grace_end_ms,
-                grace_end_ms + self.cfg.cross_window_ms,
+                grace_end_ms.saturating_add(self.cfg.cross_window_ms),
             ) {
                 self.counters.exit_taker_cross += 1;
                 let fee = self.params.notional_usd * self.taker_fee_leg_bps / 1e4;

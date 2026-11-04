@@ -5,7 +5,7 @@ use crate::book::{OppositeEvidence, opposite_evidence};
 use crate::ledger::{
     EVENT_SCHEMA, Event, EventKind, LedgerWriter, Leg, Mode, PostState, Verdict, event_id, trade_id,
 };
-use crate::nyse::regime;
+use crate::nyse::regime_label;
 use crate::paper::ExecutedTrade;
 use crate::params::TracerParams;
 use crate::replay::SymbolData;
@@ -54,7 +54,7 @@ pub fn evaluate(
             .get(t.symbol.as_str())
             .ok_or_else(|| anyhow::anyhow!("{}: no rows loaded", t.symbol))?;
         let entry_side = MakerSide::entry_for_signal_side(t.side);
-        let window_end = t.t_entry_ms + params.hold_ms;
+        let window_end = t.t_entry_ms.saturating_add(params.hold_ms);
         let entry: [MakerScan; 3] = DELTAS_MS.map(|delta| {
             scan_maker(
                 rows,
@@ -81,16 +81,19 @@ pub fn evaluate(
             };
             markout = MARKOUT_WINDOWS_MS.map(|w| markout_bps(rows, posted_fill, w, t.side));
             let exit_side = MakerSide::exit_for_signal_side(t.side);
-            let grace_end = t.t_exit_ms + grace_ms;
+            let grace_end = t.t_exit_ms.saturating_add(grace_ms);
             let scan = scan_maker(rows, exit_side, t.exit_px, t.t_exit_ms, 0, grace_end, None);
             let outcome = if let Some(f) = scan.through {
                 ExitOutcome::Maker(Fill {
                     ts_ms: f.ts_ms,
                     px: t.exit_px,
                 })
-            } else if let Some(f) =
-                first_opposite_trade(rows, exit_side, grace_end, grace_end + cross_window_ms)
-            {
+            } else if let Some(f) = first_opposite_trade(
+                rows,
+                exit_side,
+                grace_end,
+                grace_end.saturating_add(cross_window_ms),
+            ) {
                 ExitOutcome::TakerCross(f)
             } else {
                 ExitOutcome::Unpriced
@@ -117,7 +120,7 @@ pub fn evaluate(
             exit_outcome = Some(outcome);
         }
         out.push(TradeVerdicts {
-            entry_regime: regime(t.t_entry_ms).label(),
+            entry_regime: regime_label(t.t_entry_ms),
             trade: t.clone(),
             entry,
             exit,
@@ -617,7 +620,7 @@ pub fn emit_events_stamped(
             },
             decile: t.decile,
             score: t.score,
-            regime: regime(ts_ms).label().into(),
+            regime: regime_label(ts_ms).into(),
             posted_px,
             qty_usd: params.notional_usd,
             window_end_ms,
@@ -659,7 +662,7 @@ pub fn emit_events_stamped(
             e
         };
 
-        let entry_window = t.t_entry_ms + params.hold_ms;
+        let entry_window = t.t_entry_ms.saturating_add(params.hold_ms);
         let scan = &v.entry[0];
         let mut posted = base(
             seq,
@@ -730,7 +733,7 @@ pub fn emit_events_stamped(
         seq += 1;
 
         if let (Some(scan), Some(outcome)) = (&v.exit, &v.exit_outcome) {
-            let grace_end = t.t_exit_ms + grace_ms;
+            let grace_end = t.t_exit_ms.saturating_add(grace_ms);
             let mut posted = base(
                 seq,
                 EventKind::Posted,

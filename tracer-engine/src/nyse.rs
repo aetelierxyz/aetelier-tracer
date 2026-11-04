@@ -58,19 +58,24 @@ fn close_minute(d: NaiveDate) -> u32 {
     }
 }
 
-pub fn calendar_expired(ms_utc: u64) -> bool {
-    let ny = New_York
-        .timestamp_millis_opt(ms_utc as i64)
+pub const OUT_OF_RANGE_LABEL: &str = "OUT_OF_RANGE";
+
+fn new_york(ms_utc: u64) -> Option<chrono::DateTime<chrono_tz::Tz>> {
+    New_York
+        .timestamp_millis_opt(i64::try_from(ms_utc).ok()?)
         .single()
-        .expect("valid ms timestamp");
-    ny.date_naive() > CALENDAR.valid_through
 }
 
-pub fn regime(ms_utc: u64) -> Regime {
-    let ny = New_York
-        .timestamp_millis_opt(ms_utc as i64)
-        .single()
-        .expect("valid ms timestamp");
+pub fn calendar_expired(ms_utc: u64) -> bool {
+    new_york(ms_utc).is_none_or(|ny| ny.date_naive() > CALENDAR.valid_through)
+}
+
+pub fn regime_label(ms_utc: u64) -> &'static str {
+    regime(ms_utc).map_or(OUT_OF_RANGE_LABEL, |r| r.label())
+}
+
+pub fn regime(ms_utc: u64) -> Option<Regime> {
+    let ny = new_york(ms_utc)?;
     let date = ny.date_naive();
     let minute = ny.hour() * 60 + ny.minute();
     let wd = ny.weekday();
@@ -82,19 +87,27 @@ pub fn regime(ms_utc: u64) -> Regime {
         _ => false,
     };
     if in_wknd {
-        return Regime::Wknd;
+        return Some(Regime::Wknd);
     }
     let trading_day = !is_holiday(date);
     if trading_day && minute >= 9 * 60 + 30 && minute < close_minute(date) {
-        Regime::Rth
+        Some(Regime::Rth)
     } else {
-        Regime::Ext
+        Some(Regime::Ext)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn out_of_range_timestamps_have_no_regime() {
+        assert_eq!(regime(u64::MAX), None);
+        assert_eq!(regime(i64::MAX as u64), None);
+        assert_eq!(regime_label(u64::MAX), OUT_OF_RANGE_LABEL);
+        assert!(calendar_expired(u64::MAX));
+    }
 
     fn ms(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> u64 {
         New_York
@@ -106,31 +119,31 @@ mod tests {
 
     #[test]
     fn regimes_partition_the_week() {
-        assert_eq!(regime(ms(2026, 8, 12, 10, 0)), Regime::Rth);
-        assert_eq!(regime(ms(2026, 8, 12, 8, 0)), Regime::Ext);
-        assert_eq!(regime(ms(2026, 8, 12, 17, 0)), Regime::Ext);
-        assert_eq!(regime(ms(2026, 8, 14, 16, 1)), Regime::Wknd);
-        assert_eq!(regime(ms(2026, 8, 15, 12, 0)), Regime::Wknd);
-        assert_eq!(regime(ms(2026, 8, 16, 23, 0)), Regime::Wknd);
-        assert_eq!(regime(ms(2026, 8, 17, 9, 29)), Regime::Wknd);
-        assert_eq!(regime(ms(2026, 8, 17, 9, 30)), Regime::Rth);
-        assert_eq!(regime(ms(2026, 5, 25, 11, 0)), Regime::Ext);
-        assert_eq!(regime(ms(2026, 6, 19, 11, 0)), Regime::Ext);
+        assert_eq!(regime(ms(2026, 8, 12, 10, 0)), Some(Regime::Rth));
+        assert_eq!(regime(ms(2026, 8, 12, 8, 0)), Some(Regime::Ext));
+        assert_eq!(regime(ms(2026, 8, 12, 17, 0)), Some(Regime::Ext));
+        assert_eq!(regime(ms(2026, 8, 14, 16, 1)), Some(Regime::Wknd));
+        assert_eq!(regime(ms(2026, 8, 15, 12, 0)), Some(Regime::Wknd));
+        assert_eq!(regime(ms(2026, 8, 16, 23, 0)), Some(Regime::Wknd));
+        assert_eq!(regime(ms(2026, 8, 17, 9, 29)), Some(Regime::Wknd));
+        assert_eq!(regime(ms(2026, 8, 17, 9, 30)), Some(Regime::Rth));
+        assert_eq!(regime(ms(2026, 5, 25, 11, 0)), Some(Regime::Ext));
+        assert_eq!(regime(ms(2026, 6, 19, 11, 0)), Some(Regime::Ext));
     }
 
     #[test]
     fn early_closes_shift_the_boundary() {
-        assert_eq!(regime(ms(2026, 12, 24, 12, 59)), Regime::Rth);
-        assert_eq!(regime(ms(2026, 12, 24, 13, 0)), Regime::Ext);
-        assert_eq!(regime(ms(2026, 11, 27, 13, 30)), Regime::Wknd);
+        assert_eq!(regime(ms(2026, 12, 24, 12, 59)), Some(Regime::Rth));
+        assert_eq!(regime(ms(2026, 12, 24, 13, 0)), Some(Regime::Ext));
+        assert_eq!(regime(ms(2026, 11, 27, 13, 30)), Some(Regime::Wknd));
     }
 
     #[test]
     fn calendar_covers_2027() {
-        assert_eq!(regime(ms(2027, 7, 5, 11, 0)), Regime::Ext);
-        assert_eq!(regime(ms(2027, 11, 25, 11, 0)), Regime::Ext);
-        assert_eq!(regime(ms(2027, 11, 26, 13, 30)), Regime::Wknd);
-        assert_eq!(regime(ms(2027, 7, 6, 11, 0)), Regime::Rth);
+        assert_eq!(regime(ms(2027, 7, 5, 11, 0)), Some(Regime::Ext));
+        assert_eq!(regime(ms(2027, 11, 25, 11, 0)), Some(Regime::Ext));
+        assert_eq!(regime(ms(2027, 11, 26, 13, 30)), Some(Regime::Wknd));
+        assert_eq!(regime(ms(2027, 7, 6, 11, 0)), Some(Regime::Rth));
     }
 
     #[test]

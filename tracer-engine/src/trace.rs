@@ -13,7 +13,7 @@ use crate::bars::{FillRow, auto_threshold, build_bars, quantize_bars};
 use crate::corrected::{emit_events_stamped, evaluate, write_artifacts_stamped};
 use crate::ledger::{LedgerWriter, Mode};
 use crate::market_engine::{GapSpan, datatype_dir, gap_overlaps};
-use crate::nyse::regime;
+use crate::nyse::regime_label;
 use crate::paper::{ExecutedTrade, run_symbol};
 use crate::params::{SymbolParams, TracerParams};
 use crate::replay::{MIN_BARS_PER_SYMBOL, SymbolData, paper_trades_from};
@@ -114,6 +114,45 @@ pub struct TraceOverrides {
     pub hold_ms: Option<u64>,
     pub maker_fee_leg_bps: Option<f64>,
     pub taker_fee_leg_bps: Option<f64>,
+}
+
+pub const MAX_FEE_LEG_BPS: f64 = 1_000.0;
+
+impl TraceOverrides {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(n) = self.notional_usd {
+            anyhow::ensure!(
+                n.is_finite() && n > 0.0,
+                "notional_usd must be finite and > 0, got {n}"
+            );
+        }
+        if let Some(h) = self.hold_ms {
+            anyhow::ensure!(h > 0, "hold_ms must be > 0");
+            crate::bounds::check_window("hold_ms", h)?;
+        }
+        for (name, fee) in [
+            ("maker_fee_leg_bps", self.maker_fee_leg_bps),
+            ("taker_fee_leg_bps", self.taker_fee_leg_bps),
+        ] {
+            if let Some(f) = fee {
+                anyhow::ensure!(
+                    f.is_finite() && f.abs() <= MAX_FEE_LEG_BPS,
+                    "{name} must be finite and within +/-{MAX_FEE_LEG_BPS}, got {f}"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl TraceRequest {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        crate::bounds::check_windows(self.grace_ms, self.cross_window_ms)?;
+        if let Some(ov) = &self.overrides {
+            ov.validate()?;
+        }
+        Ok(())
+    }
 }
 
 pub struct TraceRequest {
@@ -239,6 +278,46 @@ fn file_name(path: &Path) -> String {
 #[cfg(test)]
 mod cap_tests {
     use super::*;
+
+    #[test]
+    fn overrides_are_bounded() {
+        let ok = TraceOverrides {
+            notional_usd: Some(1000.0),
+            hold_ms: Some(900_000),
+            maker_fee_leg_bps: Some(-0.5),
+            taker_fee_leg_bps: Some(3.5),
+        };
+        assert!(ok.validate().is_ok());
+        let bad = [
+            TraceOverrides {
+                notional_usd: Some(0.0),
+                ..ok.clone()
+            },
+            TraceOverrides {
+                notional_usd: Some(f64::NAN),
+                ..ok.clone()
+            },
+            TraceOverrides {
+                hold_ms: Some(0),
+                ..ok.clone()
+            },
+            TraceOverrides {
+                hold_ms: Some(crate::bounds::MAX_WINDOW_MS + 1),
+                ..ok.clone()
+            },
+            TraceOverrides {
+                maker_fee_leg_bps: Some(f64::INFINITY),
+                ..ok.clone()
+            },
+            TraceOverrides {
+                taker_fee_leg_bps: Some(-MAX_FEE_LEG_BPS - 1.0),
+                ..ok.clone()
+            },
+        ];
+        for ov in bad {
+            assert!(ov.validate().is_err(), "{ov:?}");
+        }
+    }
 
     #[test]
     fn each_tape_role_carries_its_own_cap() {
@@ -511,7 +590,18 @@ pub fn parse_signals_strict(
         let parse_u64 =
             |field: &str, raw: &str, err: &mut dyn FnMut(&str, String)| -> Option<u64> {
                 match raw.parse::<u64>() {
-                    Ok(v) => Some(v),
+                    Ok(v) if crate::bounds::ts_in_range(v) => Some(v),
+                    Ok(v) => {
+                        err(
+                            field,
+                            format!(
+                                "outside [{}, {}): {v}",
+                                crate::bounds::MIN_TS_MS,
+                                crate::bounds::MAX_TS_MS
+                            ),
+                        );
+                        None
+                    }
                     Err(_) => {
                         err(field, format!("not a timestamp: {raw:?}"));
                         None
@@ -555,7 +645,7 @@ pub fn parse_signals_strict(
         let regime_given = c[12];
 
         if let Some(t0) = t_entry_ms {
-            let computed = regime(t0).label();
+            let computed = regime_label(t0);
             if regime_given != computed {
                 err(
                     "regime",
@@ -563,7 +653,7 @@ pub fn parse_signals_strict(
                 );
             }
             if let Some(tx) = t_exit_ms
-                && tx != t0 + hold_ms
+                && Some(tx) != t0.checked_add(hold_ms)
             {
                 err(
                     "t_exit_ms",
@@ -602,7 +692,7 @@ pub fn parse_signals_strict(
                     );
                 }
             }
-            if !gap_spans.is_empty() && gap_overlaps(gap_spans, t0, t0 + hold_ms) {
+            if !gap_spans.is_empty() && gap_overlaps(gap_spans, t0, t0.saturating_add(hold_ms)) {
                 err(
                     "t_entry_ms",
                     "entry window straddles a recorded collector gap".into(),
@@ -735,6 +825,7 @@ pub fn prepare(
     req: &TraceRequest,
     base_params: &TracerParams,
 ) -> anyhow::Result<Result<TracePrepared, PreflightReport>> {
+    req.validate()?;
     let mut errors: Vec<RowError> = Vec::new();
     let mut files: Vec<TapeFileSummary> = Vec::new();
     let mut trades_by_stem: BTreeMap<String, Vec<FillRow>> = BTreeMap::new();
