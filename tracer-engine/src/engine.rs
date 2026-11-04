@@ -8,7 +8,9 @@ use crate::deciles::decile_of;
 use crate::ledger::{
     EVENT_SCHEMA, Event, EventKind, LedgerWriter, Leg, Mode, PostState, Verdict, event_id, trade_id,
 };
-use crate::market_engine::{GapSpan, TapeTrade, TradeTailer, gap_overlaps, read_gap_spans};
+use crate::market_engine::{
+    GapSpan, TAPE_FUTURE_TOLERANCE_MS, TapeTrade, TradeTailer, gap_overlaps, read_gap_spans,
+};
 use crate::nyse::{calendar_expired, regime_label};
 use crate::params::TracerParams;
 use crate::verdict::{MakerSide, first_opposite_trade, scan_maker};
@@ -141,6 +143,9 @@ pub struct StreamStatus {
     pub watermark_ms: u64,
     pub last_file: Option<String>,
     pub files_read: u64,
+    pub files_skipped: u64,
+    pub rows_future_dropped: u64,
+    pub last_read_error: Option<String>,
     pub advance_age_ms: u64,
     pub stalled: bool,
 }
@@ -170,6 +175,7 @@ pub struct EngineStatus {
     pub paper_fees_usd: f64,
     pub first_post_ts_ms: Option<u64>,
     pub events_written: u64,
+    pub events_pending: usize,
     pub ready: bool,
     pub binding_pending: bool,
     pub maker_fee_leg_bps: f64,
@@ -193,6 +199,8 @@ pub struct LiveEngine {
     recent_bars: Vec<Bar>,
     open: Vec<OpenTrade>,
     ledger: LedgerWriter,
+    inbox: Vec<TapeTrade>,
+    outbox: Vec<Event>,
     pub counters: EngineCounters,
     pub corrected_points: Vec<(u64, f64)>,
     corrected_total: f64,
@@ -240,6 +248,8 @@ impl LiveEngine {
             recent_bars: Vec::new(),
             open: Vec::new(),
             ledger: LedgerWriter::new(ledger_dir)?,
+            inbox: Vec::new(),
+            outbox: Vec::new(),
             counters: EngineCounters::default(),
             corrected_points: Vec::new(),
             corrected_total: 0.0,
@@ -279,6 +289,9 @@ impl LiveEngine {
             watermark_ms: tail.watermark_ms,
             last_file: tail.last_file.clone(),
             files_read: tail.files_read,
+            files_skipped: tail.files_skipped,
+            rows_future_dropped: tail.rows_future_dropped,
+            last_read_error: tail.last_read_error.clone(),
             advance_age_ms,
             stalled: self.ready && advance_age_ms > self.cfg.idle_after_ms,
         }
@@ -323,6 +336,7 @@ impl LiveEngine {
             paper_fees_usd: self.paper_fees,
             first_post_ts_ms: self.first_post_ts_ms,
             events_written: self.ledger.events_written,
+            events_pending: self.outbox.len(),
             ready: self.ready,
             binding_pending: self.trades_tail.pending()
                 || self.books_tail.as_ref().is_some_and(|b| b.pending()),
@@ -425,7 +439,7 @@ impl LiveEngine {
         e
     }
 
-    fn post_trade(&mut self, bar: &Bar, score: f64, decile: usize) -> anyhow::Result<()> {
+    fn post_trade(&mut self, bar: &Bar, score: f64, decile: usize) {
         let side: i8 = if decile == 10 { 1 } else { -1 };
         let maker_side = MakerSide::entry_for_signal_side(side);
         let tid = trade_id(&self.cfg.symbol_stem, bar.close_ms, side);
@@ -467,12 +481,11 @@ impl LiveEngine {
         e.bar_buy_usd = Some(bar.buy_usd);
         e.bar_sell_usd = Some(bar.sell_usd);
         e.bar_n = Some(bar.n);
-        self.ledger.append(&e)?;
+        self.outbox.push(e);
         t.seq = 1;
         self.counters.posted += 1;
         self.first_post_ts_ms.get_or_insert(bar.close_ms);
         self.open.push(t);
-        Ok(())
     }
 
     fn exit_posted_px(&self, t_exit_ms: u64) -> Option<(f64, u64)> {
@@ -486,7 +499,7 @@ impl LiveEngine {
         Some((b.vwap, b.close_ms))
     }
 
-    fn finalize_entries(&mut self, wm: u64) -> anyhow::Result<()> {
+    fn finalize_entries(&mut self, wm: u64) {
         let fillrows = trades_as_fillrows(&self.trades);
         let mut still_open = Vec::new();
         for mut t in std::mem::take(&mut self.open) {
@@ -494,7 +507,7 @@ impl LiveEngine {
                 still_open.push(t);
                 continue;
             };
-            if wm < window_end_ms + WATERMARK_SLACK_MS {
+            if wm < window_end_ms.saturating_add(WATERMARK_SLACK_MS) {
                 still_open.push(t);
                 continue;
             }
@@ -516,7 +529,7 @@ impl LiveEngine {
                     self.base_event(&t, t.seq, EventKind::Expired, Leg::Entry, window_end_ms);
                 e.verdict = Some(Verdict::UnfilledGapped);
                 e.gap_flags = vec!["gap_overlap".into()];
-                self.ledger.append(&e)?;
+                self.outbox.push(e);
                 t.seq += 1;
                 let ev = self.evidence_event(
                     &t,
@@ -526,7 +539,7 @@ impl LiveEngine {
                     t.t_post_ms,
                     &fillrows,
                 );
-                self.ledger.append(&ev)?;
+                self.outbox.push(ev);
                 self.counters.entry_gapped += 1;
                 continue;
             }
@@ -561,7 +574,7 @@ impl LiveEngine {
                 let mut e = self.base_event(&t, t.seq, EventKind::Observed, Leg::Entry, f.ts_ms);
                 e.milestone = Some("touch".into());
                 e.evidence_px = Some(f.px);
-                self.ledger.append(&e)?;
+                self.outbox.push(e);
                 t.seq += 1;
             }
             let verdict = if scan.through.is_some() {
@@ -596,7 +609,7 @@ impl LiveEngine {
                 });
                 e.evidence_px = scan.through.map(|f| f.px).or(queue_cleared.map(|f| f.px));
             }
-            self.ledger.append(&e)?;
+            self.outbox.push(e);
             t.seq += 1;
             let ev = self.evidence_event(
                 &t,
@@ -606,8 +619,7 @@ impl LiveEngine {
                 t.t_post_ms,
                 &fillrows,
             );
-            self.ledger.append(&ev)?;
-            self.ledger.flush()?;
+            self.outbox.push(ev);
             t.seq += 1;
             match verdict {
                 Verdict::FilledThrough => self.counters.entry_filled_through += 1,
@@ -638,15 +650,14 @@ impl LiveEngine {
             };
             let mut e = self.base_event(&t, t.seq, EventKind::Posted, Leg::Exit, t_exit_post);
             e.exit_price_stale = Some(stale);
-            self.ledger.append(&e)?;
+            self.outbox.push(e);
             t.seq += 1;
             still_open.push(t);
         }
         self.open = still_open;
-        Ok(())
     }
 
-    fn finalize_exits(&mut self, wm: u64) -> anyhow::Result<()> {
+    fn finalize_exits(&mut self, wm: u64) {
         let fillrows = trades_as_fillrows(&self.trades);
         let mut still_open = Vec::new();
         for mut t in std::mem::take(&mut self.open) {
@@ -681,7 +692,7 @@ impl LiveEngine {
                 let mut e = self.base_event(&t, t.seq, EventKind::Observed, Leg::Exit, f.ts_ms);
                 e.milestone = Some("touch".into());
                 e.evidence_px = Some(f.px);
-                self.ledger.append(&e)?;
+                self.outbox.push(e);
                 t.seq += 1;
             }
             let (exit_px, exit_ts, exit_fee, cross) = if let Some(f) = scan.through {
@@ -714,14 +725,14 @@ impl LiveEngine {
             if matches!(kind, EventKind::Filled) {
                 e.evidence_px = scan.through.map(|f| f.px);
             }
-            self.ledger.append(&e)?;
+            self.outbox.push(e);
             t.seq += 1;
             if let Some(f) = cross {
                 let mut e = self.base_event(&t, t.seq, EventKind::TakerCross, Leg::Exit, f.ts_ms);
                 e.cross_px = Some(f.px);
                 e.cross_kind = Some("opposite_trade".into());
                 e.taker_fee_usd = Some(exit_fee);
-                self.ledger.append(&e)?;
+                self.outbox.push(e);
                 t.seq += 1;
             }
             let ev = self.evidence_event(
@@ -732,8 +743,7 @@ impl LiveEngine {
                 t_exit_post_ms,
                 &fillrows,
             );
-            self.ledger.append(&ev)?;
-            self.ledger.flush()?;
+            self.outbox.push(ev);
             if let Some(px) = exit_px {
                 let entry_fee = self.params.notional_usd * self.maker_fee_leg_bps / 1e4;
                 let gross = t.side as f64 * (px / t.posted_px - 1.0) * self.params.notional_usd;
@@ -744,16 +754,18 @@ impl LiveEngine {
             }
         }
         self.open = still_open;
-        Ok(())
     }
 
     pub fn tick(&mut self, wall_ms: u64) -> anyhow::Result<()> {
         let wm_before = self.merged_watermark_ms();
         let trades_wm_before = self.trades_tail.tail.watermark_ms;
         let books_wm_before = self.books_tail.as_ref().map(|b| b.tail.watermark_ms);
-        let new_trades = self.trades_tail.poll()?;
+        self.flush_outbox()?;
+        let max_ts_ms = wall_ms.saturating_add(TAPE_FUTURE_TOLERANCE_MS);
+        let polled = self.trades_tail.poll_until(max_ts_ms)?;
+        self.inbox.extend(polled);
         if let Some(b) = self.books_tail.as_mut() {
-            b.poll()?;
+            b.poll_until(max_ts_ms)?;
         }
         if self.trades_tail.tail.watermark_ms > trades_wm_before || !self.ready {
             self.trades_last_advance_wall_ms = wall_ms;
@@ -769,13 +781,14 @@ impl LiveEngine {
             gaps.extend(read_gap_spans(root, Some(&stem))?);
         }
         self.gaps = gaps;
+        let new_trades = std::mem::take(&mut self.inbox);
         for p in &new_trades {
             if let Some(bar) = self.bars.push(p) {
                 let score = self.signal.update(&bar, self.params.tau_secs);
                 let d = decile_of(&self.params.decile_thresholds, score);
                 let extreme = d == 0 || d == 9;
                 if extreme && !self.signal.prev_extreme {
-                    self.post_trade(&bar, score, d + 1)?;
+                    self.post_trade(&bar, score, d + 1);
                 }
                 self.signal.prev_extreme = extreme;
                 self.recent_bars.push(bar);
@@ -788,8 +801,8 @@ impl LiveEngine {
         if wm > wm_before || !self.ready {
             self.last_advance_wall_ms = wall_ms;
         }
-        self.finalize_entries(wm)?;
-        self.finalize_exits(wm)?;
+        self.finalize_entries(wm);
+        self.finalize_exits(wm);
         let retention_ms = self.params.hold_ms
             + self.cfg.grace_ms
             + self.cfg.cross_window_ms
@@ -802,7 +815,25 @@ impl LiveEngine {
         }
         self.recent_bars.retain(|b| b.close_ms >= cutoff);
         self.ready = true;
-        Ok(())
+        self.flush_outbox()
+    }
+
+    fn flush_outbox(&mut self) -> anyhow::Result<()> {
+        if self.outbox.is_empty() {
+            return Ok(());
+        }
+        let mut written = 0;
+        let mut outcome = Ok(());
+        for e in &self.outbox {
+            if let Err(err) = self.ledger.append(e) {
+                outcome = Err(err);
+                break;
+            }
+            written += 1;
+        }
+        self.outbox.drain(..written);
+        outcome?;
+        self.ledger.flush()
     }
 }
 
@@ -898,6 +929,33 @@ mod tests {
         eng.tick(2_000).unwrap();
         assert!(!eng.status(2_000).binding_pending);
         assert_eq!(eng.counters.posted, 1);
+    }
+
+    #[test]
+    fn a_ledger_write_failure_keeps_trades_positions_and_events_for_the_next_tick() {
+        let (binding, ledger) = fixture("ledger_fail");
+        let dir = binding.join("hyperliquid/perpetual/trades");
+        write_trades_parquet(&preamble_and_burst(), &dir.join("a.parquet")).unwrap();
+        let mut eng = LiveEngine::new(test_params(), cfg(), &binding, None, &ledger).unwrap();
+        std::fs::remove_dir_all(&ledger).unwrap();
+        std::fs::write(&ledger, b"blocks the ledger dir").unwrap();
+
+        assert!(eng.tick(1_000).is_err());
+        assert_eq!(eng.counters.posted, 1);
+        assert_eq!(eng.open.len(), 1);
+        assert_eq!(eng.trades.len(), preamble_and_burst().len());
+        assert!(eng.status(1_000).events_pending > 0);
+
+        std::fs::remove_file(&ledger).unwrap();
+        std::fs::create_dir_all(&ledger).unwrap();
+        eng.tick(2_000).unwrap();
+        assert_eq!(eng.status(2_000).events_pending, 0);
+        assert_eq!(eng.counters.posted, 1);
+        let kinds: Vec<String> = ledger_events(&ledger)
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(kinds, vec!["POSTED".to_string()]);
     }
 
     #[test]
