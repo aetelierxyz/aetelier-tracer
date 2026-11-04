@@ -230,6 +230,7 @@ async fn run_live(
         traces: traces_rt,
         params_path: Some(params_path),
         auth,
+        heavy: api::heavy_permits(),
         now_ms: wall_now_ms,
     };
     let publish = state.clone();
@@ -623,6 +624,7 @@ async fn main() -> anyhow::Result<()> {
                 traces: traces_rt,
                 params_path: Some(params),
                 auth,
+                heavy: api::heavy_permits(),
                 now_ms: wall_now_ms,
             };
             serve_api(state, bind, port).await

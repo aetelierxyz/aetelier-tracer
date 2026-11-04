@@ -62,7 +62,14 @@ pub struct AppState {
     pub traces: Option<Arc<crate::traces::TraceRuntime>>,
     pub params_path: Option<PathBuf>,
     pub auth: Arc<crate::auth::ServiceAuth>,
+    pub heavy: Arc<tokio::sync::Semaphore>,
     pub now_ms: fn() -> u64,
+}
+
+pub const HEAVY_CONCURRENCY: usize = 8;
+
+pub fn heavy_permits() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(HEAVY_CONCURRENCY))
 }
 
 pub fn wall_now_ms() -> u64 {

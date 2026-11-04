@@ -289,6 +289,7 @@ fn state(dir: &Path) -> AppState {
         auth: auth::ServiceAuth::new(auth::AuthMode::Optional, None)
             .unwrap()
             .shared(),
+        heavy: api::heavy_permits(),
         now_ms: fixed_now,
     }
 }
