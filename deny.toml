@@ -4,7 +4,10 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not vulnerable; no maintained release or safe upgrade exists" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz is unmaintained, not vulnerable; no maintained release or safe upgrade exists" },
+]
 
 [licenses]
 version = 2
